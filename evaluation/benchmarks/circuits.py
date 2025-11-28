@@ -4,13 +4,26 @@ import os
 import numpy as np
 import networkx as nx
 
-from qiskit_algorithms.minimum_eigensolvers import VQE, QAOA
-from qiskit_algorithms.optimizers import SLSQP
+try:
+    from qiskit_algorithms.minimum_eigensolvers import VQE, QAOA
+    from qiskit_algorithms.optimizers import SLSQP
+except Exception:  # pragma: no cover - compatibility shim
+    VQE = None
+    QAOA = None
+    SLSQP = None
 from qiskit.circuit import QuantumCircuit, ClassicalRegister
 from qiskit.circuit.library import RealAmplitudes, TwoLocal, QFT
-from qiskit.primitives import Estimator, Sampler
-from qiskit_optimization import QuadraticProgram
-from qiskit_optimization.applications import Maxcut
+try:
+    from qiskit.primitives import Estimator, Sampler
+except Exception:  # pragma: no cover - compatibility shim
+    Estimator = None
+    Sampler = None
+try:
+    from qiskit_optimization import QuadraticProgram
+    from qiskit_optimization.applications import Maxcut
+except Exception:  # pragma: no cover - compatibility shim
+    QuadraticProgram = None
+    Maxcut = None
 from qiskit.converters import circuit_to_dag, dag_to_circuit
 
 

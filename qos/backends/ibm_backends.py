@@ -2,11 +2,29 @@ from typing import Any, Dict, Optional
 from types import MethodType
 from warnings import warn
 
-import mapomatic as mm
+# mapomatic optional
+try:
+    import mapomatic as mm
+except Exception:  # pragma: no cover
+    class _MapShim:
+        def __getattr__(self, name):
+            raise ImportError("mapomatic is required for this operation.")
+    mm = _MapShim()
+
 import qiskit.providers.fake_provider as FakeAccountProvider
 from qiskit.compiler import transpile
-from qiskit_ibm_provider import IBMProvider
-from qiskit.providers.models.backendproperties import BackendProperties
+# IBMProvider optional
+try:
+    from qiskit_ibm_provider import IBMProvider  # type: ignore
+except Exception:  # pragma: no cover
+    class IBMProvider:  # type: ignore
+        pass
+# BackendProperties optional
+try:
+    from qiskit.providers.models.backendproperties import BackendProperties  # type: ignore
+except Exception:  # pragma: no cover
+    BackendProperties = None  # type: ignore
+
 from qiskit.circuit import QuantumCircuit
 
 
@@ -25,16 +43,17 @@ class IBMQPU:
                     FakeAccountProvider, backend_name.replace("V2", "")
                 )()
 
-                setattr(
-                    backend,
-                    "_properties",
-                    BackendProperties.from_dict(v1_backend.properties().to_dict()),
-                )
+                if BackendProperties is not None:
+                    setattr(
+                        backend,
+                        "_properties",
+                        BackendProperties.from_dict(v1_backend.properties().to_dict()),
+                    )
 
-                def properties(self):
-                    return self._properties
+                    def properties(self):
+                        return self._properties
 
-                backend.properties = MethodType(properties, backend)
+                    backend.properties = MethodType(properties, backend)
             self.is_simulator = True
         elif isinstance(provider, IBMProvider):
             backend = provider.get_backend(backend_name)

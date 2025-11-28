@@ -1,8 +1,15 @@
 #helper for Frozen Qubits  
 import copy
 import networkx as nx
-import dimod
 import numpy as np
+# dimod optional
+try:
+    import dimod  # type: ignore
+except Exception:  # pragma: no cover
+    dimod = None
+
+def _need_dimod():
+    raise ImportError("dimod is required for FrozenQubits helpers that solve Ising models.")
 
 def to_iterable(obj):
     ''' if obj is not an iterable (e.g., list, tuple, etc.), converts it to a tuple of size one'''
@@ -57,6 +64,8 @@ def drop_hotspot_node(G,
 
 
 def encode_var_names(bqm):
+    if dimod is None:
+        return _need_dimod()
     _bqm=copy.deepcopy(bqm)
     old_vars=sorted(list(dict(_bqm.adj).keys()))
     n=len(old_vars)
@@ -74,6 +83,8 @@ def encode_var_names(bqm):
 
 
 def decode_var_names(encoding, J, h=None, offset=0.0):    
+    if dimod is None:
+        return _need_dimod()
     _bqm=dimod.BinaryQuadraticModel.from_ising(h, J, offset)        
     _decoding={j:i for i,j in encoding.items()}
     new_bqm=copy.deepcopy(_bqm)
@@ -89,6 +100,8 @@ def decode_var_names(encoding, J, h=None, offset=0.0):
 
 
 def halt_qubits(J, h={}, offset=0.0, halting_list=[], get_all_sub_Ising_problems=True):
+    if dimod is None:
+        return _need_dimod()
     _bqm=dimod.BinaryQuadraticModel.from_ising(h, J, offset)    
     _halting_list=to_iterable(copy.deepcopy(halting_list))
     h_for_remove={i:0 for i in _halting_list}

@@ -10,10 +10,13 @@ import copy
 from FrozenQubits.helper import *
 
 from qiskit import QuantumCircuit
-from qiskit_ibm_provider import IBMProvider
 from qiskit.circuit import Parameter
 from qiskit.quantum_info import hellinger_fidelity
 from qiskit_aer import AerSimulator
+try:
+    from qiskit_ibm_provider import IBMProvider  # type: ignore
+except Exception:  # pragma: no cover
+    IBMProvider = None  # type: ignore
 
 
 def _get_ideal_counts(circuit: QuantumCircuit) -> Counter:
@@ -227,4 +230,3 @@ def bind_QAOA(primary_circuit, params, beta, gamma,
         except:
             pass
     return new_circuit
-

@@ -1,13 +1,22 @@
 import networkx as nx
 
-from clingo.solving import Symbol
-from clingo.control import Control
+try:
+    from clingo.solving import Symbol
+    from clingo.control import Control
+except Exception:  # pragma: no cover - compatibility shim
+    Symbol = None
+    Control = None
+
+    def _missing(*args, **kwargs):
+        raise ImportError("clingo is required for this operation.")
 from qiskit.circuit import Barrier
 
 from .dag import DAG
 
 
 def dag_to_asp(dag: DAG) -> str:
+    if Control is None:
+        return _missing()
     dag.remove_nodes_of_type(Barrier)
 
     qubits = dag.qubits
@@ -30,6 +39,8 @@ def dag_to_asp(dag: DAG) -> str:
 
 
 def qcg_to_asp(qcg: nx.Graph) -> str:
+    if Control is None:
+        return _missing()
     asp = ""
     for node, data in qcg.nodes(data=True):
         asp += f"qubit({node}).\n"
@@ -42,6 +53,8 @@ def qcg_to_asp(qcg: nx.Graph) -> str:
 
 
 def get_optimal_symbols(asp: str) -> list[Symbol]:
+    if Control is None:
+        return _missing()
     control = Control()
     control.configuration.solve.models = 0  # type: ignore
     control.add("base", [], asp)

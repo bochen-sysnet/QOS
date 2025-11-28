@@ -5,7 +5,11 @@ from qos.backends.types import QPU
 from qvm.virtual_circuit import VirtualCircuit
 from qvm.quasi_distr import *
 from qiskit import dagcircuit, QuantumCircuit
-from ..dag import DAG
+# DAG may live under qos.dag; fallback to qvm.compiler.dag
+try:
+    from ..dag import DAG  # type: ignore
+except Exception:  # pragma: no cover
+    from qvm.compiler.dag import DAG  # type: ignore
 #from qos.distributed_transpiler.types import AnalysisPass
 #from qos.distributed_transpiler.types import TransformationPass
 

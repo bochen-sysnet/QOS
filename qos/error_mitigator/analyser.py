@@ -11,6 +11,10 @@ import networkx as nx
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.converters import circuit_to_dag
+from typing import Optional
+
+def _qindex(qubit) -> Optional[int]:
+    return getattr(qubit, "index", getattr(qubit, "_index", None))
 
 class BasicAnalysisPass(AnalysisPass):
 
@@ -306,12 +310,12 @@ class QAOAAnalysisPass(DAGAnalysisPass):
                     param = instr.operation.params[0]
 
                     if param > 0:
-                        J[(instr.qubits[0].index, instr.qubits[1].index)] = 1
+                        J[(_qindex(instr.qubits[0]), _qindex(instr.qubits[1]))] = 1
                     else:
-                        J[(instr.qubits[0].index, instr.qubits[1].index)] = -1
+                        J[(_qindex(instr.qubits[0]), _qindex(instr.qubits[1]))] = -1
                 if instr.operation.name == 'cx':
-                    if instr.qubits[1].index == i:
-                        op1 = instr.qubits[0].index
+                    if _qindex(instr.qubits[1]) == i:
+                        op1 = _qindex(instr.qubits[0])
                         v = J.get((op1, i))
                         if v is not None:
                             continue
@@ -321,7 +325,7 @@ class QAOAAnalysisPass(DAGAnalysisPass):
                 if instr.operation.name == 'rz':
                     if prev_op != 'cx':
                         continue
-                    if instr.qubits[0].index == i:    
+                    if _qindex(instr.qubits[0]) == i:
                         param = instr.operation.params[0]
 
                         if param > 0:
