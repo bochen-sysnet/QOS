@@ -250,7 +250,19 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=12)
     parser.add_argument("--size-to-reach", type=int, default=9)
     parser.add_argument("--ideal-size-to-reach", type=int, default=2)
-    parser.add_argument("--qos-cost-search", action="store_true")
+    parser.add_argument(
+        "--qos-cost-search",
+        dest="qos_cost_search",
+        action="store_true",
+        default=True,
+        help="Enable cost-search (default).",
+    )
+    parser.add_argument(
+        "--no-qos-cost-search",
+        dest="qos_cost_search",
+        action="store_false",
+        help="Disable cost-search.",
+    )
     parser.add_argument("--clingo-timeout-sec", type=int, default=10)
     parser.add_argument("--max-partition-tries", type=int, default=5)
     parser.add_argument("--max-instantiations", type=int, default=0)

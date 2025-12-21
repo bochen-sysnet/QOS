@@ -199,11 +199,11 @@ class ErrorMitigator():
                     t0 = time.perf_counter()
                     costs = self.computeCuttingCosts(q, size_to_reach)
                     cost_time += time.perf_counter() - t0
-                    max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "6"))
+                    max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
                     iter_ctr = 0
                     while (costs["GV"] <= budget or costs["WC"] <=budget) and size_to_reach > 2:
                         iter_ctr += 1
-                        if iter_ctr > max_iters:
+                        if max_iters > 0 and iter_ctr > max_iters:
                             break
                         size_to_reach = size_to_reach - 1
                         t0 = time.perf_counter()
@@ -213,7 +213,7 @@ class ErrorMitigator():
                     iter_ctr = 0
                     while costs["GV"] > budget and costs["WC"] > budget:
                         iter_ctr += 1
-                        if iter_ctr > max_iters:
+                        if max_iters > 0 and iter_ctr > max_iters:
                             break
                         size_to_reach = size_to_reach + 1
                         t0 = time.perf_counter()
@@ -267,12 +267,12 @@ class ErrorMitigator():
                 t0 = time.perf_counter()
                 costs = self.computeCuttingCosts(q, size_to_reach)
                 cost_time += time.perf_counter() - t0
-                max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "6"))
+                max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
                 iter_ctr = 0
 
                 while (costs["GV"] <= self.budget or costs["WC"] <= self.budget) and size_to_reach > 2:
                     iter_ctr += 1
-                    if iter_ctr > max_iters:
+                    if max_iters > 0 and iter_ctr > max_iters:
                         break
                     size_to_reach = size_to_reach - 1
                     t0 = time.perf_counter()
@@ -282,7 +282,7 @@ class ErrorMitigator():
                 iter_ctr = 0
                 while costs["GV"] > self.budget and costs["WC"] > self.budget:
                     iter_ctr += 1
-                    if iter_ctr > max_iters:
+                    if max_iters > 0 and iter_ctr > max_iters:
                         break
                     size_to_reach = size_to_reach + 1
                     t0 = time.perf_counter()

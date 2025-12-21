@@ -29,12 +29,12 @@ class OptimalWireCutter(VirtualizationPass):
         min_num_fragments = len(dag.qubits) // self._size_to_reach
         min_num_fragments = max(min_num_fragments, 2)
         partitions: dict[int, int] | None = None
-        max_tries = int(os.getenv("QVM_MAX_PARTITION_TRIES", "5"))
+        max_tries = int(os.getenv("QVM_MAX_PARTITION_TRIES", "0"))
         tries = 0
         edges = list(dag.edges())
         while partitions is None:
             tries += 1
-            if tries > max_tries:
+            if max_tries > 0 and tries > max_tries:
                 raise ValueError("Could not find a solution (internal error)")
             if min_num_fragments > len(dag.qubits):
                 raise ValueError("Could not find a solution (internal error)")

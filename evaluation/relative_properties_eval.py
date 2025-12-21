@@ -115,10 +115,38 @@ def _max_metric(vals: List[int]) -> int:
     return int(max(vals))
 
 
-def _maybe_transpile(circuit: QuantumCircuit, do_transpile: bool, opt_level: int) -> QuantumCircuit:
-    if not do_transpile:
+_METRICS_BACKEND = None
+
+
+def _get_metrics_backend(baseline: str):
+    global _METRICS_BACKEND
+    if baseline != "kolkata":
+        return None
+    if _METRICS_BACKEND is not None:
+        return _METRICS_BACKEND
+    try:
+        from qiskit.providers.fake_provider import FakeKolkataV2
+
+        _METRICS_BACKEND = FakeKolkataV2()
+    except Exception:
+        try:
+            from qiskit_ibm_runtime.fake_provider import FakeKolkataV2
+
+            _METRICS_BACKEND = FakeKolkataV2()
+        except Exception as exc:
+            raise RuntimeError(
+                "Kolkata metrics baseline requested but FakeKolkataV2 is unavailable."
+            ) from exc
+    return _METRICS_BACKEND
+
+
+def _apply_metrics_baseline(
+    circuit: QuantumCircuit, baseline: str, opt_level: int
+) -> QuantumCircuit:
+    if baseline == "raw":
         return circuit
-    return transpile(circuit, optimization_level=opt_level)
+    backend = _get_metrics_backend(baseline)
+    return transpile(circuit, backend=backend, optimization_level=opt_level)
 
 
 class SerialPool:
@@ -245,13 +273,13 @@ def _average_fidelity(
 def _analyze_circuit(
     circuit: QuantumCircuit,
     metric_mode: str,
-    transpile_metrics: bool,
-    transpile_opt_level: int,
+    metrics_baseline: str,
+    metrics_opt_level: int,
 ) -> Dict[str, int]:
     if _has_virtual_ops(circuit):
         if metric_mode == "virtual" or metric_mode == "cutqc":
             effective = _replace_virtual_ops(_normalize_circuit(circuit), metric_mode)
-            effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+            effective = _apply_metrics_baseline(effective, metrics_baseline, metrics_opt_level)
             q = Qernel(effective)
             BasicAnalysisPass().run(q)
             m = q.get_metadata()
@@ -266,7 +294,7 @@ def _analyze_circuit(
         nonlocals = []
         for frag_circ in vc.fragment_circuits.values():
             effective = _replace_virtual_ops(frag_circ, metric_mode)
-            effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+            effective = _apply_metrics_baseline(effective, metrics_baseline, metrics_opt_level)
             q = Qernel(effective)
             BasicAnalysisPass().run(q)
             m = q.get_metadata()
@@ -277,7 +305,7 @@ def _analyze_circuit(
             "num_nonlocal_gates": _max_metric(nonlocals),
         }
     effective = _replace_virtual_ops(circuit, metric_mode)
-    effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+    effective = _apply_metrics_baseline(effective, metrics_baseline, metrics_opt_level)
     q = Qernel(effective)
     BasicAnalysisPass().run(q)
     m = q.get_metadata()
@@ -298,8 +326,8 @@ def _extract_circuits(q: Qernel) -> List[QuantumCircuit]:
 def _analyze_qernel(
     q: Qernel,
     metric_mode: str,
-    transpile_metrics: bool,
-    transpile_opt_level: int,
+    metrics_baseline: str,
+    metrics_opt_level: int,
 ) -> Dict[str, int]:
     circuits = []
     vsqs = q.get_virtual_subqernels()
@@ -314,8 +342,8 @@ def _analyze_qernel(
         m = _analyze_circuit(
             c,
             metric_mode,
-            transpile_metrics,
-            transpile_opt_level,
+            metrics_baseline,
+            metrics_opt_level,
         )
         depths.append(m["depth"])
         nonlocals.append(m["num_nonlocal_gates"])
@@ -355,8 +383,8 @@ def _run_mitigator(
                 _analyze_qernel(
                     q,
                     args.metric_mode,
-                    args.transpile_metrics,
-                    args.transpile_optimization_level,
+                    args.metrics_baseline,
+                    args.metrics_optimization_level,
                 ),
                 mitigator.timings,
                 _extract_circuits(q),
@@ -370,8 +398,8 @@ def _run_mitigator(
         _analyze_circuit(
             qc,
             args.metric_mode,
-            args.transpile_metrics,
-            args.transpile_optimization_level,
+            args.metrics_baseline,
+            args.metrics_optimization_level,
         ),
         {},
         [qc],
@@ -463,6 +491,19 @@ def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp:
     if not timing_rows:
         raise ValueError("No timing data to plot.")
 
+    stages = ["analysis", "qaoa_analysis", "qf", "cost_search", "gv", "wc", "qr", "cut_select"]
+    skip_stages = {"total", "overall"}
+    seen = set(stages)
+    for row in timing_rows:
+        for k in row.keys():
+            if k in {"bench", "size", "method"}:
+                continue
+            if k in skip_stages:
+                continue
+            if k not in seen:
+                stages.append(k)
+                seen.add(k)
+
     # Aggregate mean timing per method and size.
     groups: Dict[Tuple[int, str], Dict[str, List[float]]] = {}
     for row in timing_rows:
@@ -475,32 +516,124 @@ def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp:
                 continue
             groups[key].setdefault(k, []).append(float(v))
 
-    stages = ["analysis", "qaoa_analysis", "qf", "cost_search", "gv", "wc", "qr", "cut_select"]
     sizes = sorted({int(r["size"]) for r in timing_rows})
     methods = ["QOS", "FrozenQubits", "CutQC"]
 
-    fig, axes = plt.subplots(1, len(sizes), figsize=(5.5 * len(sizes), 3.5))
-    if len(sizes) == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(len(sizes), 3, figsize=(16.5, 3.8 * len(sizes)))
+    axes = np.array(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape(1, 3)
 
-    for ax, size in zip(axes, sizes):
+    for row_idx, size in enumerate(sizes):
+        ax = axes[row_idx, 0]
         x = np.arange(len(methods))
         bottom = np.zeros(len(methods))
+        totals = np.zeros(len(methods))
         for stage in stages:
             vals = []
             for method in methods:
                 stage_vals = groups.get((size, method), {}).get(stage, [])
-                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+                val = sum(stage_vals) / max(1, len(stage_vals))
+                vals.append(val)
             ax.bar(x, vals, bottom=bottom, label=stage)
             bottom = bottom + np.array(vals)
+            totals = totals + np.array(vals)
 
-        ax.set_title(f"Timing Breakdown - {size} qubits")
+        ax.set_title(f"Timing Breakdown (Avg) - {size} qubits")
         ax.set_ylabel("Seconds")
         ax.set_xticks(x)
         ax.set_xticklabels(methods)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
+        for idx, total in enumerate(totals):
+            ax.text(
+                x[idx],
+                total,
+                f"{total:.2f}s",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
 
-    handles, labels = axes[0].get_legend_handles_labels()
+        ax = axes[row_idx, 1]
+        bench_labels = []
+        for bench, label in BENCHES:
+            if any(int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench for r in timing_rows):
+                bench_labels.append((bench, label))
+        x = np.arange(len(bench_labels))
+        bottom = np.zeros(len(bench_labels))
+        for stage in stages:
+            vals = []
+            for bench, _label in bench_labels:
+                stage_vals = []
+                for row in timing_rows:
+                    if int(row["size"]) != size:
+                        continue
+                    if row["method"] != "QOS":
+                        continue
+                    if row["bench"] != bench:
+                        continue
+                    if stage in row:
+                        stage_vals.append(float(row[stage]))
+                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+            ax.bar(x, vals, bottom=bottom, label=stage)
+            bottom = bottom + np.array(vals)
+
+        ax.set_title(f"QOS Timing by Circuit - {size} qubits")
+        ax.set_ylabel("Seconds")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+        ax = axes[row_idx, 2]
+        x = np.arange(len(bench_labels))
+        bottom = np.zeros(len(bench_labels))
+        for stage in stages:
+            vals = []
+            totals = []
+            for bench, _label in bench_labels:
+                stage_vals = []
+                for row in timing_rows:
+                    if int(row["size"]) != size:
+                        continue
+                    if row["method"] != "QOS":
+                        continue
+                    if row["bench"] != bench:
+                        continue
+                    if stage in row:
+                        stage_vals.append(float(row[stage]))
+                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+            for idx, bench in enumerate(bench_labels):
+                total = 0.0
+                for stage_total in stages:
+                    stage_vals = []
+                    for row in timing_rows:
+                        if int(row["size"]) != size:
+                            continue
+                        if row["method"] != "QOS":
+                            continue
+                        if row["bench"] != bench[0]:
+                            continue
+                        if stage_total in row:
+                            stage_vals.append(float(row[stage_total]))
+                    total += sum(stage_vals) / max(1, len(stage_vals))
+                totals.append(total)
+            pct_vals = []
+            for v, total in zip(vals, totals):
+                if total <= 0:
+                    pct_vals.append(0.0)
+                else:
+                    pct_vals.append((v / total) * 100.0)
+            ax.bar(x, pct_vals, bottom=bottom, label=stage)
+            bottom = bottom + np.array(pct_vals)
+
+        ax.set_title(f"QOS Timing % by Circuit - {size} qubits")
+        ax.set_ylabel("Percent of total")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+        ax.set_ylim(0, 100)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, ncol=4, fontsize=7, loc="upper center")
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     out_path = out_dir / f"timing_breakdown_{timestamp}.pdf"
@@ -557,8 +690,8 @@ def _run_eval(args, benches, sizes):
             base = _analyze_circuit(
                 qc,
                 args.metric_mode,
-                args.transpile_metrics,
-                args.transpile_optimization_level,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
             )
             if args.verbose:
                 print(f"  baseline depth={base['depth']} cnot={base['num_nonlocal_gates']}", flush=True)
@@ -702,10 +835,22 @@ def main() -> None:
     parser.add_argument("--size-to-reach", type=int, default=7)
     parser.add_argument("--ideal-size-to-reach", type=int, default=2)
     parser.add_argument("--timeout-sec", type=int, default=45)
-    parser.add_argument("--clingo-timeout-sec", type=int, default=30)
-    parser.add_argument("--max-partition-tries", type=int, default=5)
-    parser.add_argument("--qos-cost-search", action="store_true")
-    parser.add_argument("--qos-cost-search-max-iters", type=int, default=6)
+    parser.add_argument("--clingo-timeout-sec", type=int, default=0, help="0 disables clingo timeout.")
+    parser.add_argument("--max-partition-tries", type=int, default=0, help="0 disables partition-try limit.")
+    parser.add_argument(
+        "--qos-cost-search",
+        dest="qos_cost_search",
+        action="store_true",
+        default=True,
+        help="Enable cost-search (default).",
+    )
+    parser.add_argument(
+        "--no-qos-cost-search",
+        dest="qos_cost_search",
+        action="store_false",
+        help="Disable cost-search.",
+    )
+    parser.add_argument("--qos-cost-search-max-iters", type=int, default=0, help="0 disables cost-search iteration limit.")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--tag", default="", help="Optional tag to include in output filenames.")
     parser.add_argument("--collect-timing", action="store_true")
@@ -723,8 +868,13 @@ def main() -> None:
         default="gv",
         help="CutQC baseline method: gv (gate cutting) or wc (wire cutting).",
     )
-    parser.add_argument("--transpile-metrics", action="store_true")
-    parser.add_argument("--transpile-optimization-level", type=int, default=3)
+    parser.add_argument(
+        "--metrics-baseline",
+        choices=["raw", "kolkata"],
+        default="raw",
+        help="Baseline for metrics: raw circuit or transpiled to IBM Kolkata.",
+    )
+    parser.add_argument("--metrics-optimization-level", type=int, default=3)
     parser.add_argument(
         "--metric-mode",
         choices=["virtual", "fragment", "cutqc"],
