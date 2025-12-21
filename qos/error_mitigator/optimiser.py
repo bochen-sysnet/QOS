@@ -12,16 +12,31 @@ from qos.error_mitigator.types import TransformationPass
 from qos.types.types import Engine, Qernel
 #import qos.database as db
 
-from qvm.compiler.virtualization import BisectionPass, OptimalDecompositionPass
-from qvm.compiler.virtualization.reduce_deps import CircularDependencyBreaker, GreedyDependencyBreaker, QubitDependencyMinimizer
+try:
+    from qvm.compiler.virtualization.reduce_deps import (
+        CircularDependencyBreaker,
+        GreedyDependencyBreaker,
+        QubitDependencyMinimizer,
+    )
+except ModuleNotFoundError:
+    CircularDependencyBreaker = None
+    GreedyDependencyBreaker = None
+    QubitDependencyMinimizer = None
+
 from qvm.compiler.distr_transpiler import QubitReuser
-from qvm.compiler.virtualization.wire_decomp import OptimalWireCutter
 from qvm import VirtualCircuit
 from qvm.compiler.dag import *
 import numpy as np
 
-from FrozenQubits.helper_FrozenQubits import drop_hotspot_node, halt_qubits
-from FrozenQubits.helper_qaoa import pqc_QAOA, bind_QAOA, _gen_angles
+try:
+    from FrozenQubits.helper_FrozenQubits import drop_hotspot_node, halt_qubits
+    from FrozenQubits.helper_qaoa import pqc_QAOA, bind_QAOA, _gen_angles
+except Exception:
+    drop_hotspot_node = None
+    halt_qubits = None
+    pqc_QAOA = None
+    bind_QAOA = None
+    _gen_angles = None
 
 
 class GateVirtualizationPass(TransformationPass):
@@ -70,6 +85,7 @@ class GVBisectionPass(GateVirtualizationPass):
         return "BisectionPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        from qvm.compiler.virtualization import BisectionPass
         bisection_pass = BisectionPass(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
 
@@ -91,6 +107,7 @@ class GVBisectionPass(GateVirtualizationPass):
         return q
     
     def cost(self, q: Qernel) -> int:
+        from qvm.compiler.virtualization import BisectionPass
         optimal_bisection_pass = BisectionPass(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
         cost = 0
@@ -118,6 +135,7 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
         return "OptimalDecompositionPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        from qvm.compiler.virtualization import OptimalDecompositionPass
         optimal_decomposition_pass = OptimalDecompositionPass(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
 
@@ -139,6 +157,7 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
         return q
     
     def cost(self, q: Qernel, final_cost) -> int:
+        from qvm.compiler.virtualization import OptimalDecompositionPass
         optimal_decomposition_pass = OptimalDecompositionPass(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
         cost = 0
@@ -147,12 +166,18 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
             highest_cost = 0
             for vsq in vsqs:
                 qc = vsq.get_circuit()
-                cost = optimal_decomposition_pass.get_budget(qc)
+                try:
+                    cost = optimal_decomposition_pass.get_budget(qc)
+                except ValueError:
+                    cost = 1000
                 if cost > highest_cost:
                     highest_cost = cost
         else:
             qc = q.get_circuit()        
-            cost = optimal_decomposition_pass.get_budget(qc) 
+            try:
+                cost = optimal_decomposition_pass.get_budget(qc)
+            except ValueError:
+                cost = 1000
 
         final_cost.value = cost
 
@@ -163,6 +188,8 @@ class CircularDependencyBreakerPass(GateVirtualizationPass):
         return "CircularDependencyBreakerPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        if CircularDependencyBreaker is None:
+            raise RuntimeError("Dependency breaker requires clingo.")
         circular_dependency_breaker_pass = CircularDependencyBreaker()
         vsqs = q.get_virtual_subqernels()
 
@@ -188,6 +215,8 @@ class GreedyDependencyBreakerPass(GateVirtualizationPass):
         return "GreedyDependencyBreakerPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        if GreedyDependencyBreaker is None:
+            raise RuntimeError("Dependency breaker requires clingo.")
         greedy_dependency_breaker_pass = GreedyDependencyBreaker()
         vsqs = q.get_virtual_subqernels()
 
@@ -213,6 +242,8 @@ class QubitDependencyMinimizerPass(GateVirtualizationPass):
         return "QubitDependencyMinimizerPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        if QubitDependencyMinimizer is None:
+            raise RuntimeError("Dependency minimizer requires clingo.")
         qubit_dependency_minimizer_pass = QubitDependencyMinimizer()
         vsqs = q.get_virtual_subqernels()
 
@@ -274,6 +305,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
         return "OptimalWireCuttingPass"
     
     def run(self, q: Qernel, budget: int) -> Qernel:
+        from qvm.compiler.virtualization.wire_decomp import OptimalWireCutter
         optimal_wire_cutting_pass = OptimalWireCutter(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
 
@@ -328,6 +360,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
         return q
     
     def cost(self, q: Qernel, final_cost) -> int:
+        from qvm.compiler.virtualization.wire_decomp import OptimalWireCutter
         optimal_wire_cutting_pass = OptimalWireCutter(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
         cost = 0
@@ -336,12 +369,18 @@ class OptimalWireCuttingPass(WireCuttingPass):
             highest_cost = 0
             for vsq in vsqs:
                 qc = vsq.get_circuit()
-                cost = optimal_wire_cutting_pass.get_budget(qc)
+                try:
+                    cost = optimal_wire_cutting_pass.get_budget(qc)
+                except ValueError:
+                    cost = 1000
                 if cost > highest_cost:
                     highest_cost = cost
         else:
             qc = q.get_circuit()        
-            cost = optimal_wire_cutting_pass.get_budget(qc) 
+            try:
+                cost = optimal_wire_cutting_pass.get_budget(qc)
+            except ValueError:
+                cost = 1000
         
         final_cost.value = cost
 
@@ -357,6 +396,9 @@ class FrozenQubitsPass(QubitFreezingPass):
         return "FrozenQubitsPass"
     
     def run(self, q: Qernel) -> Qernel:
+        if drop_hotspot_node is None:
+            raise RuntimeError("FrozenQubits dependencies are missing; qubit freezing unavailable.")
+
         circuit = q.get_circuit()
         metadata = q.get_metadata()
         h = metadata['h']

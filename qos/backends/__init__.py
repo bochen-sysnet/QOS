@@ -1,1 +1,4 @@
-from .ibm_backends import IBMQPU
+try:
+    from .ibm_backends import IBMQPU
+except Exception:
+    IBMQPU = None

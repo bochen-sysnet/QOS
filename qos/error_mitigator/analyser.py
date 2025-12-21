@@ -5,7 +5,10 @@ from qos.types.types import Qernel
 from qos.error_mitigator.types import AnalysisPass
 from qvm.compiler.dag import *
 
-from FrozenQubits.helper_FrozenQubits import get_nodes_sorted_by_degree
+try:
+    from FrozenQubits.helper_FrozenQubits import get_nodes_sorted_by_degree
+except Exception:
+    get_nodes_sorted_by_degree = None
 
 import networkx as nx
 import numpy as np
@@ -269,6 +272,9 @@ class QAOAAnalysisPass(DAGAnalysisPass):
     def run(self, qernel: Qernel) -> None:
         qc = qernel.get_circuit()
 
+        if get_nodes_sorted_by_degree is None:
+            raise RuntimeError("FrozenQubits dependencies are missing; QAOA analysis unavailable.")
+
         h = self.generate_h(qc)
         J = self.generate_J(qc)
 
@@ -310,8 +316,8 @@ class QAOAAnalysisPass(DAGAnalysisPass):
                     else:
                         J[(instr.qubits[0].index, instr.qubits[1].index)] = -1
                 if instr.operation.name == 'cx':
-                    if instr.qubits[1].index == i:
-                        op1 = instr.qubits[0].index
+                    if qc.find_bit(instr.qubits[1]).index == i:
+                        op1 = qc.find_bit(instr.qubits[0]).index
                         v = J.get((op1, i))
                         if v is not None:
                             continue
@@ -321,7 +327,7 @@ class QAOAAnalysisPass(DAGAnalysisPass):
                 if instr.operation.name == 'rz':
                     if prev_op != 'cx':
                         continue
-                    if instr.qubits[0].index == i:    
+                    if qc.find_bit(instr.qubits[0]).index == i:
                         param = instr.operation.params[0]
 
                         if param > 0:

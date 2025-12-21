@@ -32,6 +32,8 @@ def dynamic_measure_and_reset(dag: DAG) -> None:
     Args:
         dag (DAG): The DAG to modify.
     """
+    if not hasattr(XGate(), "c_if"):
+        return
     nodes = list(dag.nodes())
     for node in nodes:
         instr = dag.get_node_instr(node)
@@ -48,8 +50,9 @@ def dynamic_measure_and_reset(dag: DAG) -> None:
         next_instr = dag.get_node_instr(next_node)
         if not isinstance(next_instr.operation, Reset):
             continue
-
-        next_instr.operation = XGate().c_if(clbit, 1)
+        new_op = XGate().c_if(clbit, 1)
+        new_instr = CircuitInstruction(new_op, next_instr.qubits, next_instr.clbits)
+        dag.nodes[next_node]["instr"] = new_instr
 
 
 def random_qubit_reuse(dag: DAG, size_to_reach: int = 1) -> None:
@@ -88,10 +91,12 @@ def reuse(dag: DAG, qubit: Qubit, reused_qubit: Qubit) -> None:
 
     for node in dag.nodes:
         instr = dag.get_node_instr(node)
-        instr.qubits = [
+        new_qubits = [
             reused_qubit if instr_qubit == qubit else instr_qubit
             for instr_qubit in instr.qubits
         ]
+        new_instr = CircuitInstruction(instr.operation, new_qubits, instr.clbits)
+        dag.nodes[node]["instr"] = new_instr
 
 
 def is_dependent_qubit(dag: DAG, u_qubit: Qubit, v_qubit: Qubit) -> bool:

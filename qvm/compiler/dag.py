@@ -81,7 +81,9 @@ class DAG(nx.DiGraph):
 
     def virtualize_node(self, node: int) -> None:
         instr = self.get_node_instr(node)
-        instr.operation = VIRTUAL_GATE_TYPES[instr.operation.name](instr.operation)
+        new_op = VIRTUAL_GATE_TYPES[instr.operation.name](instr.operation)
+        new_instr = CircuitInstruction(new_op, instr.qubits, instr.clbits)
+        self.nodes[node]["instr"] = new_instr
 
 
     def to_circuit(self) -> QuantumCircuit:
@@ -164,7 +166,8 @@ class DAG(nx.DiGraph):
         for node in self.nodes:
             instr = self.get_node_instr(node)
             new_qubits = [qubit_mapping[qubit] for qubit in instr.qubits]
-            instr.qubits = new_qubits
+            new_instr = CircuitInstruction(instr.operation, new_qubits, instr.clbits)
+            self.nodes[node]["instr"] = new_instr
 
         self._qregs = [new_qreg]
 
@@ -194,7 +197,9 @@ class DAG(nx.DiGraph):
 
         for node in self.nodes:
             instr = self.get_node_instr(node)
-            instr.qubits = [qubit_map[qubit] for qubit in instr.qubits]
+            new_qubits = [qubit_map[qubit] for qubit in instr.qubits]
+            new_instr = CircuitInstruction(instr.operation, new_qubits, instr.clbits)
+            self.nodes[node]["instr"] = new_instr
         self._qregs = new_frags
 
 

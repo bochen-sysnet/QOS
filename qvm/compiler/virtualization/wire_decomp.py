@@ -1,4 +1,5 @@
 import networkx as nx
+import os
 from qiskit.circuit import QuantumCircuit, QuantumRegister, CircuitInstruction, Qubit
 from qiskit.circuit.library import SwapGate
 
@@ -17,7 +18,6 @@ class OptimalWireCutter(VirtualizationPass):
     def run(self, circuit: QuantumCircuit, budget: int) -> QuantumCircuit:
         dag = DAG(circuit)
         num_cuts = self._cut_wires(dag)
-        new_circuit = dag.to_circuit()
         self._wire_cuts_to_moves(dag, num_cuts)
         dag.fragment()
         new_circuit = dag.to_circuit()
@@ -29,8 +29,13 @@ class OptimalWireCutter(VirtualizationPass):
         min_num_fragments = len(dag.qubits) // self._size_to_reach
         min_num_fragments = max(min_num_fragments, 2)
         partitions: dict[int, int] | None = None
+        max_tries = int(os.getenv("QVM_MAX_PARTITION_TRIES", "5"))
+        tries = 0
         edges = list(dag.edges())
         while partitions is None:
+            tries += 1
+            if tries > max_tries:
+                raise ValueError("Could not find a solution (internal error)")
             if min_num_fragments > len(dag.qubits):
                 raise ValueError("Could not find a solution (internal error)")
             partitions = self._find_optimal_partitons(dag, min_num_fragments)
@@ -68,11 +73,14 @@ class OptimalWireCutter(VirtualizationPass):
         cut_ctr = 0
         for node in nx.topological_sort(dag):
             instr = dag.get_node_instr(node)
-            instr.qubits = [_find_qubit(qubit) for qubit in instr.qubits]
+            mapped_qubits = [_find_qubit(qubit) for qubit in instr.qubits]
+            instr = CircuitInstruction(instr.operation, mapped_qubits, instr.clbits)
+            dag.nodes[node]["instr"] = instr
             if isinstance(instr.operation, WireCut):
-                instr.operation = VirtualMove(SwapGate())
-                instr.qubits.append(move_reg[cut_ctr])
-                qubit_mapping[instr.qubits[0]] = instr.qubits[1]
+                new_qubits = list(instr.qubits) + [move_reg[cut_ctr]]
+                new_instr = CircuitInstruction(VirtualMove(SwapGate()), new_qubits, instr.clbits)
+                dag.nodes[node]["instr"] = new_instr
+                qubit_mapping[new_qubits[0]] = new_qubits[1]
                 cut_ctr += 1
 
     def _find_optimal_partitons(

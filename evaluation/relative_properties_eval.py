@@ -1,0 +1,881 @@
+import argparse
+import csv
+import datetime as dt
+from pathlib import Path
+import sys
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import site
+import signal
+import os
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Ensure conda site-packages precedes user site-packages.
+USER_SITE = site.getusersitepackages()
+if USER_SITE in sys.path:
+    sys.path.remove(USER_SITE)
+    sys.path.append(USER_SITE)
+
+from qiskit import QuantumCircuit, ClassicalRegister, transpile
+from qiskit.converters import circuit_to_dag, dag_to_circuit
+
+from qos.error_mitigator.analyser import BasicAnalysisPass
+from qos.error_mitigator.run import ErrorMitigator
+from qos.types.types import Qernel
+from qvm.quasi_distr import QuasiDistr
+from qvm.virtual_circuit import VirtualCircuit, generate_instantiations
+from qvm.virtual_gates import VirtualBinaryGate, VirtualMove, WireCut, VirtualGateEndpoint
+from qiskit.circuit.library import CXGate
+
+
+BENCHES = [
+    ("qaoa_r3", "QAOA-R3"),
+    ("bv", "BV"),
+    ("ghz", "GHZ"),
+    ("hamsim_1", "HS-1"),
+    ("qaoa_pl1", "QAOA-P1"),
+    ("qsvm", "QSVM"),
+    ("twolocal_1", "TL-1"),
+    ("vqe_1", "VQE-1"),
+    ("wstate", "W-STATE"),
+]
+
+TARGET_REL = {
+    "depth": {
+        "QOS": 1 - 0.46,
+        "CutQC": 1 - 0.386,
+        "FrozenQubits": 1 - 0.294,
+    },
+    "nonlocal": {
+        "QOS": 1 - 0.705,
+        "CutQC": 1 - 0.66,
+        "FrozenQubits": 1 - 0.566,
+    },
+}
+
+
+def _benchmarks_dir() -> Path:
+    return Path(__file__).resolve().parent / "benchmarks"
+
+
+def _load_qasm_circuit(bench: str, nqubits: int) -> QuantumCircuit:
+    circuits_dir = _benchmarks_dir() / bench
+    candidates = [
+        p for p in circuits_dir.glob("*.qasm") if p.stem.isdigit() and int(p.stem) == nqubits
+    ]
+    if not candidates:
+        raise ValueError(f"No qasm file found for {bench} with {nqubits} qubits.")
+    circuit = QuantumCircuit.from_qasm_file(str(candidates[0]))
+    dag = circuit_to_dag(circuit)
+    dag.remove_all_ops_named("barrier")
+    return dag_to_circuit(dag)
+
+
+def _normalize_circuit(circuit):
+    if isinstance(circuit, VirtualCircuit):
+        return circuit._circuit
+    return circuit
+
+
+def _has_virtual_ops(circuit: QuantumCircuit) -> bool:
+    qc = _normalize_circuit(circuit)
+    for instr in qc.data:
+        op = instr.operation
+        if isinstance(op, (VirtualBinaryGate, VirtualMove, VirtualGateEndpoint, WireCut)):
+            return True
+    return False
+
+
+def _replace_virtual_ops(circuit: QuantumCircuit, metric_mode: str) -> QuantumCircuit:
+    qc = _normalize_circuit(circuit)
+    new_circuit = QuantumCircuit(*qc.qregs, *qc.cregs)
+    for instr in qc.data:
+        op = instr.operation
+        if isinstance(op, (VirtualBinaryGate, VirtualMove, VirtualGateEndpoint)):
+            if metric_mode == "cutqc":
+                continue
+            if len(instr.qubits) == 2:
+                new_circuit.append(CXGate(), instr.qubits, instr.clbits)
+            else:
+                continue
+        elif isinstance(op, WireCut):
+            continue
+        else:
+            new_circuit.append(op, instr.qubits, instr.clbits)
+    return new_circuit
+
+
+def _max_metric(vals: List[int]) -> int:
+    if not vals:
+        return 0
+    return int(max(vals))
+
+
+def _maybe_transpile(circuit: QuantumCircuit, do_transpile: bool, opt_level: int) -> QuantumCircuit:
+    if not do_transpile:
+        return circuit
+    return transpile(circuit, optimization_level=opt_level)
+
+
+class SerialPool:
+    def map(self, fn, iterable):
+        return list(map(fn, iterable))
+
+    def starmap(self, fn, iterable):
+        return [fn(*args) for args in iterable]
+
+
+def _ensure_measurements(circuit: QuantumCircuit | VirtualCircuit) -> QuantumCircuit:
+    if isinstance(circuit, VirtualCircuit):
+        circuit = circuit._circuit
+    if circuit.num_clbits == 0:
+        creg = ClassicalRegister(circuit.num_qubits)
+        circuit = circuit.copy()
+        circuit.add_register(creg)
+        circuit.measure(range(circuit.num_qubits), range(circuit.num_qubits))
+        return circuit
+    if not any(instr.operation.name == "measure" for instr in circuit.data):
+        circuit = circuit.copy()
+        circuit.measure(range(circuit.num_qubits), range(circuit.num_qubits))
+    return circuit
+
+
+def _import_aer():
+    try:
+        from qiskit_aer import AerSimulator  # type: ignore
+        from qiskit_aer.noise import NoiseModel, depolarizing_error  # type: ignore
+        return AerSimulator, NoiseModel, depolarizing_error
+    except ModuleNotFoundError:
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.append(user_site)
+        from qiskit_aer import AerSimulator  # type: ignore
+        from qiskit_aer.noise import NoiseModel, depolarizing_error  # type: ignore
+        return AerSimulator, NoiseModel, depolarizing_error
+
+
+def _noise_model(p1: float, p2: float):
+    AerSimulator, NoiseModel, depolarizing_error = _import_aer()
+    noise = NoiseModel()
+    err1 = depolarizing_error(p1, 1)
+    err2 = depolarizing_error(p2, 2)
+    one_q = ["x", "y", "z", "h", "rx", "ry", "rz", "sx", "id", "s", "sdg"]
+    two_q = ["cx", "cz", "swap", "rzz", "cp", "ecr"]
+    noise.add_all_qubit_quantum_error(err1, one_q)
+    noise.add_all_qubit_quantum_error(err2, two_q)
+    return noise
+
+
+def _counts_to_probs(counts: Dict[str, int]) -> Dict[str, float]:
+    shots = max(1, sum(counts.values()))
+    return {k: v / shots for k, v in counts.items()}
+
+
+def _hellinger_fidelity_from_counts(ideal: Dict[str, int], noisy: Dict[str, int]) -> float:
+    p = _counts_to_probs(ideal)
+    q = _counts_to_probs(noisy)
+    if not p or not q:
+        return 0.0
+    keys = set(p.keys()) | set(q.keys())
+    bc = 0.0
+    for k in keys:
+        bc += (p.get(k, 0.0) * q.get(k, 0.0)) ** 0.5
+    return bc * bc
+
+
+def _simulate_counts(circuit: QuantumCircuit, shots: int, noise, seed: int) -> Dict[str, int]:
+    AerSimulator, _, _ = _import_aer()
+    sim = AerSimulator(noise_model=noise) if noise else AerSimulator()
+    circ = _ensure_measurements(circuit)
+    result = sim.run(circ, shots=shots, seed_simulator=seed, seed_transpiler=seed).result()
+    return result.get_counts()
+
+
+def _simulate_virtual_counts(
+    circuit: QuantumCircuit | VirtualCircuit,
+    shots: int,
+    noise,
+    seed: int,
+) -> Dict[str, int]:
+    vc = circuit if isinstance(circuit, VirtualCircuit) else VirtualCircuit(circuit)
+    results: Dict = {}
+    for frag, frag_circ in vc.fragment_circuits.items():
+        inst_labels = vc.get_instance_labels(frag)
+        instantiations = generate_instantiations(frag_circ, inst_labels)
+        distrs = []
+        for inst in instantiations:
+            counts = _simulate_counts(inst, shots, noise, seed)
+            distrs.append(QuasiDistr.from_counts(counts))
+        results[frag] = distrs
+    quasi = vc.knit(results, SerialPool())
+    return quasi.to_counts(vc._circuit.num_clbits, shots)
+
+
+def _fidelity_for_circuit(
+    circuit: QuantumCircuit,
+    shots: int,
+    noise,
+    seed: int,
+) -> float:
+    if _has_virtual_ops(circuit):
+        ideal = _simulate_virtual_counts(circuit, shots, None, seed)
+        noisy = _simulate_virtual_counts(circuit, shots, noise, seed)
+    else:
+        ideal = _simulate_counts(circuit, shots, None, seed)
+        noisy = _simulate_counts(circuit, shots, noise, seed)
+    if not ideal or not noisy:
+        return 0.0
+    return _hellinger_fidelity_from_counts(ideal, noisy)
+
+
+def _average_fidelity(
+    circuits: List[QuantumCircuit],
+    shots: int,
+    noise,
+    seed: int,
+) -> float:
+    vals = [_fidelity_for_circuit(c, shots, noise, seed) for c in circuits]
+    return float(sum(vals) / max(1, len(vals)))
+
+
+def _analyze_circuit(
+    circuit: QuantumCircuit,
+    metric_mode: str,
+    transpile_metrics: bool,
+    transpile_opt_level: int,
+) -> Dict[str, int]:
+    if _has_virtual_ops(circuit):
+        if metric_mode == "virtual" or metric_mode == "cutqc":
+            effective = _replace_virtual_ops(_normalize_circuit(circuit), metric_mode)
+            effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+            q = Qernel(effective)
+            BasicAnalysisPass().run(q)
+            m = q.get_metadata()
+            cnot = int(m.get("num_cnot_gates", m.get("num_nonlocal_gates", 0)))
+            return {
+                "depth": int(m.get("depth", 0)),
+                "num_nonlocal_gates": cnot,
+            }
+
+        vc = VirtualCircuit(_normalize_circuit(circuit))
+        depths = []
+        nonlocals = []
+        for frag_circ in vc.fragment_circuits.values():
+            effective = _replace_virtual_ops(frag_circ, metric_mode)
+            effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+            q = Qernel(effective)
+            BasicAnalysisPass().run(q)
+            m = q.get_metadata()
+            depths.append(int(m.get("depth", 0)))
+            nonlocals.append(int(m.get("num_cnot_gates", m.get("num_nonlocal_gates", 0))))
+        return {
+            "depth": max(depths) if depths else 0,
+            "num_nonlocal_gates": _max_metric(nonlocals),
+        }
+    effective = _replace_virtual_ops(circuit, metric_mode)
+    effective = _maybe_transpile(effective, transpile_metrics, transpile_opt_level)
+    q = Qernel(effective)
+    BasicAnalysisPass().run(q)
+    m = q.get_metadata()
+    cnot = int(m.get("num_cnot_gates", m.get("num_nonlocal_gates", 0)))
+    return {
+        "depth": int(m.get("depth", 0)),
+        "num_nonlocal_gates": cnot,
+    }
+
+
+def _extract_circuits(q: Qernel) -> List[QuantumCircuit]:
+    vsqs = q.get_virtual_subqernels()
+    if vsqs:
+        return [vsq.get_circuit() for vsq in vsqs]
+    return [q.get_circuit()]
+
+
+def _analyze_qernel(
+    q: Qernel,
+    metric_mode: str,
+    transpile_metrics: bool,
+    transpile_opt_level: int,
+) -> Dict[str, int]:
+    circuits = []
+    vsqs = q.get_virtual_subqernels()
+    if vsqs:
+        circuits = [_normalize_circuit(vsq.get_circuit()) for vsq in vsqs]
+    else:
+        circuits = [_normalize_circuit(q.get_circuit())]
+
+    depths = []
+    nonlocals = []
+    for c in circuits:
+        m = _analyze_circuit(
+            c,
+            metric_mode,
+            transpile_metrics,
+            transpile_opt_level,
+        )
+        depths.append(m["depth"])
+        nonlocals.append(m["num_nonlocal_gates"])
+
+    return {
+        "depth": max(depths) if depths else 0,
+        "num_nonlocal_gates": _max_metric(nonlocals),
+    }
+
+
+def _run_mitigator(
+    qc: QuantumCircuit, methods: List[str], args
+) -> Tuple[Dict[str, int], Dict[str, float], List[QuantumCircuit]]:
+    size_candidates = [args.size_to_reach, qc.num_qubits]
+    budget = args.budget
+
+    for size_to_reach in size_candidates:
+        q = Qernel(qc.copy())
+        use_cost_search = bool(methods == [] and args.qos_cost_search)
+        mitigator = ErrorMitigator(
+            size_to_reach=size_to_reach,
+            ideal_size_to_reach=args.ideal_size_to_reach,
+            budget=budget,
+            methods=methods,
+            use_cost_search=use_cost_search,
+            collect_timing=args.collect_timing,
+        )
+        try:
+            use_alarm = not (methods == [] or "WC" in methods or "GV" in methods)
+            if use_alarm:
+                signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
+                signal.alarm(args.timeout_sec)
+            q = mitigator.run(q)
+            if use_alarm:
+                signal.alarm(0)
+            return (
+                _analyze_qernel(
+                    q,
+                    args.metric_mode,
+                    args.transpile_metrics,
+                    args.transpile_optimization_level,
+                ),
+                mitigator.timings,
+                _extract_circuits(q),
+            )
+        except (ValueError, TimeoutError):
+            if "SIGALRM" in signal.Signals.__members__:
+                signal.alarm(0)
+            continue
+
+    return (
+        _analyze_circuit(
+            qc,
+            args.metric_mode,
+            args.transpile_metrics,
+            args.transpile_optimization_level,
+        ),
+        {},
+        [qc],
+    )
+
+
+def _relative(value: float, baseline: float) -> float:
+    if baseline == 0:
+        return 1.0
+    return value / baseline
+
+
+def _plot_panel(
+    ax,
+    title: str,
+    rel_data: Dict[str, Dict[str, float]],
+    benches: List[Tuple[str, str]],
+    methods: List[str],
+    ylabel: str,
+) -> None:
+    x = np.arange(len(methods))
+    width = 0.08
+    for i, (bench, label) in enumerate(benches):
+        vals = [rel_data[bench].get(m, 1.0) for m in methods]
+        ax.bar(x + (i - len(benches) / 2) * width, vals, width, label=label)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+
+def _plot_combined(
+    rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]],
+    benches: List[Tuple[str, str]],
+    out_dir: Path,
+    timestamp: str,
+    fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+) -> Path:
+    plt = _import_matplotlib()
+    sizes = sorted(rel_by_size.keys())
+    rows = max(1, len(sizes))
+    cols = 3 if fidelity_by_size else 2
+    fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 3.6 * rows))
+    if rows == 1:
+        axes = np.array([axes])
+
+    for row, size in enumerate(sizes):
+        rel_depth, rel_nonlocal = rel_by_size[size]
+        _plot_panel(
+            axes[row, 0],
+            f"Depth - {size} qubits (lower is better)",
+            rel_depth,
+            benches,
+            ["FrozenQubits", "CutQC", "QOS"],
+            "Relative to Qiskit",
+        )
+        _plot_panel(
+            axes[row, 1],
+            f"Number of CNOT gates - {size} qubits (lower is better)",
+            rel_nonlocal,
+            benches,
+            ["FrozenQubits", "CutQC", "QOS"],
+            "Relative to Qiskit",
+        )
+        if fidelity_by_size:
+            fidelity = fidelity_by_size.get(size, {})
+            _plot_panel(
+                axes[row, 2],
+                f"Hellinger fidelity - {size} qubits (higher is better)",
+                fidelity,
+                benches,
+                ["Qiskit", "FrozenQubits", "CutQC", "QOS"],
+                "Fidelity",
+            )
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=3, fontsize=8, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    out_path = out_dir / f"relative_properties_compare_{timestamp}.pdf"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp: str) -> Path:
+    plt = _import_matplotlib()
+    if not timing_rows:
+        raise ValueError("No timing data to plot.")
+
+    # Aggregate mean timing per method and size.
+    groups: Dict[Tuple[int, str], Dict[str, List[float]]] = {}
+    for row in timing_rows:
+        size = int(row["size"])
+        method = str(row["method"])
+        key = (size, method)
+        groups.setdefault(key, {})
+        for k, v in row.items():
+            if k in {"bench", "size", "method"}:
+                continue
+            groups[key].setdefault(k, []).append(float(v))
+
+    stages = ["analysis", "qaoa_analysis", "qf", "cost_search", "gv", "wc", "qr", "cut_select"]
+    sizes = sorted({int(r["size"]) for r in timing_rows})
+    methods = ["QOS", "FrozenQubits", "CutQC"]
+
+    fig, axes = plt.subplots(1, len(sizes), figsize=(5.5 * len(sizes), 3.5))
+    if len(sizes) == 1:
+        axes = [axes]
+
+    for ax, size in zip(axes, sizes):
+        x = np.arange(len(methods))
+        bottom = np.zeros(len(methods))
+        for stage in stages:
+            vals = []
+            for method in methods:
+                stage_vals = groups.get((size, method), {}).get(stage, [])
+                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+            ax.bar(x, vals, bottom=bottom, label=stage)
+            bottom = bottom + np.array(vals)
+
+        ax.set_title(f"Timing Breakdown - {size} qubits")
+        ax.set_ylabel("Seconds")
+        ax.set_xticks(x)
+        ax.set_xticklabels(methods)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=4, fontsize=7, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    out_path = out_dir / f"timing_breakdown_{timestamp}.pdf"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _summarize(rows: List[Dict[str, object]]) -> Dict[str, float]:
+    def _avg(key: str) -> float:
+        vals = [float(r[key]) for r in rows]
+        return sum(vals) / max(1, len(vals))
+
+    summary = {
+        "rel_depth_qos": _avg("rel_depth_qos"),
+        "rel_depth_cutqc": _avg("rel_depth_cutqc"),
+        "rel_depth_fq": _avg("rel_depth_fq"),
+        "rel_nonlocal_qos": _avg("rel_nonlocal_qos"),
+        "rel_nonlocal_cutqc": _avg("rel_nonlocal_cutqc"),
+        "rel_nonlocal_fq": _avg("rel_nonlocal_fq"),
+    }
+    dist = 0.0
+    dist += (summary["rel_depth_qos"] - TARGET_REL["depth"]["QOS"]) ** 2
+    dist += (summary["rel_depth_cutqc"] - TARGET_REL["depth"]["CutQC"]) ** 2
+    dist += (summary["rel_depth_fq"] - TARGET_REL["depth"]["FrozenQubits"]) ** 2
+    dist += (summary["rel_nonlocal_qos"] - TARGET_REL["nonlocal"]["QOS"]) ** 2
+    dist += (summary["rel_nonlocal_cutqc"] - TARGET_REL["nonlocal"]["CutQC"]) ** 2
+    dist += (summary["rel_nonlocal_fq"] - TARGET_REL["nonlocal"]["FrozenQubits"]) ** 2
+    summary["target_distance"] = dist ** 0.5
+    return summary
+
+
+def _run_eval(args, benches, sizes):
+    all_rows: List[Dict[str, object]] = []
+    rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
+    timing_rows = []
+    fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
+
+    noise = None
+    if args.with_fidelity:
+        noise = _noise_model(args.fidelity_p1, args.fidelity_p2)
+
+    for size in sizes:
+        rel_depth: Dict[str, Dict[str, float]] = {bench: {} for bench, _ in BENCHES}
+        rel_nonlocal: Dict[str, Dict[str, float]] = {bench: {} for bench, _ in BENCHES}
+        if args.with_fidelity:
+            fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
+
+        for bench, _label in benches:
+            if args.verbose:
+                print(f"size={size} bench={bench}", flush=True)
+            qc = _load_qasm_circuit(bench, size)
+            base = _analyze_circuit(
+                qc,
+                args.metric_mode,
+                args.transpile_metrics,
+                args.transpile_optimization_level,
+            )
+            if args.verbose:
+                print(f"  baseline depth={base['depth']} cnot={base['num_nonlocal_gates']}", flush=True)
+            qos_m, qos_t, qos_circs = _run_mitigator(qc, [], args)
+            if args.verbose:
+                print(f"  qos depth={qos_m['depth']} cnot={qos_m['num_nonlocal_gates']}", flush=True)
+            fq_m, fq_t, fq_circs = _run_mitigator(qc, ["QF"], args)
+            if args.verbose:
+                print(f"  frozen depth={fq_m['depth']} cnot={fq_m['num_nonlocal_gates']}", flush=True)
+
+            cutqc_methods = ["GV"] if args.cutqc_method == "gv" else ["WC"]
+            cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(qc, cutqc_methods, args)
+            if args.verbose:
+                print(f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']}", flush=True)
+
+            rel_depth[bench]["QOS"] = _relative(qos_m["depth"], base["depth"])
+            rel_depth[bench]["FrozenQubits"] = _relative(fq_m["depth"], base["depth"])
+            rel_depth[bench]["CutQC"] = _relative(cutqc_m["depth"], base["depth"])
+
+            rel_nonlocal[bench]["QOS"] = _relative(qos_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
+            rel_nonlocal[bench]["FrozenQubits"] = _relative(fq_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
+            rel_nonlocal[bench]["CutQC"] = _relative(cutqc_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
+
+            if args.with_fidelity:
+                base_fidelity = _average_fidelity([qc], args.fidelity_shots, noise, args.fidelity_seed)
+                qos_fidelity = _average_fidelity(qos_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                fq_fidelity = _average_fidelity(fq_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                cutqc_fidelity = _average_fidelity(cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                fidelity_by_size[size][bench] = {
+                    "Qiskit": base_fidelity,
+                    "QOS": qos_fidelity,
+                    "FrozenQubits": fq_fidelity,
+                    "CutQC": cutqc_fidelity,
+                }
+                rel_fidelity_qos = _relative(qos_fidelity, base_fidelity)
+                rel_fidelity_fq = _relative(fq_fidelity, base_fidelity)
+                rel_fidelity_cutqc = _relative(cutqc_fidelity, base_fidelity)
+            else:
+                base_fidelity = ""
+                qos_fidelity = ""
+                fq_fidelity = ""
+                cutqc_fidelity = ""
+                rel_fidelity_qos = ""
+                rel_fidelity_fq = ""
+                rel_fidelity_cutqc = ""
+
+            all_rows.append(
+                {
+                    "bench": bench,
+                    "size": size,
+                    "baseline_depth": base["depth"],
+                    "baseline_nonlocal": base["num_nonlocal_gates"],
+                    "baseline_fidelity": base_fidelity,
+                    "qos_depth": qos_m["depth"],
+                    "qos_nonlocal": qos_m["num_nonlocal_gates"],
+                    "qos_fidelity": qos_fidelity,
+                    "fq_depth": fq_m["depth"],
+                    "fq_nonlocal": fq_m["num_nonlocal_gates"],
+                    "fq_fidelity": fq_fidelity,
+                    "cutqc_depth": cutqc_m["depth"],
+                    "cutqc_nonlocal": cutqc_m["num_nonlocal_gates"],
+                    "cutqc_fidelity": cutqc_fidelity,
+                    "rel_depth_qos": rel_depth[bench]["QOS"],
+                    "rel_depth_fq": rel_depth[bench]["FrozenQubits"],
+                    "rel_depth_cutqc": rel_depth[bench]["CutQC"],
+                    "rel_nonlocal_qos": rel_nonlocal[bench]["QOS"],
+                    "rel_nonlocal_fq": rel_nonlocal[bench]["FrozenQubits"],
+                    "rel_nonlocal_cutqc": rel_nonlocal[bench]["CutQC"],
+                    "rel_fidelity_qos": rel_fidelity_qos,
+                    "rel_fidelity_fq": rel_fidelity_fq,
+                    "rel_fidelity_cutqc": rel_fidelity_cutqc,
+                }
+            )
+
+            if args.collect_timing:
+                for method, timing in [("QOS", qos_t), ("FrozenQubits", fq_t), ("CutQC", cutqc_t)]:
+                    row = {"bench": bench, "size": size, "method": method}
+                    row.update(timing)
+                    timing_rows.append(row)
+            if args.cut_visualization:
+                cut_circuits[(size, bench, "Qiskit")] = [qc]
+                cut_circuits[(size, bench, "QOS")] = qos_circs
+                cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
+                cut_circuits[(size, bench, "CutQC")] = cutqc_circs
+
+        rel_by_size[size] = (rel_depth, rel_nonlocal)
+
+    return all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits
+
+
+def _plot_cut_visualization(
+    cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]],
+    benches: List[Tuple[str, str]],
+    sizes: List[int],
+    out_dir: Path,
+    timestamp: str,
+) -> Path:
+    plt = _import_matplotlib()
+    from matplotlib.backends.backend_pdf import PdfPages  # type: ignore
+    from qiskit.visualization import circuit_drawer  # type: ignore
+
+    out_path = out_dir / f"cut_visualization_{timestamp}.pdf"
+    methods = ["Qiskit", "QOS", "FrozenQubits", "CutQC"]
+
+    with PdfPages(out_path) as pdf:
+        for size in sizes:
+            for bench, label in benches:
+                for method in methods:
+                    circuits = cut_circuits.get((size, bench, method), [])
+                    if not circuits:
+                        continue
+                    for idx, circuit in enumerate(circuits):
+                        circuit = _normalize_circuit(circuit)
+                        title = f"{label} ({size}q) - {method}"
+                        if len(circuits) > 1:
+                            title = f"{title} [{idx + 1}/{len(circuits)}]"
+                        fig = circuit_drawer(circuit, output="mpl", fold=30, idle_wires=False)
+                        fig.suptitle(title, fontsize=10)
+                        pdf.savefig(fig)
+                        plt.close(fig)
+
+    return out_path
+
+
+def _import_matplotlib():
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+        return plt
+    except ModuleNotFoundError:
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.append(user_site)
+        import matplotlib.pyplot as plt  # type: ignore
+        return plt
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare QOS, FrozenQubits, and CutQC vs Qiskit baseline.")
+    parser.add_argument("--sizes", default="12,24", help="Comma-separated qubit sizes.")
+    parser.add_argument("--budget", type=int, default=3)
+    parser.add_argument("--size-to-reach", type=int, default=7)
+    parser.add_argument("--ideal-size-to-reach", type=int, default=2)
+    parser.add_argument("--timeout-sec", type=int, default=45)
+    parser.add_argument("--clingo-timeout-sec", type=int, default=30)
+    parser.add_argument("--max-partition-tries", type=int, default=5)
+    parser.add_argument("--qos-cost-search", action="store_true")
+    parser.add_argument("--qos-cost-search-max-iters", type=int, default=6)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--tag", default="", help="Optional tag to include in output filenames.")
+    parser.add_argument("--collect-timing", action="store_true")
+    parser.add_argument("--timing-csv", default="", help="Optional CSV path for timing breakdown.")
+    parser.add_argument("--timing-plot", action="store_true")
+    parser.add_argument("--with-fidelity", action="store_true")
+    parser.add_argument("--fidelity-shots", type=int, default=2000)
+    parser.add_argument("--fidelity-seed", type=int, default=7)
+    parser.add_argument("--fidelity-p1", type=float, default=0.001, help="1-qubit depolarizing error.")
+    parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")
+    parser.add_argument("--cut-visualization", action="store_true")
+    parser.add_argument(
+        "--cutqc-method",
+        choices=["gv", "wc"],
+        default="gv",
+        help="CutQC baseline method: gv (gate cutting) or wc (wire cutting).",
+    )
+    parser.add_argument("--transpile-metrics", action="store_true")
+    parser.add_argument("--transpile-optimization-level", type=int, default=3)
+    parser.add_argument(
+        "--metric-mode",
+        choices=["virtual", "fragment", "cutqc"],
+        default="fragment",
+        help="Metric mode: virtual (paper-style), fragment (sum/max), or cutqc (ignore cut ops).",
+    )
+    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--sweep-budgets", default="3", help="Comma-separated budgets.")
+    parser.add_argument("--sweep-sizes-to-reach", default="6,7,8,9", help="Comma-separated size-to-reach values.")
+    parser.add_argument("--sweep-clingo", default="5,10,20", help="Comma-separated clingo timeouts.")
+    parser.add_argument("--sweep-max-tries", default="3,5,8", help="Comma-separated max partition tries.")
+    parser.add_argument("--sweep-cost-iters", default="2,3,4", help="Comma-separated cost-search max iters.")
+    parser.add_argument(
+        "--benches",
+        default="all",
+        help="Comma-separated benchmark names or 'all'.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=str(ROOT / "evaluation" / "plots"),
+        help="Output directory for figures and CSV.",
+    )
+    args = parser.parse_args()
+    os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
+    os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
+    os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
+
+    sizes = [int(s.strip()) for s in args.sizes.split(",") if s.strip()]
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = args.tag.strip()
+    tag_suffix = f"_{tag}" if tag else ""
+
+    all_rows: List[Dict[str, object]] = []
+    rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
+
+    if args.benches == "all":
+        benches = BENCHES
+    else:
+        selected = {b.strip() for b in args.benches.split(",") if b.strip()}
+        benches = [(b, label) for b, label in BENCHES if b in selected]
+
+    if args.sweep:
+        sweep_rows = []
+        best = None
+        budgets = [int(x) for x in args.sweep_budgets.split(",") if x.strip()]
+        size_to_reach_vals = [int(x) for x in args.sweep_sizes_to_reach.split(",") if x.strip()]
+        clingo_vals = [int(x) for x in args.sweep_clingo.split(",") if x.strip()]
+        max_tries_vals = [int(x) for x in args.sweep_max_tries.split(",") if x.strip()]
+        cost_iters = [int(x) for x in args.sweep_cost_iters.split(",") if x.strip()]
+
+        for budget in budgets:
+            for size_to_reach in size_to_reach_vals:
+                for clingo in clingo_vals:
+                    for max_tries in max_tries_vals:
+                        for cost_iter in cost_iters:
+                            args.budget = budget
+                            args.size_to_reach = size_to_reach
+                            args.clingo_timeout_sec = clingo
+                            args.max_partition_tries = max_tries
+                            args.qos_cost_search = True
+                            args.qos_cost_search_max_iters = cost_iter
+                            os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
+                            os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
+                            os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
+
+                            rows, _rel, _timing, _fid, _cuts = _run_eval(args, benches, sizes)
+                            summary = _summarize(rows)
+                            sweep_rows.append(
+                                {
+                                    "budget": budget,
+                                    "size_to_reach": size_to_reach,
+                                    "clingo_timeout_sec": clingo,
+                                    "max_partition_tries": max_tries,
+                                    "cost_search_max_iters": cost_iter,
+                                    **summary,
+                                }
+                            )
+                            if best is None or summary["target_distance"] < best[0]:
+                                best = (summary["target_distance"], budget, size_to_reach, clingo, max_tries, cost_iter)
+
+        sweep_path = out_dir / f"relative_properties_sweep_{timestamp}{tag_suffix}.csv"
+        with sweep_path.open("w", newline="") as f:
+            fieldnames = sorted({k for row in sweep_rows for k in row.keys()})
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(sweep_rows)
+
+        if best is None:
+            raise RuntimeError("No sweep results produced.")
+
+        _, best_budget, best_size, best_clingo, best_max_tries, best_cost_iter = best
+        args.budget = best_budget
+        args.size_to_reach = best_size
+        args.clingo_timeout_sec = best_clingo
+        args.max_partition_tries = best_max_tries
+        args.qos_cost_search = True
+        args.qos_cost_search_max_iters = best_cost_iter
+        os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
+        os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
+        os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
+
+        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits = _run_eval(args, benches, sizes)
+        print(f"Wrote sweep: {sweep_path}")
+        print(
+            "Best config:"
+            f" budget={best_budget} size_to_reach={best_size}"
+            f" clingo={best_clingo} max_tries={best_max_tries}"
+            f" cost_iters={best_cost_iter}"
+        )
+    else:
+        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits = _run_eval(args, benches, sizes)
+
+    csv_path = out_dir / f"relative_properties_compare_{timestamp}{tag_suffix}.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    combined_path = _plot_combined(
+        rel_by_size,
+        benches,
+        out_dir,
+        f"{timestamp}{tag_suffix}",
+        fidelity_by_size if args.with_fidelity else None,
+    )
+
+    print(f"Wrote metrics: {csv_path}")
+    print(f"Wrote figure: {combined_path}")
+    if args.cut_visualization and cut_circuits:
+        cut_fig = _plot_cut_visualization(
+            cut_circuits,
+            benches,
+            sizes,
+            out_dir,
+            f"{timestamp}{tag_suffix}",
+        )
+        print(f"Wrote cut visualization: {cut_fig}")
+    if args.collect_timing and timing_rows and args.timing_csv:
+        timing_path = Path(args.timing_csv)
+        with timing_path.open("w", newline="") as f:
+            fieldnames = sorted({k for row in timing_rows for k in row.keys()})
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(timing_rows)
+        print(f"Wrote timing: {timing_path}")
+    if args.collect_timing and timing_rows and args.timing_plot:
+        timing_fig = _plot_timing(timing_rows, out_dir, f"{timestamp}{tag_suffix}")
+        print(f"Wrote timing figure: {timing_fig}")
+
+
+if __name__ == "__main__":
+    main()

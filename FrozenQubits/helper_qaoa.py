@@ -10,7 +10,6 @@ import copy
 from FrozenQubits.helper import *
 
 from qiskit import QuantumCircuit
-from qiskit_ibm_provider import IBMProvider
 from qiskit.circuit import Parameter
 from qiskit.quantum_info import hellinger_fidelity
 from qiskit_aer import AerSimulator
@@ -23,14 +22,16 @@ def _get_ideal_counts(circuit: QuantumCircuit) -> Counter:
         ideal_counts = AerSimulator().run(circuit, shots=20000).result().get_counts()
         
     else:
-        provider = IBMProvider(instance="ibm-q/open/main")
-        backend = provider.get_backend("simulator_statevector")
-        
-        ideal_counts = (
-            backend.run(circuit, shots=20000).result().get_counts()
-        )
-        for k, v in ideal_counts.items():
-            ideal_counts[k] = v / 20000
+        try:
+            from qiskit_ibm_provider import IBMProvider
+
+            provider = IBMProvider(instance="ibm-q/open/main")
+            backend = provider.get_backend("simulator_statevector")
+            ideal_counts = backend.run(circuit, shots=20000).result().get_counts()
+            for k, v in ideal_counts.items():
+                ideal_counts[k] = v / 20000
+        except Exception:
+            ideal_counts = AerSimulator().run(circuit, shots=20000).result().get_counts()
 
     return Counter(ideal_counts)
 
@@ -210,21 +211,20 @@ def bind_QAOA(primary_circuit, params, beta, gamma,
                          beta_label='b', gamma_label='g'):
     gamma=to_iterable(gamma)
     beta=to_iterable(beta)
-    new_circuit=primary_circuit.copy()    
+    new_circuit=primary_circuit.copy()
+
+    def _bind(circuit, mapping):
+        if hasattr(circuit, "bind_parameters"):
+            return circuit.bind_parameters(mapping)
+        return circuit.assign_parameters(mapping, inplace=False)
+
     for p in range(len(beta)):
         mapping={}
         _beta= f'{beta_label}_{p+1}'
         mapping[params[_beta]]=beta[p]
-        try:
-            new_circuit=new_circuit.bind_parameters(mapping)
-        except Exception as e:
-            print(e)                                                
+        new_circuit=_bind(new_circuit, mapping)
         mapping={}
         _gamma= f'{gamma_label}_{p+1}'
         mapping[params[_gamma]]=gamma[p]
-        try:
-            new_circuit=new_circuit.bind_parameters(mapping)    
-        except:
-            pass
+        new_circuit=_bind(new_circuit, mapping)
     return new_circuit
-

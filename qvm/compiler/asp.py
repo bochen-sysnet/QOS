@@ -1,4 +1,5 @@
 import networkx as nx
+import os
 
 from clingo.solving import Symbol
 from clingo.control import Control
@@ -46,6 +47,16 @@ def get_optimal_symbols(asp: str) -> list[Symbol]:
     control.configuration.solve.models = 0  # type: ignore
     control.add("base", [], asp)
     control.ground([("base", [])])
+    timeout_sec = float(os.getenv("QVM_CLINGO_TIMEOUT_SEC", "30"))
+    if timeout_sec > 0:
+        try:
+            control.configuration.solve.time_limit = timeout_sec  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                control.configuration.solve.timeout = int(timeout_sec * 1000)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
     solve_result = control.solve(yield_=True)  # type: ignore
     opt_model = None
     for model in solve_result:  # type: ignore
