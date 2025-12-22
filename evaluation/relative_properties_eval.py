@@ -9,6 +9,7 @@ import numpy as np
 import site
 import signal
 import os
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -412,6 +413,12 @@ def _relative(value: float, baseline: float) -> float:
     return value / baseline
 
 
+def _safe_ratio(value: float, baseline: float) -> float:
+    if baseline == 0:
+        return 0.0
+    return value / baseline
+
+
 def _plot_panel(
     ax,
     title: str,
@@ -642,6 +649,165 @@ def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp:
     return out_path
 
 
+def _plot_overheads(
+    rows: List[Dict[str, object]],
+    benches: List[Tuple[str, str]],
+    sizes: List[int],
+    out_dir: Path,
+    timestamp: str,
+) -> Path:
+    plt = _import_matplotlib()
+    min_factor = 1e-3
+
+    def _val(row, key):
+        v = row.get(key, 0.0)
+        if v == "" or v is None:
+            return min_factor
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return min_factor
+        if v <= 0:
+            return min_factor
+        return v
+
+    fig, axes = plt.subplots(len(sizes), 3, figsize=(16.5, 3.8 * len(sizes)))
+    axes = np.array(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape(1, 3)
+
+    methods = ["FrozenQubits", "CutQC", "QOS"]
+    method_keys = {
+        "FrozenQubits": ("fq_classical_overhead", "fq_quantum_overhead"),
+        "CutQC": ("cutqc_classical_overhead", "cutqc_quantum_overhead"),
+        "QOS": ("qos_classical_overhead", "qos_quantum_overhead"),
+    }
+
+    for row_idx, size in enumerate(sizes):
+        size_rows = [r for r in rows if int(r["size"]) == size]
+        by_bench = {r["bench"]: r for r in size_rows}
+        bench_labels = [(b, label) for b, label in benches if b in by_bench]
+        x = np.arange(len(bench_labels))
+        width = 0.22
+
+        ax = axes[row_idx, 0]
+        for idx, method in enumerate(methods):
+            vals = []
+            key, _qkey = method_keys[method]
+            for bench, _label in bench_labels:
+                vals.append(_val(by_bench[bench], key))
+            ax.bar(x + (idx - 1) * width, vals, width, label=method)
+        ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.set_title(f"Classical Overhead - {size} qubits")
+        ax.set_ylabel("Factor vs Qiskit")
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _b, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+        ax = axes[row_idx, 1]
+        for idx, method in enumerate(methods):
+            vals = []
+            _ckey, qkey = method_keys[method]
+            for bench, _label in bench_labels:
+                vals.append(_val(by_bench[bench], qkey))
+            ax.bar(x + (idx - 1) * width, vals, width, label=method)
+        ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.set_title(f"Quantum Overhead - {size} qubits")
+        ax.set_ylabel("Factor vs Qiskit")
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _b, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+        ax = axes[row_idx, 2]
+        qos_class_vals = []
+        qos_quant_vals = []
+        for bench, _label in bench_labels:
+            row = by_bench[bench]
+            qos_class_vals.append(_val(row, "qos_classical_overhead"))
+            qos_quant_vals.append(_val(row, "qos_quantum_overhead"))
+        ax.bar(x - width / 2, qos_class_vals, width, label="Classical")
+        ax.bar(x + width / 2, qos_quant_vals, width, label="Quantum")
+        ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.set_title(f"QOS Overhead by Circuit - {size} qubits")
+        ax.set_ylabel("Factor vs Qiskit")
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _b, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.legend(fontsize=7)
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=3, fontsize=8, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    out_path = out_dir / f"overhead_breakdown_{timestamp}.pdf"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _fragment_fidelity_sweep(
+    circuits: List[QuantumCircuit],
+    shots_list: List[int],
+    noise,
+    seed: int,
+) -> Dict[str, object]:
+    data: Dict[str, object] = {"shots": shots_list, "fragments": {}}
+    fragments: Dict[str, List[float]] = {}
+    for idx, circuit in enumerate(circuits):
+        label = f"frag{idx}"
+        vals = []
+        for shots in shots_list:
+            vals.append(_fidelity_for_circuit(circuit, shots, noise, seed))
+        fragments[label] = vals
+    data["fragments"] = fragments
+    return data
+
+
+def _plot_fragment_fidelity_sweep(
+    fragment_data: Dict[Tuple[int, str], Dict[str, object]],
+    benches: List[Tuple[str, str]],
+    sizes: List[int],
+    out_dir: Path,
+    timestamp: str,
+) -> List[Path]:
+    plt = _import_matplotlib()
+    out_paths: List[Path] = []
+    for size in sizes:
+        fig, axes = plt.subplots(3, 3, figsize=(12.5, 10.5), sharex=True, sharey=True)
+        axes = np.array(axes).reshape(3, 3)
+        for idx, (bench, label) in enumerate(benches):
+            row = idx // 3
+            col = idx % 3
+            ax = axes[row, col]
+            data = fragment_data.get((size, bench))
+            if not data:
+                ax.set_visible(False)
+                continue
+            shots = data["shots"]
+            fragments = data["fragments"]
+            for frag_label, vals in fragments.items():
+                ax.plot(shots, vals, marker="o", linewidth=1, markersize=3, label=frag_label)
+            ax.set_title(label)
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
+            ax.set_xlabel("Shots")
+            ax.set_ylabel("Hellinger fidelity")
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, ncol=4, fontsize=7, loc="upper center")
+            fig.tight_layout(rect=(0, 0, 1, 0.9))
+        else:
+            fig.tight_layout()
+        out_path = out_dir / f"fragment_fidelity_{timestamp}_s{size}.pdf"
+        fig.savefig(out_path)
+        plt.close(fig)
+        out_paths.append(out_path)
+    return out_paths
+
+
 def _summarize(rows: List[Dict[str, object]]) -> Dict[str, float]:
     def _avg(key: str) -> float:
         vals = [float(r[key]) for r in rows]
@@ -672,9 +838,10 @@ def _run_eval(args, benches, sizes):
     timing_rows = []
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
+    fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
 
     noise = None
-    if args.with_fidelity:
+    if args.with_fidelity or args.fragment_fidelity_sweep:
         noise = _noise_model(args.fidelity_p1, args.fidelity_p2)
 
     for size in sizes:
@@ -707,6 +874,14 @@ def _run_eval(args, benches, sizes):
             if args.verbose:
                 print(f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']}", flush=True)
 
+            if args.fragment_fidelity_sweep:
+                fragment_fidelity[(size, bench)] = _fragment_fidelity_sweep(
+                    qos_circs,
+                    args.fragment_fidelity_shots,
+                    noise,
+                    args.fidelity_seed,
+                )
+
             rel_depth[bench]["QOS"] = _relative(qos_m["depth"], base["depth"])
             rel_depth[bench]["FrozenQubits"] = _relative(fq_m["depth"], base["depth"])
             rel_depth[bench]["CutQC"] = _relative(cutqc_m["depth"], base["depth"])
@@ -716,10 +891,19 @@ def _run_eval(args, benches, sizes):
             rel_nonlocal[bench]["CutQC"] = _relative(cutqc_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
 
             if args.with_fidelity:
+                sim_times = {}
+                t0 = time.perf_counter()
                 base_fidelity = _average_fidelity([qc], args.fidelity_shots, noise, args.fidelity_seed)
+                sim_times["Qiskit"] = time.perf_counter() - t0
+                t0 = time.perf_counter()
                 qos_fidelity = _average_fidelity(qos_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                sim_times["QOS"] = time.perf_counter() - t0
+                t0 = time.perf_counter()
                 fq_fidelity = _average_fidelity(fq_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                sim_times["FrozenQubits"] = time.perf_counter() - t0
+                t0 = time.perf_counter()
                 cutqc_fidelity = _average_fidelity(cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                sim_times["CutQC"] = time.perf_counter() - t0
                 fidelity_by_size[size][bench] = {
                     "Qiskit": base_fidelity,
                     "QOS": qos_fidelity,
@@ -730,6 +914,7 @@ def _run_eval(args, benches, sizes):
                 rel_fidelity_fq = _relative(fq_fidelity, base_fidelity)
                 rel_fidelity_cutqc = _relative(cutqc_fidelity, base_fidelity)
             else:
+                sim_times = {}
                 base_fidelity = ""
                 qos_fidelity = ""
                 fq_fidelity = ""
@@ -738,6 +923,22 @@ def _run_eval(args, benches, sizes):
                 rel_fidelity_fq = ""
                 rel_fidelity_cutqc = ""
 
+            qiskit_sim = float(sim_times.get("Qiskit", 0.0))
+            qos_sim = float(sim_times.get("QOS", 0.0))
+            fq_sim = float(sim_times.get("FrozenQubits", 0.0))
+            cutqc_sim = float(sim_times.get("CutQC", 0.0))
+
+            qos_num_circuits = max(1, len(qos_circs))
+            fq_num_circuits = max(1, len(fq_circs))
+            cutqc_num_circuits = max(1, len(cutqc_circs))
+
+            qos_classical_overhead = _safe_ratio(qos_sim, qiskit_sim)
+            fq_classical_overhead = _safe_ratio(fq_sim, qiskit_sim)
+            cutqc_classical_overhead = _safe_ratio(cutqc_sim, qiskit_sim)
+            qos_quantum_overhead = float(qos_num_circuits)
+            fq_quantum_overhead = float(fq_num_circuits)
+            cutqc_quantum_overhead = float(cutqc_num_circuits)
+
             all_rows.append(
                 {
                     "bench": bench,
@@ -745,15 +946,28 @@ def _run_eval(args, benches, sizes):
                     "baseline_depth": base["depth"],
                     "baseline_nonlocal": base["num_nonlocal_gates"],
                     "baseline_fidelity": base_fidelity,
+                    "baseline_sim_time": qiskit_sim,
                     "qos_depth": qos_m["depth"],
                     "qos_nonlocal": qos_m["num_nonlocal_gates"],
                     "qos_fidelity": qos_fidelity,
+                    "qos_sim_time": qos_sim,
                     "fq_depth": fq_m["depth"],
                     "fq_nonlocal": fq_m["num_nonlocal_gates"],
                     "fq_fidelity": fq_fidelity,
+                    "fq_sim_time": fq_sim,
                     "cutqc_depth": cutqc_m["depth"],
                     "cutqc_nonlocal": cutqc_m["num_nonlocal_gates"],
                     "cutqc_fidelity": cutqc_fidelity,
+                    "cutqc_sim_time": cutqc_sim,
+                    "qos_num_circuits": qos_num_circuits,
+                    "fq_num_circuits": fq_num_circuits,
+                    "cutqc_num_circuits": cutqc_num_circuits,
+                    "qos_classical_overhead": qos_classical_overhead,
+                    "fq_classical_overhead": fq_classical_overhead,
+                    "cutqc_classical_overhead": cutqc_classical_overhead,
+                    "qos_quantum_overhead": qos_quantum_overhead,
+                    "fq_quantum_overhead": fq_quantum_overhead,
+                    "cutqc_quantum_overhead": cutqc_quantum_overhead,
                     "rel_depth_qos": rel_depth[bench]["QOS"],
                     "rel_depth_fq": rel_depth[bench]["FrozenQubits"],
                     "rel_depth_cutqc": rel_depth[bench]["CutQC"],
@@ -770,6 +984,8 @@ def _run_eval(args, benches, sizes):
                 for method, timing in [("QOS", qos_t), ("FrozenQubits", fq_t), ("CutQC", cutqc_t)]:
                     row = {"bench": bench, "size": size, "method": method}
                     row.update(timing)
+                    if args.with_fidelity:
+                        row["simulation"] = sim_times.get(method, 0.0)
                     timing_rows.append(row)
             if args.cut_visualization:
                 cut_circuits[(size, bench, "Qiskit")] = [qc]
@@ -779,7 +995,7 @@ def _run_eval(args, benches, sizes):
 
         rel_by_size[size] = (rel_depth, rel_nonlocal)
 
-    return all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits
+    return all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity
 
 
 def _plot_cut_visualization(
@@ -856,11 +1072,18 @@ def main() -> None:
     parser.add_argument("--collect-timing", action="store_true")
     parser.add_argument("--timing-csv", default="", help="Optional CSV path for timing breakdown.")
     parser.add_argument("--timing-plot", action="store_true")
+    parser.add_argument("--overhead-plot", action="store_true")
     parser.add_argument("--with-fidelity", action="store_true")
     parser.add_argument("--fidelity-shots", type=int, default=2000)
     parser.add_argument("--fidelity-seed", type=int, default=7)
     parser.add_argument("--fidelity-p1", type=float, default=0.001, help="1-qubit depolarizing error.")
     parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")
+    parser.add_argument("--fragment-fidelity-sweep", action="store_true")
+    parser.add_argument(
+        "--fragment-fidelity-shots",
+        default="100,200,400,600,800,1000",
+        help="Comma-separated shots list for fragment fidelity sweep.",
+    )
     parser.add_argument("--cut-visualization", action="store_true")
     parser.add_argument(
         "--cutqc-method",
@@ -871,7 +1094,7 @@ def main() -> None:
     parser.add_argument(
         "--metrics-baseline",
         choices=["raw", "kolkata"],
-        default="raw",
+        default="kolkata",
         help="Baseline for metrics: raw circuit or transpiled to IBM Kolkata.",
     )
     parser.add_argument("--metrics-optimization-level", type=int, default=3)
@@ -903,6 +1126,11 @@ def main() -> None:
     os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
     sizes = [int(s.strip()) for s in args.sizes.split(",") if s.strip()]
+    args.fragment_fidelity_shots = [
+        int(s.strip())
+        for s in str(args.fragment_fidelity_shots).split(",")
+        if s.strip()
+    ]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -942,7 +1170,7 @@ def main() -> None:
                             os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
                             os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-                            rows, _rel, _timing, _fid, _cuts = _run_eval(args, benches, sizes)
+                            rows, _rel, _timing, _fid, _cuts, _frag = _run_eval(args, benches, sizes)
                             summary = _summarize(rows)
                             sweep_rows.append(
                                 {
@@ -978,7 +1206,9 @@ def main() -> None:
         os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
         os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits = _run_eval(args, benches, sizes)
+        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
+            args, benches, sizes
+        )
         print(f"Wrote sweep: {sweep_path}")
         print(
             "Best config:"
@@ -987,7 +1217,9 @@ def main() -> None:
             f" cost_iters={best_cost_iter}"
         )
     else:
-        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits = _run_eval(args, benches, sizes)
+        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
+            args, benches, sizes
+        )
 
     csv_path = out_dir / f"relative_properties_compare_{timestamp}{tag_suffix}.csv"
     with csv_path.open("w", newline="") as f:
@@ -1025,6 +1257,17 @@ def main() -> None:
     if args.collect_timing and timing_rows and args.timing_plot:
         timing_fig = _plot_timing(timing_rows, out_dir, f"{timestamp}{tag_suffix}")
         print(f"Wrote timing figure: {timing_fig}")
+    if args.overhead_plot:
+        if not args.with_fidelity:
+            raise RuntimeError("Overhead plot requires --with-fidelity to measure simulation time.")
+        overhead_fig = _plot_overheads(all_rows, benches, sizes, out_dir, f"{timestamp}{tag_suffix}")
+        print(f"Wrote overhead figure: {overhead_fig}")
+    if args.fragment_fidelity_sweep:
+        frag_paths = _plot_fragment_fidelity_sweep(
+            fragment_fidelity, benches, sizes, out_dir, f"{timestamp}{tag_suffix}"
+        )
+        for path in frag_paths:
+            print(f"Wrote fragment fidelity figure: {path}")
 
 
 if __name__ == "__main__":
