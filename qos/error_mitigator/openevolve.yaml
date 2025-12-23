@@ -1,13 +1,9 @@
-# =========================
-# Global
-# =========================
 max_iterations: 200
 checkpoint_interval: 10
 log_level: "INFO"
 log_dir: null
 random_seed: 42
 
-# IMPORTANT: OpenEvolve expects SEARCH/REPLACE patches
 diff_based_evolution: true
 max_code_length: 15000
 
@@ -15,117 +11,87 @@ early_stopping_patience: null
 convergence_threshold: 0.001
 early_stopping_metric: "combined_score"
 
-# =========================
-# LLM
-# =========================
 llm:
   api_base: "http://localhost:8000/v1"
   primary_model: "Qwen/Qwen2.5-Coder-7B-Instruct"
-
-  # High novelty, but format guarded by SEARCH/REPLACE
   temperature: 0.7
   top_p: 0.85
-
-  # Enough for 1–2 SEARCH/REPLACE blocks
-  max_tokens: 1200
-
+  max_tokens: 700
   timeout: 60
-  retries: 2
+  retries: 4
   retry_delay: 1
 
-# =========================
-# Prompt
-# =========================
 prompt:
   system_message: |
     You are optimizing QOSE by modifying the function evolved_run(self, q)
-    in the file qos/error_mitigator/evolution_target.py.
+    in qos/error_mitigator/evolution_target.py.
 
     OUTPUT FORMAT (MANDATORY):
-    Use ONLY the SEARCH/REPLACE patch format below.
-    Do NOT output git diffs.
-    Do NOT output markdown.
-    Do NOT output commentary.
-
-    Format (one or more blocks allowed):
+    Output ONLY one or more SEARCH/REPLACE blocks EXACTLY in this format.
+    Do NOT output git diff. Do NOT output markdown. Do NOT output commentary.
 
     <<<<<<< SEARCH
-    (exact text copied verbatim from the current file)
+    exact text to find
     =======
-    (replacement text)
+    replacement text
     >>>>>>> REPLACE
 
+    The tokens '<<<<<<< SEARCH', '=======', and '>>>>>>> REPLACE' must appear exactly as written,
+    on their own lines, with the same number of < and > characters.
+
     EDIT SCOPE (MANDATORY):
-    - You may ONLY modify code between the markers:
-        # OE_BEGIN
-        # OE_END
-    - Do NOT change anything outside those markers.
-    - Do NOT change imports.
-    - Do NOT change function signatures.
+    - Only modify code between markers '# OE_BEGIN' and '# OE_END'.
+    - Do not change anything outside those markers.
+    - Do not change imports or any function signatures.
     - Modify at most 30 lines total.
 
-    OBJECTIVE:
-    - Reduce circuit depth, CNOT count, and quantum overhead.
-    - Keep behavior deterministic.
-    - Keep runtime short.
-
     IMPORTANT:
-    - SEARCH blocks must match the file character-for-character.
-    - If unsure, replace a small contiguous snippet (5–15 lines) inside OE_BEGIN/END.
-    - If you cannot find a safe improvement, make a minimal refactor inside OE_BEGIN/END.
+    - SEARCH content must be copied verbatim from the current file.
+    - Always include either '# OE_BEGIN' or '# OE_END' inside the SEARCH block to anchor in-range.
+    - If unsure, choose a 5–10 line contiguous snippet inside the markers and replace it.
+
+    OBJECTIVE:
+    - Reduce depth, CNOT count, and quantum overhead; keep deterministic and fast.
+
+    FALLBACK (MANDATORY IF UNSURE):
+    - Make a minimal refactor inside OE_BEGIN/END (e.g., factor a constant into a local variable).
+    - Still output ONLY SEARCH/REPLACE blocks.
 
   evaluator_system_message: "You are an expert Quantum System Optimizer."
-
   num_top_programs: 1
   num_diverse_programs: 0
-
   use_template_stochasticity: false
   include_artifacts: false
   max_artifact_bytes: 20480
   artifact_security_filter: true
-
   template_variations: {}
 
-# =========================
-# Population / Archive
-# =========================
 database:
   db_path: null
   in_memory: true
-  log_prompts: false
-
+  log_prompts: true
   population_size: 40
   archive_size: 20
-
   num_islands: 2
   migration_interval: 20
   migration_rate: 0.1
-
   elite_selection_ratio: 0.1
   exploration_ratio: 0.35
   exploitation_ratio: 0.65
-
   feature_dimensions:
     - "complexity"
     - "diversity"
   feature_bins: 10
   diversity_reference_size: 20
 
-# =========================
-# Evaluator
-# =========================
 evaluator:
   timeout: 60
   max_retries: 0
   cascade_evaluation: false
   parallel_evaluations: 1
-
   use_llm_feedback: false
   llm_feedback_weight: 0.0
 
-# =========================
-# Tracing (optional)
-# =========================
 evolution_trace:
   enabled: false
   format: "jsonl"

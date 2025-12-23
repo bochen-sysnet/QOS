@@ -175,6 +175,7 @@ def _find_qose_program(path_hint: str) -> Optional[Path]:
             str(ROOT / "qos" / "error_mitigator" / "qose_program.py"),
             str(ROOT / "qos" / "error_mitigator" / "openevolve_output" / "best_program.py"),
             str(ROOT / "openevolve_output" / "best_program.py"),
+            str(ROOT / "qos" / "error_mitigator" / "evolution_target.py"),
         ]
     )
     for entry in candidates:
@@ -211,10 +212,9 @@ def _fidelity_methods(include_qose: bool) -> List[str]:
 
 
 def _timing_methods(include_qose: bool) -> List[str]:
-    methods = ["QOS"]
+    methods = ["FrozenQubits", "CutQC", "QOS"]
     if include_qose:
         methods.append("QOSE")
-    methods.extend(["FrozenQubits", "CutQC"])
     return methods
 
 
@@ -453,7 +453,10 @@ def _run_mitigator(
             if use_alarm:
                 signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
                 signal.alarm(args.timeout_sec)
+            start = time.perf_counter() if args.collect_timing else 0.0
             q = mitigator.run(q)
+            if args.collect_timing and "total" not in mitigator.timings:
+                mitigator.timings["total"] = time.perf_counter() - start
             if use_alarm:
                 signal.alarm(0)
             return (
@@ -499,7 +502,10 @@ def _run_qose(
         if "SIGALRM" in signal.Signals.__members__:
             signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
             signal.alarm(args.timeout_sec)
+        start = time.perf_counter() if args.collect_timing else 0.0
         q = evolved_run(mitigator, q)
+        if args.collect_timing and "total" not in mitigator.timings:
+            mitigator.timings["total"] = time.perf_counter() - start
         if "SIGALRM" in signal.Signals.__members__:
             signal.alarm(0)
         return (
@@ -617,151 +623,78 @@ def _plot_timing(
     if not timing_rows:
         raise ValueError("No timing data to plot.")
 
-    stages = ["analysis", "qaoa_analysis", "qf", "cost_search", "gv", "wc", "qr", "cut_select"]
-    skip_stages = {"total", "overall"}
-    seen = set(stages)
-    for row in timing_rows:
-        for k in row.keys():
-            if k in {"bench", "size", "method"}:
-                continue
-            if k in skip_stages:
-                continue
-            if k not in seen:
-                stages.append(k)
-                seen.add(k)
-
-    # Aggregate mean timing per method and size.
-    groups: Dict[Tuple[int, str], Dict[str, List[float]]] = {}
-    for row in timing_rows:
-        size = int(row["size"])
-        method = str(row["method"])
-        key = (size, method)
-        groups.setdefault(key, {})
+    def _row_total(row: Dict[str, object]) -> float:
+        if "total" in row:
+            try:
+                return float(row["total"])
+            except (TypeError, ValueError):
+                return 0.0
+        total = 0.0
         for k, v in row.items():
             if k in {"bench", "size", "method"}:
                 continue
-            groups[key].setdefault(k, []).append(float(v))
+            try:
+                total += float(v)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     sizes = sorted({int(r["size"]) for r in timing_rows})
     methods = _timing_methods(include_qose)
 
-    fig, axes = plt.subplots(len(sizes), 3, figsize=(16.5, 3.8 * len(sizes)))
+    fig, axes = plt.subplots(len(sizes), 2, figsize=(11.0, 3.8 * len(sizes)))
     axes = np.array(axes)
     if axes.ndim == 1:
-        axes = axes.reshape(1, 3)
+        axes = axes.reshape(1, 2)
 
     for row_idx, size in enumerate(sizes):
         ax = axes[row_idx, 0]
         x = np.arange(len(methods))
-        bottom = np.zeros(len(methods))
-        totals = np.zeros(len(methods))
-        for stage in stages:
-            vals = []
-            for method in methods:
-                stage_vals = groups.get((size, method), {}).get(stage, [])
-                val = sum(stage_vals) / max(1, len(stage_vals))
-                vals.append(val)
-            ax.bar(x, vals, bottom=bottom, label=stage)
-            bottom = bottom + np.array(vals)
-            totals = totals + np.array(vals)
-
-        ax.set_title(f"Timing Breakdown (Avg) - {size} qubits")
+        totals = []
+        for method in methods:
+            method_rows = [
+                r for r in timing_rows if int(r["size"]) == size and r["method"] == method
+            ]
+            vals = [_row_total(r) for r in method_rows]
+            totals.append(sum(vals) / max(1, len(vals)))
+        ax.bar(x, totals)
+        ax.set_title(f"Total Timing (Avg) - {size} qubits")
         ax.set_ylabel("Seconds")
         ax.set_xticks(x)
         ax.set_xticklabels(methods)
         ax.grid(axis="y", linestyle="--", alpha=0.4)
         for idx, total in enumerate(totals):
-            ax.text(
-                x[idx],
-                total,
-                f"{total:.2f}s",
-                ha="center",
-                va="bottom",
-                fontsize=7,
-            )
+            ax.text(x[idx], total, f"{total:.2f}s", ha="center", va="bottom", fontsize=7)
 
         ax = axes[row_idx, 1]
         bench_labels = []
         for bench, label in BENCHES:
-            if any(int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench for r in timing_rows):
+            if any(
+                int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
+                for r in timing_rows
+            ):
                 bench_labels.append((bench, label))
+        if not bench_labels:
+            ax.set_visible(False)
+            continue
         x = np.arange(len(bench_labels))
-        bottom = np.zeros(len(bench_labels))
-        for stage in stages:
-            vals = []
-            for bench, _label in bench_labels:
-                stage_vals = []
-                for row in timing_rows:
-                    if int(row["size"]) != size:
-                        continue
-                    if row["method"] != "QOS":
-                        continue
-                    if row["bench"] != bench:
-                        continue
-                    if stage in row:
-                        stage_vals.append(float(row[stage]))
-                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
-            ax.bar(x, vals, bottom=bottom, label=stage)
-            bottom = bottom + np.array(vals)
-
-        ax.set_title(f"QOS Timing by Circuit - {size} qubits")
+        vals = []
+        for bench, _label in bench_labels:
+            bench_rows = [
+                r
+                for r in timing_rows
+                if int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
+            ]
+            totals = [_row_total(r) for r in bench_rows]
+            vals.append(sum(totals) / max(1, len(totals)))
+        ax.bar(x, vals)
+        ax.set_title(f"QOS Timing by Circuit (Total) - {size} qubits")
         ax.set_ylabel("Seconds")
         ax.set_xticks(x)
         ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
         ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-        ax = axes[row_idx, 2]
-        x = np.arange(len(bench_labels))
-        bottom = np.zeros(len(bench_labels))
-        for stage in stages:
-            vals = []
-            totals = []
-            for bench, _label in bench_labels:
-                stage_vals = []
-                for row in timing_rows:
-                    if int(row["size"]) != size:
-                        continue
-                    if row["method"] != "QOS":
-                        continue
-                    if row["bench"] != bench:
-                        continue
-                    if stage in row:
-                        stage_vals.append(float(row[stage]))
-                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
-            for idx, bench in enumerate(bench_labels):
-                total = 0.0
-                for stage_total in stages:
-                    stage_vals = []
-                    for row in timing_rows:
-                        if int(row["size"]) != size:
-                            continue
-                        if row["method"] != "QOS":
-                            continue
-                        if row["bench"] != bench[0]:
-                            continue
-                        if stage_total in row:
-                            stage_vals.append(float(row[stage_total]))
-                    total += sum(stage_vals) / max(1, len(stage_vals))
-                totals.append(total)
-            pct_vals = []
-            for v, total in zip(vals, totals):
-                if total <= 0:
-                    pct_vals.append(0.0)
-                else:
-                    pct_vals.append((v / total) * 100.0)
-            ax.bar(x, pct_vals, bottom=bottom, label=stage)
-            bottom = bottom + np.array(pct_vals)
-
-        ax.set_title(f"QOS Timing % by Circuit - {size} qubits")
-        ax.set_ylabel("Percent of total")
-        ax.set_xticks(x)
-        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
-        ax.set_ylim(0, 100)
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, ncol=4, fontsize=7, loc="upper center")
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.tight_layout()
     out_path = out_dir / f"timing_breakdown_{timestamp}.pdf"
     fig.savefig(out_path)
     plt.close(fig)
