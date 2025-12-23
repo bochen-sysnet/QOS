@@ -1,0 +1,65 @@
+2025-12-23 14:06:52,507 - openevolve.controller - INFO - Logging to openevolve_output/logs/openevolve_20251223_140652.log
+2025-12-23 14:06:52,509 - openevolve.controller - INFO - Set random seed to 42 for reproducibility
+2025-12-23 14:06:52,528 - openevolve.llm.openai - INFO - Initialized OpenAI LLM with model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:06:52,528 - openevolve.llm.ensemble - INFO - Initialized LLM ensemble with models: Qwen/Qwen2.5-Coder-7B-Instruct (weight: 1.00)
+2025-12-23 14:06:52,539 - openevolve.prompt.sampler - INFO - Initialized prompt sampler
+2025-12-23 14:06:52,540 - openevolve.prompt.sampler - INFO - Set custom templates: system=evaluator_system_message, user=None
+2025-12-23 14:06:52,540 - openevolve.database - INFO - Initialized program database with 0 programs
+2025-12-23 14:06:52,640 - qiskit.passmanager.base_tasks - INFO - Pass: UnrollCustomDefinitions - 0.05460 (ms)
+2025-12-23 14:06:52,640 - qiskit.passmanager.base_tasks - INFO - Pass: BasisTranslator - 0.01287 (ms)
+2025-12-23 14:06:52,810 - openevolve.evaluator - INFO - Successfully loaded evaluation function from qos/error_mitigator/evaluator.py
+2025-12-23 14:06:52,810 - openevolve.evaluator - INFO - Initialized evaluator with qos/error_mitigator/evaluator.py
+2025-12-23 14:06:52,810 - openevolve.controller - INFO - Initialized OpenEvolve with qos/error_mitigator/evolution_target.py
+2025-12-23 14:06:52,810 - openevolve.controller - INFO - Adding initial program to database
+2025-12-23 14:06:53,755 - openevolve.evaluator - INFO - Evaluated program 9152e3b6-1a3e-4b4e-ab9d-6d2a3854d70d in 0.94s: rel_depth=0.8636, rel_cnot=0.9130, rel_overhead=1.0000, combined_score=0.3588
+2025-12-23 14:06:53,755 - openevolve.database - INFO - New MAP-Elites cell occupied in island 0: {'complexity': 5, 'diversity': 0}
+2025-12-23 14:06:53,756 - openevolve.process_parallel - INFO - Initialized process parallel controller with 1 workers
+2025-12-23 14:06:53,756 - openevolve.process_parallel - INFO - Started process pool with 1 processes
+2025-12-23 14:06:53,756 - openevolve.controller - INFO - Using island-based evolution with 2 islands
+2025-12-23 14:06:53,756 - openevolve.database - INFO - Island Status:
+2025-12-23 14:06:53,756 - openevolve.database - INFO -  * Island 0: 1 programs, best=0.3588, avg=0.3588, diversity=0.00, gen=0 (best: 9152e3b6-1a3e-4b4e-ab9d-6d2a3854d70d)
+2025-12-23 14:06:53,756 - openevolve.database - INFO -    Island 1: 0 programs, best=0.0000, avg=0.0000, diversity=0.00, gen=0
+2025-12-23 14:06:53,756 - openevolve.process_parallel - INFO - Starting process-based evolution from iteration 1 for 200 iterations (total: 201)
+2025-12-23 14:06:53,760 - openevolve.process_parallel - INFO - Early stopping disabled
+2025-12-23 14:06:53,784 - openevolve.prompt.sampler - INFO - Set custom templates: system=evaluator_system_message, user=None
+2025-12-23 14:06:53,785 - openevolve.evaluator - INFO - Successfully loaded evaluation function from qos/error_mitigator/evaluator.py
+2025-12-23 14:06:53,785 - openevolve.evaluator - INFO - Initialized evaluator with qos/error_mitigator/evaluator.py
+2025-12-23 14:06:53,785 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:07:10,681 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:07:11,051 - openevolve.evaluator - INFO - Evaluated program 75d2d93e-e6b3-4c9c-b71b-66a485c763b1 in 0.36s: rel_depth=1.0000, rel_cnot=1.0000, rel_overhead=1.0000, combined_score=0.3322
+2025-12-23 14:07:11,052 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:07:11,055 - openevolve.database - INFO - New MAP-Elites cell occupied in island 0: {'complexity': 5, 'diversity': 5}
+2025-12-23 14:07:11,055 - openevolve.process_parallel - INFO - Iteration 1: Program 75d2d93e-e6b3-4c9c-b71b-66a485c763b1 (parent: 9152e3b6-1a3e-4b4e-ab9d-6d2a3854d70d) completed in 17.27s
+2025-12-23 14:07:11,056 - openevolve.process_parallel - INFO - Metrics: rel_depth=1.0000, rel_cnot=1.0000, rel_overhead=1.0000, combined_score=0.3322
+2025-12-23 14:07:28,147 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:07:59,229 - openevolve.evaluator - INFO - Evaluated program 3f08b062-82dd-4ff6-bfb5-9b8acb547e98 in 31.08s: rel_depth=1.0000, rel_cnot=1.0000, rel_overhead=1.0000, combined_score=0.3322
+2025-12-23 14:07:59,230 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:07:59,233 - openevolve.process_parallel - INFO - Iteration 2: Program 3f08b062-82dd-4ff6-bfb5-9b8acb547e98 (parent: 9152e3b6-1a3e-4b4e-ab9d-6d2a3854d70d) completed in 48.18s
+2025-12-23 14:07:59,233 - openevolve.process_parallel - INFO - Metrics: rel_depth=1.0000, rel_cnot=1.0000, rel_overhead=1.0000, combined_score=0.3322
+2025-12-23 14:08:19,969 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:08:19,971 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:08:19,977 - openevolve.process_parallel - WARNING - Iteration 3 error: No valid diffs found in response
+2025-12-23 14:08:40,092 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:08:40,093 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:08:40,099 - openevolve.process_parallel - WARNING - Iteration 4 error: No valid diffs found in response
+2025-12-23 14:09:00,641 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:09:00,642 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:09:00,643 - openevolve.process_parallel - WARNING - Iteration 5 error: No valid diffs found in response
+2025-12-23 14:09:20,765 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:09:20,766 - openevolve.process_parallel - WARNING - Iteration 6 error: No valid diffs found in response
+2025-12-23 14:09:20,766 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:09:41,324 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:09:41,325 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:09:41,327 - openevolve.process_parallel - WARNING - Iteration 7 error: No valid diffs found in response
+2025-12-23 14:10:01,670 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:10:01,671 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:10:01,680 - openevolve.process_parallel - WARNING - Iteration 8 error: No valid diffs found in response
+2025-12-23 14:10:22,018 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:10:22,020 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:10:22,027 - openevolve.process_parallel - WARNING - Iteration 9 error: No valid diffs found in response
+2025-12-23 14:10:42,150 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:10:42,151 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:10:42,159 - openevolve.process_parallel - WARNING - Iteration 10 error: No valid diffs found in response
+2025-12-23 14:11:02,285 - httpx - INFO - HTTP Request: POST http://localhost:8000/v1/chat/completions "HTTP/1.1 200 OK"
+2025-12-23 14:11:02,287 - openevolve.llm.ensemble - INFO - Sampled model: Qwen/Qwen2.5-Coder-7B-Instruct
+2025-12-23 14:11:02,294 - openevolve.process_parallel - WARNING - Iteration 11 error: No valid diffs found in response

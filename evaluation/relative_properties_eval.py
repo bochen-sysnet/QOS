@@ -1,9 +1,10 @@
 import argparse
 import csv
 import datetime as dt
+import importlib.util
 from pathlib import Path
 import sys
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import site
@@ -148,6 +149,81 @@ def _apply_metrics_baseline(
         return circuit
     backend = _get_metrics_backend(baseline)
     return transpile(circuit, backend=backend, optimization_level=opt_level)
+
+
+def _resolve_program_path(path_str: str) -> Optional[Path]:
+    if not path_str:
+        return None
+    candidate = Path(path_str)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    if candidate.exists():
+        return candidate.resolve()
+    rel = (ROOT / candidate).resolve()
+    return rel if rel.exists() else None
+
+
+def _find_qose_program(path_hint: str) -> Optional[Path]:
+    candidates = []
+    if path_hint:
+        candidates.append(path_hint)
+    env_hint = os.getenv("QOSE_PROGRAM", "").strip()
+    if env_hint:
+        candidates.append(env_hint)
+    candidates.extend(
+        [
+            str(ROOT / "qos" / "error_mitigator" / "qose_program.py"),
+            str(ROOT / "qos" / "error_mitigator" / "openevolve_output" / "best_program.py"),
+            str(ROOT / "openevolve_output" / "best_program.py"),
+        ]
+    )
+    for entry in candidates:
+        resolved = _resolve_program_path(entry)
+        if resolved:
+            return resolved
+    return None
+
+
+def _load_qose_run(qose_program: Path) -> Callable:
+    spec = importlib.util.spec_from_file_location("qose_program", str(qose_program))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load QOSE program at {qose_program}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    evolved_run = getattr(module, "evolved_run", None)
+    if not callable(evolved_run):
+        raise AttributeError(f"Program {qose_program} has no callable evolved_run()")
+    return evolved_run
+
+
+def _relative_methods(include_qose: bool) -> List[str]:
+    methods = ["FrozenQubits", "CutQC", "QOS"]
+    if include_qose:
+        methods.append("QOSE")
+    return methods
+
+
+def _fidelity_methods(include_qose: bool) -> List[str]:
+    methods = ["Qiskit", "FrozenQubits", "CutQC", "QOS"]
+    if include_qose:
+        methods.append("QOSE")
+    return methods
+
+
+def _timing_methods(include_qose: bool) -> List[str]:
+    methods = ["QOS"]
+    if include_qose:
+        methods.append("QOSE")
+    methods.extend(["FrozenQubits", "CutQC"])
+    return methods
+
+
+def _cut_methods(include_qose: bool) -> List[str]:
+    methods = ["Qiskit", "QOS"]
+    if include_qose:
+        methods.append("QOSE")
+    methods.extend(["FrozenQubits", "CutQC"])
+    return methods
 
 
 class SerialPool:
@@ -407,6 +483,41 @@ def _run_mitigator(
     )
 
 
+def _run_qose(
+    qc: QuantumCircuit, args, evolved_run: Callable
+) -> Tuple[Optional[Dict[str, int]], Dict[str, float], List[QuantumCircuit]]:
+    q = Qernel(qc.copy())
+    mitigator = ErrorMitigator(
+        size_to_reach=args.size_to_reach,
+        ideal_size_to_reach=args.ideal_size_to_reach,
+        budget=args.budget,
+        methods=[],
+        use_cost_search=bool(args.qos_cost_search),
+        collect_timing=args.collect_timing,
+    )
+    try:
+        if "SIGALRM" in signal.Signals.__members__:
+            signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
+            signal.alarm(args.timeout_sec)
+        q = evolved_run(mitigator, q)
+        if "SIGALRM" in signal.Signals.__members__:
+            signal.alarm(0)
+        return (
+            _analyze_qernel(
+                q,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            ),
+            mitigator.timings,
+            _extract_circuits(q),
+        )
+    except (ValueError, TimeoutError):
+        if "SIGALRM" in signal.Signals.__members__:
+            signal.alarm(0)
+        return None, {}, [qc]
+
+
 def _relative(value: float, baseline: float) -> float:
     if baseline == 0:
         return 1.0
@@ -446,8 +557,14 @@ def _plot_combined(
     out_dir: Path,
     timestamp: str,
     fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    methods: Optional[List[str]] = None,
+    fidelity_methods: Optional[List[str]] = None,
 ) -> Path:
     plt = _import_matplotlib()
+    if methods is None:
+        methods = _relative_methods(False)
+    if fidelity_methods is None:
+        fidelity_methods = _fidelity_methods(False)
     sizes = sorted(rel_by_size.keys())
     rows = max(1, len(sizes))
     cols = 3 if fidelity_by_size else 2
@@ -462,7 +579,7 @@ def _plot_combined(
             f"Depth - {size} qubits (lower is better)",
             rel_depth,
             benches,
-            ["FrozenQubits", "CutQC", "QOS"],
+            methods,
             "Relative to Qiskit",
         )
         _plot_panel(
@@ -470,7 +587,7 @@ def _plot_combined(
             f"Number of CNOT gates - {size} qubits (lower is better)",
             rel_nonlocal,
             benches,
-            ["FrozenQubits", "CutQC", "QOS"],
+            methods,
             "Relative to Qiskit",
         )
         if fidelity_by_size:
@@ -480,7 +597,7 @@ def _plot_combined(
                 f"Hellinger fidelity - {size} qubits (higher is better)",
                 fidelity,
                 benches,
-                ["Qiskit", "FrozenQubits", "CutQC", "QOS"],
+                fidelity_methods,
                 "Fidelity",
             )
 
@@ -493,7 +610,9 @@ def _plot_combined(
     return out_path
 
 
-def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp: str) -> Path:
+def _plot_timing(
+    timing_rows: List[Dict[str, object]], out_dir: Path, timestamp: str, include_qose: bool
+) -> Path:
     plt = _import_matplotlib()
     if not timing_rows:
         raise ValueError("No timing data to plot.")
@@ -524,7 +643,7 @@ def _plot_timing(timing_rows: List[Dict[str, object]], out_dir: Path, timestamp:
             groups[key].setdefault(k, []).append(float(v))
 
     sizes = sorted({int(r["size"]) for r in timing_rows})
-    methods = ["QOS", "FrozenQubits", "CutQC"]
+    methods = _timing_methods(include_qose)
 
     fig, axes = plt.subplots(len(sizes), 3, figsize=(16.5, 3.8 * len(sizes)))
     axes = np.array(axes)
@@ -655,6 +774,7 @@ def _plot_overheads(
     sizes: List[int],
     out_dir: Path,
     timestamp: str,
+    include_qose: bool,
 ) -> Path:
     plt = _import_matplotlib()
     min_factor = 1e-3
@@ -676,12 +796,14 @@ def _plot_overheads(
     if axes.ndim == 1:
         axes = axes.reshape(1, 3)
 
-    methods = ["FrozenQubits", "CutQC", "QOS"]
+    methods = _relative_methods(include_qose)
     method_keys = {
         "FrozenQubits": ("fq_classical_overhead", "fq_quantum_overhead"),
         "CutQC": ("cutqc_classical_overhead", "cutqc_quantum_overhead"),
         "QOS": ("qos_classical_overhead", "qos_quantum_overhead"),
     }
+    if include_qose:
+        method_keys["QOSE"] = ("qose_classical_overhead", "qose_quantum_overhead")
 
     for row_idx, size in enumerate(sizes):
         size_rows = [r for r in rows if int(r["size"]) == size]
@@ -813,6 +935,9 @@ def _summarize(rows: List[Dict[str, object]]) -> Dict[str, float]:
         vals = [float(r[key]) for r in rows]
         return sum(vals) / max(1, len(vals))
 
+    def _has_key(key: str) -> bool:
+        return any(key in r for r in rows)
+
     summary = {
         "rel_depth_qos": _avg("rel_depth_qos"),
         "rel_depth_cutqc": _avg("rel_depth_cutqc"),
@@ -821,6 +946,10 @@ def _summarize(rows: List[Dict[str, object]]) -> Dict[str, float]:
         "rel_nonlocal_cutqc": _avg("rel_nonlocal_cutqc"),
         "rel_nonlocal_fq": _avg("rel_nonlocal_fq"),
     }
+    if _has_key("rel_depth_qose"):
+        summary["rel_depth_qose"] = _avg("rel_depth_qose")
+    if _has_key("rel_nonlocal_qose"):
+        summary["rel_nonlocal_qose"] = _avg("rel_nonlocal_qose")
     dist = 0.0
     dist += (summary["rel_depth_qos"] - TARGET_REL["depth"]["QOS"]) ** 2
     dist += (summary["rel_depth_cutqc"] - TARGET_REL["depth"]["CutQC"]) ** 2
@@ -832,13 +961,14 @@ def _summarize(rows: List[Dict[str, object]]) -> Dict[str, float]:
     return summary
 
 
-def _run_eval(args, benches, sizes):
+def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
     all_rows: List[Dict[str, object]] = []
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
     timing_rows = []
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
     fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
+    include_qose = qose_run is not None
 
     noise = None
     if args.with_fidelity or args.fragment_fidelity_sweep:
@@ -874,6 +1004,18 @@ def _run_eval(args, benches, sizes):
             if args.verbose:
                 print(f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']}", flush=True)
 
+            qose_m = None
+            qose_t = {}
+            qose_circs = []
+            if include_qose:
+                qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_run)
+                if qose_m is None:
+                    qose_m = qos_m
+                    qose_circs = qos_circs
+                    qose_t = {}
+                if args.verbose:
+                    print(f"  qose depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']}", flush=True)
+
             if args.fragment_fidelity_sweep:
                 fragment_fidelity[(size, bench)] = _fragment_fidelity_sweep(
                     qos_circs,
@@ -885,10 +1027,16 @@ def _run_eval(args, benches, sizes):
             rel_depth[bench]["QOS"] = _relative(qos_m["depth"], base["depth"])
             rel_depth[bench]["FrozenQubits"] = _relative(fq_m["depth"], base["depth"])
             rel_depth[bench]["CutQC"] = _relative(cutqc_m["depth"], base["depth"])
+            if include_qose:
+                rel_depth[bench]["QOSE"] = _relative(qose_m["depth"], base["depth"])
 
             rel_nonlocal[bench]["QOS"] = _relative(qos_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
             rel_nonlocal[bench]["FrozenQubits"] = _relative(fq_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
             rel_nonlocal[bench]["CutQC"] = _relative(cutqc_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
+            if include_qose:
+                rel_nonlocal[bench]["QOSE"] = _relative(
+                    qose_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
+                )
 
             if args.with_fidelity:
                 sim_times = {}
@@ -904,33 +1052,49 @@ def _run_eval(args, benches, sizes):
                 t0 = time.perf_counter()
                 cutqc_fidelity = _average_fidelity(cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed)
                 sim_times["CutQC"] = time.perf_counter() - t0
+                if include_qose:
+                    t0 = time.perf_counter()
+                    qose_fidelity = _average_fidelity(qose_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                    sim_times["QOSE"] = time.perf_counter() - t0
+                else:
+                    qose_fidelity = ""
                 fidelity_by_size[size][bench] = {
                     "Qiskit": base_fidelity,
                     "QOS": qos_fidelity,
                     "FrozenQubits": fq_fidelity,
                     "CutQC": cutqc_fidelity,
                 }
+                if include_qose:
+                    fidelity_by_size[size][bench]["QOSE"] = qose_fidelity
                 rel_fidelity_qos = _relative(qos_fidelity, base_fidelity)
                 rel_fidelity_fq = _relative(fq_fidelity, base_fidelity)
                 rel_fidelity_cutqc = _relative(cutqc_fidelity, base_fidelity)
+                if include_qose:
+                    rel_fidelity_qose = _relative(qose_fidelity, base_fidelity)
+                else:
+                    rel_fidelity_qose = ""
             else:
                 sim_times = {}
                 base_fidelity = ""
                 qos_fidelity = ""
                 fq_fidelity = ""
                 cutqc_fidelity = ""
+                qose_fidelity = ""
                 rel_fidelity_qos = ""
                 rel_fidelity_fq = ""
                 rel_fidelity_cutqc = ""
+                rel_fidelity_qose = ""
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
             qos_sim = float(sim_times.get("QOS", 0.0))
             fq_sim = float(sim_times.get("FrozenQubits", 0.0))
             cutqc_sim = float(sim_times.get("CutQC", 0.0))
+            qose_sim = float(sim_times.get("QOSE", 0.0))
 
             qos_num_circuits = max(1, len(qos_circs))
             fq_num_circuits = max(1, len(fq_circs))
             cutqc_num_circuits = max(1, len(cutqc_circs))
+            qose_num_circuits = max(1, len(qose_circs)) if include_qose else 0
 
             qos_classical_overhead = _safe_ratio(qos_sim, qiskit_sim)
             fq_classical_overhead = _safe_ratio(fq_sim, qiskit_sim)
@@ -938,50 +1102,69 @@ def _run_eval(args, benches, sizes):
             qos_quantum_overhead = float(qos_num_circuits)
             fq_quantum_overhead = float(fq_num_circuits)
             cutqc_quantum_overhead = float(cutqc_num_circuits)
+            qose_classical_overhead = _safe_ratio(qose_sim, qiskit_sim) if include_qose else ""
+            qose_quantum_overhead = float(qose_num_circuits) if include_qose else ""
 
-            all_rows.append(
-                {
-                    "bench": bench,
-                    "size": size,
-                    "baseline_depth": base["depth"],
-                    "baseline_nonlocal": base["num_nonlocal_gates"],
-                    "baseline_fidelity": base_fidelity,
-                    "baseline_sim_time": qiskit_sim,
-                    "qos_depth": qos_m["depth"],
-                    "qos_nonlocal": qos_m["num_nonlocal_gates"],
-                    "qos_fidelity": qos_fidelity,
-                    "qos_sim_time": qos_sim,
-                    "fq_depth": fq_m["depth"],
-                    "fq_nonlocal": fq_m["num_nonlocal_gates"],
-                    "fq_fidelity": fq_fidelity,
-                    "fq_sim_time": fq_sim,
-                    "cutqc_depth": cutqc_m["depth"],
-                    "cutqc_nonlocal": cutqc_m["num_nonlocal_gates"],
-                    "cutqc_fidelity": cutqc_fidelity,
-                    "cutqc_sim_time": cutqc_sim,
-                    "qos_num_circuits": qos_num_circuits,
-                    "fq_num_circuits": fq_num_circuits,
-                    "cutqc_num_circuits": cutqc_num_circuits,
-                    "qos_classical_overhead": qos_classical_overhead,
-                    "fq_classical_overhead": fq_classical_overhead,
-                    "cutqc_classical_overhead": cutqc_classical_overhead,
-                    "qos_quantum_overhead": qos_quantum_overhead,
-                    "fq_quantum_overhead": fq_quantum_overhead,
-                    "cutqc_quantum_overhead": cutqc_quantum_overhead,
-                    "rel_depth_qos": rel_depth[bench]["QOS"],
-                    "rel_depth_fq": rel_depth[bench]["FrozenQubits"],
-                    "rel_depth_cutqc": rel_depth[bench]["CutQC"],
-                    "rel_nonlocal_qos": rel_nonlocal[bench]["QOS"],
-                    "rel_nonlocal_fq": rel_nonlocal[bench]["FrozenQubits"],
-                    "rel_nonlocal_cutqc": rel_nonlocal[bench]["CutQC"],
-                    "rel_fidelity_qos": rel_fidelity_qos,
-                    "rel_fidelity_fq": rel_fidelity_fq,
-                    "rel_fidelity_cutqc": rel_fidelity_cutqc,
-                }
-            )
+            row = {
+                "bench": bench,
+                "size": size,
+                "baseline_depth": base["depth"],
+                "baseline_nonlocal": base["num_nonlocal_gates"],
+                "baseline_fidelity": base_fidelity,
+                "baseline_sim_time": qiskit_sim,
+                "qos_depth": qos_m["depth"],
+                "qos_nonlocal": qos_m["num_nonlocal_gates"],
+                "qos_fidelity": qos_fidelity,
+                "qos_sim_time": qos_sim,
+                "fq_depth": fq_m["depth"],
+                "fq_nonlocal": fq_m["num_nonlocal_gates"],
+                "fq_fidelity": fq_fidelity,
+                "fq_sim_time": fq_sim,
+                "cutqc_depth": cutqc_m["depth"],
+                "cutqc_nonlocal": cutqc_m["num_nonlocal_gates"],
+                "cutqc_fidelity": cutqc_fidelity,
+                "cutqc_sim_time": cutqc_sim,
+                "qos_num_circuits": qos_num_circuits,
+                "fq_num_circuits": fq_num_circuits,
+                "cutqc_num_circuits": cutqc_num_circuits,
+                "qos_classical_overhead": qos_classical_overhead,
+                "fq_classical_overhead": fq_classical_overhead,
+                "cutqc_classical_overhead": cutqc_classical_overhead,
+                "qos_quantum_overhead": qos_quantum_overhead,
+                "fq_quantum_overhead": fq_quantum_overhead,
+                "cutqc_quantum_overhead": cutqc_quantum_overhead,
+                "rel_depth_qos": rel_depth[bench]["QOS"],
+                "rel_depth_fq": rel_depth[bench]["FrozenQubits"],
+                "rel_depth_cutqc": rel_depth[bench]["CutQC"],
+                "rel_nonlocal_qos": rel_nonlocal[bench]["QOS"],
+                "rel_nonlocal_fq": rel_nonlocal[bench]["FrozenQubits"],
+                "rel_nonlocal_cutqc": rel_nonlocal[bench]["CutQC"],
+                "rel_fidelity_qos": rel_fidelity_qos,
+                "rel_fidelity_fq": rel_fidelity_fq,
+                "rel_fidelity_cutqc": rel_fidelity_cutqc,
+            }
+            if include_qose:
+                row.update(
+                    {
+                        "qose_depth": qose_m["depth"],
+                        "qose_nonlocal": qose_m["num_nonlocal_gates"],
+                        "qose_fidelity": qose_fidelity,
+                        "qose_sim_time": qose_sim,
+                        "qose_num_circuits": qose_num_circuits,
+                        "qose_classical_overhead": qose_classical_overhead,
+                        "qose_quantum_overhead": qose_quantum_overhead,
+                        "rel_depth_qose": rel_depth[bench]["QOSE"],
+                        "rel_nonlocal_qose": rel_nonlocal[bench]["QOSE"],
+                        "rel_fidelity_qose": rel_fidelity_qose,
+                    }
+                )
+            all_rows.append(row)
 
             if args.collect_timing:
-                for method, timing in [("QOS", qos_t), ("FrozenQubits", fq_t), ("CutQC", cutqc_t)]:
+                timing_methods = [("QOS", qos_t), ("FrozenQubits", fq_t), ("CutQC", cutqc_t)]
+                if include_qose:
+                    timing_methods.insert(1, ("QOSE", qose_t))
+                for method, timing in timing_methods:
                     row = {"bench": bench, "size": size, "method": method}
                     row.update(timing)
                     if args.with_fidelity:
@@ -990,6 +1173,8 @@ def _run_eval(args, benches, sizes):
             if args.cut_visualization:
                 cut_circuits[(size, bench, "Qiskit")] = [qc]
                 cut_circuits[(size, bench, "QOS")] = qos_circs
+                if include_qose:
+                    cut_circuits[(size, bench, "QOSE")] = qose_circs
                 cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
                 cut_circuits[(size, bench, "CutQC")] = cutqc_circs
 
@@ -998,19 +1183,32 @@ def _run_eval(args, benches, sizes):
     return all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity
 
 
+def _load_qose_run_from_args(args) -> Tuple[Optional[Callable], Optional[Path]]:
+    qose_program = _find_qose_program(getattr(args, "qose_program", ""))
+    if not qose_program:
+        return None, None
+    try:
+        return _load_qose_run(qose_program), qose_program
+    except Exception as exc:
+        if getattr(args, "verbose", False):
+            print(f"Skipping QOSE program {qose_program}: {exc}", file=sys.stderr)
+        return None, None
+
+
 def _plot_cut_visualization(
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]],
     benches: List[Tuple[str, str]],
     sizes: List[int],
     out_dir: Path,
     timestamp: str,
+    include_qose: bool,
 ) -> Path:
     plt = _import_matplotlib()
     from matplotlib.backends.backend_pdf import PdfPages  # type: ignore
     from qiskit.visualization import circuit_drawer  # type: ignore
 
     out_path = out_dir / f"cut_visualization_{timestamp}.pdf"
-    methods = ["Qiskit", "QOS", "FrozenQubits", "CutQC"]
+    methods = _cut_methods(include_qose)
 
     with PdfPages(out_path) as pdf:
         for size in sizes:
@@ -1045,7 +1243,9 @@ def _import_matplotlib():
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare QOS, FrozenQubits, and CutQC vs Qiskit baseline.")
+    parser = argparse.ArgumentParser(
+        description="Compare QOS, FrozenQubits, CutQC, and optional QOSE vs Qiskit baseline."
+    )
     parser.add_argument("--sizes", default="12,24", help="Comma-separated qubit sizes.")
     parser.add_argument("--budget", type=int, default=3)
     parser.add_argument("--size-to-reach", type=int, default=7)
@@ -1116,6 +1316,14 @@ def main() -> None:
         help="Comma-separated benchmark names or 'all'.",
     )
     parser.add_argument(
+        "--qose-program",
+        default="",
+        help=(
+            "Optional path to evolved QOSE program (evolved_run). "
+            "If unset, auto-detect qose_program.py or openevolve_output/best_program.py."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         default=str(ROOT / "evaluation" / "plots"),
         help="Output directory for figures and CSV.",
@@ -1146,6 +1354,11 @@ def main() -> None:
         selected = {b.strip() for b in args.benches.split(",") if b.strip()}
         benches = [(b, label) for b, label in BENCHES if b in selected]
 
+    qose_run, qose_program = _load_qose_run_from_args(args)
+    include_qose = qose_run is not None
+    if args.verbose and qose_program:
+        print(f"Using QOSE program: {qose_program}", file=sys.stderr)
+
     if args.sweep:
         sweep_rows = []
         best = None
@@ -1170,7 +1383,9 @@ def main() -> None:
                             os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
                             os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-                            rows, _rel, _timing, _fid, _cuts, _frag = _run_eval(args, benches, sizes)
+                            rows, _rel, _timing, _fid, _cuts, _frag = _run_eval(
+                                args, benches, sizes, qose_run
+                            )
                             summary = _summarize(rows)
                             sweep_rows.append(
                                 {
@@ -1207,7 +1422,7 @@ def main() -> None:
         os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
         all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
-            args, benches, sizes
+            args, benches, sizes, qose_run
         )
         print(f"Wrote sweep: {sweep_path}")
         print(
@@ -1218,7 +1433,7 @@ def main() -> None:
         )
     else:
         all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
-            args, benches, sizes
+            args, benches, sizes, qose_run
         )
 
     csv_path = out_dir / f"relative_properties_compare_{timestamp}{tag_suffix}.csv"
@@ -1233,6 +1448,8 @@ def main() -> None:
         out_dir,
         f"{timestamp}{tag_suffix}",
         fidelity_by_size if args.with_fidelity else None,
+        methods=_relative_methods(include_qose),
+        fidelity_methods=_fidelity_methods(include_qose),
     )
 
     print(f"Wrote metrics: {csv_path}")
@@ -1244,6 +1461,7 @@ def main() -> None:
             sizes,
             out_dir,
             f"{timestamp}{tag_suffix}",
+            include_qose,
         )
         print(f"Wrote cut visualization: {cut_fig}")
     if args.collect_timing and timing_rows and args.timing_csv:
@@ -1255,12 +1473,14 @@ def main() -> None:
             writer.writerows(timing_rows)
         print(f"Wrote timing: {timing_path}")
     if args.collect_timing and timing_rows and args.timing_plot:
-        timing_fig = _plot_timing(timing_rows, out_dir, f"{timestamp}{tag_suffix}")
+        timing_fig = _plot_timing(timing_rows, out_dir, f"{timestamp}{tag_suffix}", include_qose)
         print(f"Wrote timing figure: {timing_fig}")
     if args.overhead_plot:
         if not args.with_fidelity:
             raise RuntimeError("Overhead plot requires --with-fidelity to measure simulation time.")
-        overhead_fig = _plot_overheads(all_rows, benches, sizes, out_dir, f"{timestamp}{tag_suffix}")
+        overhead_fig = _plot_overheads(
+            all_rows, benches, sizes, out_dir, f"{timestamp}{tag_suffix}", include_qose
+        )
         print(f"Wrote overhead figure: {overhead_fig}")
     if args.fragment_fidelity_sweep:
         frag_paths = _plot_fragment_fidelity_sweep(
