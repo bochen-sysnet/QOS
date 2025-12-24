@@ -4,8 +4,8 @@ log_level: "INFO"
 log_dir: null
 random_seed: 42
 
-diff_based_evolution: true
-max_code_length: 15000
+diff_based_evolution: false
+max_code_length: 30000
 
 early_stopping_patience: null
 convergence_threshold: 0.001
@@ -13,12 +13,12 @@ early_stopping_metric: "combined_score"
 
 llm:
   api_base: "http://localhost:8000/v1"
-  primary_model: "Qwen/Qwen2.5-Coder-7B-Instruct"
-  temperature: 0.7
-  top_p: 0.85
-  max_tokens: 700
-  timeout: 60
-  retries: 4
+  primary_model: "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ"
+  temperature: 0.6
+  top_p: 0.92
+  max_tokens: 1200
+  timeout: 450
+  retries: 2
   retry_delay: 1
 
 prompt:
@@ -27,35 +27,17 @@ prompt:
     in qos/error_mitigator/evolution_target.py.
 
     OUTPUT FORMAT (MANDATORY):
-    Output ONLY one or more SEARCH/REPLACE blocks EXACTLY in this format.
-    Do NOT output git diff. Do NOT output markdown. Do NOT output commentary.
-
-    <<<<<<< SEARCH
-    exact text to find
-    =======
-    replacement text
-    >>>>>>> REPLACE
-
-    The tokens '<<<<<<< SEARCH', '=======', and '>>>>>>> REPLACE' must appear exactly as written,
-    on their own lines, with the same number of < and > characters.
+    - Output the COMPLETE updated program code.
+    - Do NOT output markdown fences, diff markers, or commentary.
+    - IMPORTANT: All text outside '# OE_BEGIN' and '# OE_END' MUST be identical to the original file (character-for-character).
 
     EDIT SCOPE (MANDATORY):
     - Only modify code between markers '# OE_BEGIN' and '# OE_END'.
     - Do not change anything outside those markers.
     - Do not change imports or any function signatures.
-    - Modify at most 30 lines total.
-
-    IMPORTANT:
-    - SEARCH content must be copied verbatim from the current file.
-    - Always include either '# OE_BEGIN' or '# OE_END' inside the SEARCH block to anchor in-range.
-    - If unsure, choose a 5–10 line contiguous snippet inside the markers and replace it.
 
     OBJECTIVE:
     - Reduce depth, CNOT count, and quantum overhead; keep deterministic and fast.
-
-    FALLBACK (MANDATORY IF UNSURE):
-    - Make a minimal refactor inside OE_BEGIN/END (e.g., factor a constant into a local variable).
-    - Still output ONLY SEARCH/REPLACE blocks.
 
   evaluator_system_message: "You are an expert Quantum System Optimizer."
   num_top_programs: 1
@@ -67,8 +49,8 @@ prompt:
   template_variations: {}
 
 database:
-  db_path: null
-  in_memory: true
+  db_path: openevolve_output/db
+  in_memory: false
   log_prompts: true
   population_size: 40
   archive_size: 20
@@ -77,7 +59,7 @@ database:
   migration_rate: 0.1
   elite_selection_ratio: 0.1
   exploration_ratio: 0.35
-  exploitation_ratio: 0.65
+  exploitation_ratio: 0.55
   feature_dimensions:
     - "complexity"
     - "diversity"
@@ -85,18 +67,18 @@ database:
   diversity_reference_size: 20
 
 evaluator:
-  timeout: 60
-  max_retries: 0
+  timeout: 90
+  max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1
   use_llm_feedback: false
   llm_feedback_weight: 0.0
 
 evolution_trace:
-  enabled: false
+  enabled: true
   format: "jsonl"
-  include_code: false
+  include_code: true
   include_prompts: true
-  output_path: null
+  output_path: openevolve_output/evolution_trace.jsonl
   buffer_size: 10
   compress: false
