@@ -138,7 +138,7 @@ def _evaluate_worker(program_path, queue):
 
 
 def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "60"))
+    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "120"))
     if timeout_sec <= 0:
         metrics, artifacts = _evaluate_impl(program_path)
         return EvaluationResult(metrics=metrics, artifacts=artifacts)

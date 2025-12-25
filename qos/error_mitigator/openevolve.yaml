@@ -14,7 +14,7 @@ early_stopping_metric: "combined_score"
 llm:
   api_base: "http://localhost:8000/v1"
   primary_model: "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ"
-  temperature: 0.6
+  temperature: 0.8
   top_p: 0.92
   max_tokens: 1200
   timeout: 450
@@ -30,18 +30,21 @@ prompt:
     - Output the COMPLETE updated program code.
     - Do NOT output markdown fences, diff markers, or commentary.
     - IMPORTANT: All text outside '# OE_BEGIN' and '# OE_END' MUST be identical to the original file (character-for-character).
+    - Keep '# OE_BEGIN' and '# OE_END' present and unchanged.
 
     EDIT SCOPE (MANDATORY):
     - Only modify code between markers '# OE_BEGIN' and '# OE_END'.
     - Do not change anything outside those markers.
     - Do not change imports or any function signatures.
+    - Modify at most 60 lines inside OE_BEGIN/END.
 
     OBJECTIVE:
     - Reduce depth, CNOT count, and quantum overhead; keep deterministic and fast.
+    - Prefer novel algorithmic ideas (new heuristics, pruning rules, scoring functions) over micro-refactors.
 
   evaluator_system_message: "You are an expert Quantum System Optimizer."
   num_top_programs: 1
-  num_diverse_programs: 0
+  num_diverse_programs: 2
   use_template_stochasticity: false
   include_artifacts: false
   max_artifact_bytes: 20480
@@ -52,19 +55,26 @@ database:
   db_path: openevolve_output/db
   in_memory: false
   log_prompts: true
-  population_size: 40
-  archive_size: 20
-  num_islands: 2
-  migration_interval: 20
-  migration_rate: 0.1
-  elite_selection_ratio: 0.1
-  exploration_ratio: 0.35
-  exploitation_ratio: 0.55
+
+  # More islands, smaller per-island pop -> diverse search without too many total candidates
+  population_size: 24
+  archive_size: 24
+  num_islands: 4
+
+  # Less frequent mixing to preserve island diversity
+  migration_interval: 30
+  migration_rate: 0.15
+
+  # Reduce selection pressure, increase exploration
+  elite_selection_ratio: 0.05
+  exploration_ratio: 0.6
+  exploitation_ratio: 0.35
+
   feature_dimensions:
     - "complexity"
     - "diversity"
-  feature_bins: 10
-  diversity_reference_size: 20
+  feature_bins: 12
+  diversity_reference_size: 30
 
 evaluator:
   timeout: 90
@@ -75,10 +85,10 @@ evaluator:
   llm_feedback_weight: 0.0
 
 evolution_trace:
-  enabled: true
+  enabled: false
   format: "jsonl"
-  include_code: true
-  include_prompts: true
+  include_code: false
+  include_prompts: false
   output_path: openevolve_output/evolution_trace.jsonl
   buffer_size: 10
   compress: false
