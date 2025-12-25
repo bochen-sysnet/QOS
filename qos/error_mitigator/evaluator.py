@@ -3,6 +3,7 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import time
 from types import SimpleNamespace
 from openevolve.evaluation_result import EvaluationResult
 
@@ -14,6 +15,7 @@ from evaluation.full_eval import (
     _extract_circuits,
     _run_mitigator,
 )
+from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 
@@ -65,7 +67,21 @@ def _evaluate_impl(program_path):
 
     rel_depth = rel_cnot = rel_overhead = 0.0
     count = 0
+    cases = []
 
+    feature_keys = [
+        "depth",
+        "num_qubits",
+        "num_nonlocal_gates",
+        "program_communication",
+        "liveness",
+        "parallelism",
+        "measurement",
+        "entanglement_ratio",
+        "critical_depth",
+    ]
+
+    total_run_time = 0.0
     for bench in benches:
         for size in sizes:
             qc = _load_qasm_circuit(bench, size)
@@ -83,6 +99,10 @@ def _evaluate_impl(program_path):
 
             # Evolved QOSE
             q = Qernel(qc.copy())
+            BasicAnalysisPass().run(q)
+            SupermarqFeaturesAnalysisPass().run(q)
+            input_meta = q.get_metadata()
+            input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
             mitigator = ErrorMitigator(
                 size_to_reach=args.size_to_reach,
                 ideal_size_to_reach=args.ideal_size_to_reach,
@@ -91,7 +111,9 @@ def _evaluate_impl(program_path):
                 use_cost_search=args.qos_cost_search,
                 collect_timing=False,
             )
+            t0 = time.perf_counter()
             q = evolved_run(mitigator, q)
+            run_time = time.perf_counter() - t0
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
@@ -99,17 +121,38 @@ def _evaluate_impl(program_path):
                 args.metrics_optimization_level,
             )
             qose_circs = _extract_circuits(q)
+            total_run_time += run_time
 
             if baseline_mode == "qiskit":
                 rel_depth += qose_m["depth"] / max(1, base["depth"])
                 rel_cnot += qose_m["num_nonlocal_gates"] / max(1, base["num_nonlocal_gates"])
                 rel_overhead += float(max(1, len(qose_circs)))
+                baseline_depth = base["depth"]
+                baseline_cnot = base["num_nonlocal_gates"]
+                baseline_label = "qiskit"
             else:
                 rel_depth += qose_m["depth"] / max(1, qos_m["depth"])
                 rel_cnot += qose_m["num_nonlocal_gates"] / max(
                     1, qos_m["num_nonlocal_gates"]
                 )
                 rel_overhead += len(qose_circs) / max(1, len(qos_circs))
+                baseline_depth = qos_m["depth"]
+                baseline_cnot = qos_m["num_nonlocal_gates"]
+                baseline_label = "qos"
+            cases.append(
+                {
+                    "bench": bench,
+                    "size": size,
+                    "baseline_mode": baseline_label,
+                    "baseline_depth": baseline_depth,
+                    "baseline_cnot": baseline_cnot,
+                    "qose_depth": qose_m["depth"],
+                    "qose_cnot": qose_m["num_nonlocal_gates"],
+                    "qose_num_circuits": len(qose_circs),
+                    "evolved_run_sec": run_time,
+                    "input_features": input_features,
+                }
+            )
             count += 1
 
     if count == 0:
@@ -120,12 +163,18 @@ def _evaluate_impl(program_path):
     rel_overhead /= count
 
     combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/100.)
-    return {
+    metrics = {
         "rel_depth": rel_depth,
         "rel_cnot": rel_cnot,
         "rel_overhead": rel_overhead,
         "combined_score": combined_score,
-    }, {}
+    }
+    artifacts = {
+        "baseline_mode": baseline_mode,
+        "evolved_run_sec_avg": (total_run_time / count) if count else 0.0,
+        "cases": cases,
+    }
+    return metrics, artifacts
 
 
 def _evaluate_worker(program_path, queue):

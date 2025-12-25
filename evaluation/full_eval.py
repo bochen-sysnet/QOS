@@ -25,7 +25,7 @@ if USER_SITE in sys.path:
 from qiskit import QuantumCircuit, ClassicalRegister, transpile
 from qiskit.converters import circuit_to_dag, dag_to_circuit
 
-from qos.error_mitigator.analyser import BasicAnalysisPass
+from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 from qvm.quasi_distr import QuasiDistr
@@ -505,6 +505,8 @@ def _run_qose(
     qc: QuantumCircuit, args, evolved_run: Callable
 ) -> Tuple[Optional[Dict[str, int]], Dict[str, float], List[QuantumCircuit]]:
     q = Qernel(qc.copy())
+    BasicAnalysisPass().run(q)
+    SupermarqFeaturesAnalysisPass().run(q)
     mitigator = ErrorMitigator(
         size_to_reach=args.size_to_reach,
         ideal_size_to_reach=args.ideal_size_to_reach,

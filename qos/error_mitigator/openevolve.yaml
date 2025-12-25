@@ -23,33 +23,48 @@ llm:
 
 prompt:
   system_message: |
-    You are optimizing QOSE by modifying the function evolved_run(self, q)
-    in qos/error_mitigator/evolution_target.py.
+    You are an expert Quantum System Optimizer specializing in error mitigation.
+    Your task is to optimize the function evolved_run(self, q) to reduce the depth, CNOT count, and quantum overhead of the circuit.
+    
+    You can use the following techniques to optimize the circuit:
+    - Gate virtualisation (applyGV)
+    - Wire cutting (applyWC)
+    - Frozen qubit (FrozenQubitsPass)
+    - Qubit reuse (applyQR)
+
+    Optimization opportunities:
+    - Improve the cost search algorithm (fewer iterations of computeCuttingCosts)
+    - Improve the ordering of the above techniques
+    - Improve the condition for applying the above techniques
 
     OUTPUT FORMAT (MANDATORY):
     - Output the COMPLETE updated program code.
     - Do NOT output markdown fences, diff markers, or commentary.
     - IMPORTANT: All text outside '# OE_BEGIN' and '# OE_END' MUST be identical to the original file (character-for-character).
     - Keep '# OE_BEGIN' and '# OE_END' present and unchanged.
-
-    EDIT SCOPE (MANDATORY):
-    - Only modify code between markers '# OE_BEGIN' and '# OE_END'.
-    - Do not change anything outside those markers.
-    - Do not change imports or any function signatures.
-    - Modify at most 60 lines inside OE_BEGIN/END.
+    - Do not change the imports or any function signatures.
+    - Do not change the constraint of the max_iters in the cost search algorithm.
 
     OBJECTIVE:
     - Reduce depth, CNOT count, and quantum overhead; keep deterministic and fast.
-    - Prefer novel algorithmic ideas (new heuristics, pruning rules, scoring functions) over micro-refactors.
+    - Prefer novel algorithmic ideas (new heuristics, pruning rules) over micro-refactors.
 
-  evaluator_system_message: "You are an expert Quantum System Optimizer."
-  num_top_programs: 1
-  num_diverse_programs: 2
+  evaluator_system_message: "You are an expert code reviewer."
+  num_top_programs: 2
+  num_diverse_programs: 1
   use_template_stochasticity: false
-  include_artifacts: false
+  include_artifacts: true
   max_artifact_bytes: 20480
   artifact_security_filter: true
-  template_variations: {}
+  template_variations: 
+    greeting:
+        - "Let's enhance this code:"
+        - "Time to optimize:"
+        - "Improving the algorithm:"
+    improvement_suggestion:
+        - "Here's how we could improve this code:"
+        - "I suggest the following improvements:"
+        - "We can enhance this code by:"
 
 database:
   db_path: openevolve_output/db
