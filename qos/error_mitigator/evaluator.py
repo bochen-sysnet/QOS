@@ -6,7 +6,7 @@ import random
 from types import SimpleNamespace
 from openevolve.evaluation_result import EvaluationResult
 
-from evaluation.relative_properties_eval import (
+from evaluation.full_eval import (
     BENCHES,
     _load_qasm_circuit,
     _analyze_circuit,

@@ -234,6 +234,16 @@ class SerialPool:
         return [fn(*args) for args in iterable]
 
 
+class _CountingMitigator(ErrorMitigator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cost_search_calls = 0
+
+    def computeCuttingCosts(self, q: Qernel, size_to_reach: int):
+        self.cost_search_calls += 1
+        return super().computeCuttingCosts(q, size_to_reach)
+
+
 def _ensure_measurements(circuit: QuantumCircuit | VirtualCircuit) -> QuantumCircuit:
     if isinstance(circuit, VirtualCircuit):
         circuit = circuit._circuit
@@ -440,7 +450,10 @@ def _run_mitigator(
     for size_to_reach in size_candidates:
         q = Qernel(qc.copy())
         use_cost_search = bool(methods == [] and args.qos_cost_search)
-        mitigator = ErrorMitigator(
+        mitigator_cls = ErrorMitigator
+        if args.collect_timing and methods == [] and args.qos_cost_search:
+            mitigator_cls = _CountingMitigator
+        mitigator = mitigator_cls(
             size_to_reach=size_to_reach,
             ideal_size_to_reach=args.ideal_size_to_reach,
             budget=budget,
@@ -457,6 +470,8 @@ def _run_mitigator(
             q = mitigator.run(q)
             if args.collect_timing and "total" not in mitigator.timings:
                 mitigator.timings["total"] = time.perf_counter() - start
+            if args.collect_timing and hasattr(mitigator, "cost_search_calls"):
+                mitigator.timings["cost_search_calls"] = mitigator.cost_search_calls
             if use_alarm:
                 signal.alarm(0)
             return (
@@ -623,6 +638,17 @@ def _plot_timing(
     if not timing_rows:
         raise ValueError("No timing data to plot.")
 
+    stages = ["analysis", "qaoa_analysis", "qf", "cost_search", "gv", "wc", "qr", "cut_select"]
+    skip_stages = {"total", "overall", "simulation", "cost_search_calls"}
+    seen = set(stages)
+    for row in timing_rows:
+        for k in row.keys():
+            if k in {"bench", "size", "method"} or k in skip_stages:
+                continue
+            if k not in seen:
+                stages.append(k)
+                seen.add(k)
+
     def _row_total(row: Dict[str, object]) -> float:
         if "total" in row:
             try:
@@ -642,10 +668,10 @@ def _plot_timing(
     sizes = sorted({int(r["size"]) for r in timing_rows})
     methods = _timing_methods(include_qose)
 
-    fig, axes = plt.subplots(len(sizes), 2, figsize=(11.0, 3.8 * len(sizes)))
+    fig, axes = plt.subplots(len(sizes), 4, figsize=(22.0, 3.8 * len(sizes)))
     axes = np.array(axes)
     if axes.ndim == 1:
-        axes = axes.reshape(1, 2)
+        axes = axes.reshape(1, 4)
 
     for row_idx, size in enumerate(sizes):
         ax = axes[row_idx, 0]
@@ -690,6 +716,63 @@ def _plot_timing(
         ax.bar(x, vals)
         ax.set_title(f"QOS Timing by Circuit (Total) - {size} qubits")
         ax.set_ylabel("Seconds")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+        ax = axes[row_idx, 2]
+        bench_labels = []
+        for bench, label in BENCHES:
+            if any(
+                int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
+                for r in timing_rows
+            ):
+                bench_labels.append((bench, label))
+        if not bench_labels:
+            ax.set_visible(False)
+            continue
+        x = np.arange(len(bench_labels))
+        bottom = np.zeros(len(bench_labels))
+        for stage in stages:
+            vals = []
+            for bench, _label in bench_labels:
+                stage_vals = [
+                    float(r.get(stage, 0.0))
+                    for r in timing_rows
+                    if int(r["size"]) == size
+                    and r["method"] == "QOS"
+                    and r["bench"] == bench
+                    and stage in r
+                ]
+                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+            ax.bar(x, vals, bottom=bottom, label=stage)
+            bottom = bottom + np.array(vals)
+        ax.set_title(f"QOS Timing Breakdown by Circuit - {size} qubits")
+        ax.set_ylabel("Seconds")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.legend(fontsize=7)
+
+        ax = axes[row_idx, 3]
+        call_vals = []
+        for bench, _label in bench_labels:
+            vals = [
+                float(r.get("cost_search_calls", 0.0))
+                for r in timing_rows
+                if int(r["size"]) == size
+                and r["method"] == "QOS"
+                and r["bench"] == bench
+                and "cost_search_calls" in r
+            ]
+            call_vals.append(sum(vals) / max(1, len(vals)))
+        if not any(call_vals):
+            ax.set_visible(False)
+            continue
+        x = np.arange(len(bench_labels))
+        ax.bar(x, call_vals)
+        ax.set_title(f"Cost Search Calls by Circuit - {size} qubits")
+        ax.set_ylabel("Calls")
         ax.set_xticks(x)
         ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
         ax.grid(axis="y", linestyle="--", alpha=0.4)
