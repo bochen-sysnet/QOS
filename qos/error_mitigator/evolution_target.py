@@ -56,7 +56,7 @@ def evolved_run(self, q: Qernel):
         else:
             q = self.applyWC(q, size_to_reach)
 
-    q = self.applyQR(q, self.size_to_reach)
+    q = self.applyQR(q, size_to_reach)
 
     # OE_END
     return q
