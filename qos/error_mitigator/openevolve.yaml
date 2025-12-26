@@ -92,7 +92,7 @@ database:
   diversity_reference_size: 30
 
 evaluator:
-  timeout: 90
+  timeout: 300
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1

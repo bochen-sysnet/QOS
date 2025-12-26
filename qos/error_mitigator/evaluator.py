@@ -49,12 +49,15 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
         seed = os.getenv("QOSE_SEED")
-        if seed:
-            rng = random.Random(int(seed))
+        rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
+        if sample_count <= 1:
             benches = [rng.choice(bench_choices)]
+        elif sample_count <= len(bench_choices):
+            benches = rng.sample(bench_choices, sample_count)
         else:
-            benches = [random.SystemRandom().choice(bench_choices)]
+            benches = [rng.choice(bench_choices) for _ in range(sample_count)]
 
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
@@ -187,7 +190,7 @@ def _evaluate_worker(program_path, queue):
 
 
 def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "120"))
+    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "300"))
     if timeout_sec <= 0:
         metrics, artifacts = _evaluate_impl(program_path)
         return EvaluationResult(metrics=metrics, artifacts=artifacts)
