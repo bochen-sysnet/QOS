@@ -48,6 +48,12 @@ class GateVirtualizationPass(TransformationPass):
     def run(self, q: Qernel):
         pass
 
+
+def _unwrap_virtual_circuit(qc):
+    if isinstance(qc, VirtualCircuit):
+        return qc._circuit
+    return qc
+
 class WireCuttingPass(TransformationPass):
     @abstractmethod
     def name(self):
@@ -141,12 +147,12 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
 
         if len(vsqs) > 0:
             for vsq in vsqs:
-                qc = vsq.get_circuit()
+                qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 new_circuit = optimal_decomposition_pass.run(qc, budget)
                 #virtual_circuit = VirtualCircuit(new_circuit)
                 vsq.set_circuit(new_circuit)
         else:
-            qc = q.get_circuit()        
+            qc = _unwrap_virtual_circuit(q.get_circuit())
             new_circuit = optimal_decomposition_pass.run(qc, budget)
             #virtual_circuit = VirtualCircuit(new_circuit)
             sub_qernel = Qernel()
@@ -165,7 +171,7 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
         if len(vsqs) > 0:
             highest_cost = 0
             for vsq in vsqs:
-                qc = vsq.get_circuit()
+                qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 try:
                     cost = optimal_decomposition_pass.get_budget(qc)
                 except ValueError:
@@ -173,7 +179,7 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
                 if cost > highest_cost:
                     highest_cost = cost
         else:
-            qc = q.get_circuit()        
+            qc = _unwrap_virtual_circuit(q.get_circuit())
             try:
                 cost = optimal_decomposition_pass.get_budget(qc)
             except ValueError:
@@ -311,7 +317,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
 
         if len(vsqs) > 0:
             for vsq in vsqs:
-                qc = vsq.get_circuit()
+                qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 new_circuit = optimal_wire_cutting_pass.run(qc, budget)
 
                 """                
@@ -349,7 +355,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
                 """
                 vsq.set_circuit(new_circuit)
         else:
-            qc = q.get_circuit()        
+            qc = _unwrap_virtual_circuit(q.get_circuit())
             new_circuit = optimal_wire_cutting_pass.run(qc, budget)
             #virtual_circuit = VirtualCircuit(new_circuit)
             sub_qernel = Qernel()
@@ -368,7 +374,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
         if len(vsqs) > 0:
             highest_cost = 0
             for vsq in vsqs:
-                qc = vsq.get_circuit()
+                qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 try:
                     cost = optimal_wire_cutting_pass.get_budget(qc)
                 except ValueError:
@@ -376,7 +382,7 @@ class OptimalWireCuttingPass(WireCuttingPass):
                 if cost > highest_cost:
                     highest_cost = cost
         else:
-            qc = q.get_circuit()        
+            qc = _unwrap_virtual_circuit(q.get_circuit())
             try:
                 cost = optimal_wire_cutting_pass.get_budget(qc)
             except ValueError:
