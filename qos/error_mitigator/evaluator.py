@@ -16,6 +16,7 @@ from evaluation.full_eval import (
     _run_mitigator,
 )
 from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
+from qos.error_mitigator.optimiser import FrozenQubitsPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 
@@ -114,9 +115,43 @@ def _evaluate_impl(program_path):
                 use_cost_search=args.qos_cost_search,
                 collect_timing=False,
             )
-            t0 = time.perf_counter()
-            q = evolved_run(mitigator, q)
-            run_time = time.perf_counter() - t0
+            stage_counts = {}
+            stage_order = []
+            stage_names = (
+                "computeCuttingCosts",
+                "applyGV",
+                "applyWC",
+                "applyQR",
+                "applyBestCut",
+            )
+            for stage_name in stage_names:
+                if not hasattr(mitigator, stage_name):
+                    continue
+                orig = getattr(mitigator, stage_name)
+
+                def _wrap_stage(orig_fn, name):
+                    def _wrapped(*args, **kwargs):
+                        stage_counts[name] = stage_counts.get(name, 0) + 1
+                        stage_order.append(name)
+                        return orig_fn(*args, **kwargs)
+
+                    return _wrapped
+
+                setattr(mitigator, stage_name, _wrap_stage(orig, stage_name))
+            fq_orig = FrozenQubitsPass.run
+
+            def _fq_run(self, *args, **kwargs):
+                stage_counts["FrozenQubitsPass"] = stage_counts.get("FrozenQubitsPass", 0) + 1
+                stage_order.append("FrozenQubitsPass")
+                return fq_orig(self, *args, **kwargs)
+
+            FrozenQubitsPass.run = _fq_run
+            try:
+                t0 = time.perf_counter()
+                q = evolved_run(mitigator, q)
+                run_time = time.perf_counter() - t0
+            finally:
+                FrozenQubitsPass.run = fq_orig
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
@@ -154,6 +189,8 @@ def _evaluate_impl(program_path):
                     "qose_num_circuits": len(qose_circs),
                     "evolved_run_sec": run_time,
                     "input_features": input_features,
+                    "stage_counts": stage_counts,
+                    "stage_order": stage_order,
                 }
             )
             count += 1
