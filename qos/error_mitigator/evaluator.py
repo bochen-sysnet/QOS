@@ -50,7 +50,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
         seed = os.getenv("QOSE_SEED")
         rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
         if sample_count <= 1:

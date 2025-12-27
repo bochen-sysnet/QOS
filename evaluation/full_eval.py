@@ -558,12 +558,35 @@ def _plot_panel(
     benches: List[Tuple[str, str]],
     methods: List[str],
     ylabel: str,
+    show_avg: bool = False,
 ) -> None:
     x = np.arange(len(methods))
     width = 0.08
+    all_vals: List[float] = []
     for i, (bench, label) in enumerate(benches):
         vals = [rel_data[bench].get(m, 1.0) for m in methods]
+        all_vals.extend(vals)
         ax.bar(x + (i - len(benches) / 2) * width, vals, width, label=label)
+
+    if show_avg:
+        max_val = max(all_vals) if all_vals else 0.0
+        pad = max(0.02, max_val * 0.06)
+        if max_val > 0:
+            ax.set_ylim(top=max(ax.get_ylim()[1], max_val + pad * 2))
+        for idx, method in enumerate(methods):
+            vals = [rel_data[bench].get(method, 1.0) for bench, _ in benches]
+            if not vals:
+                continue
+            avg = sum(vals) / len(vals)
+            y = max(vals) + pad
+            ax.text(
+                x[idx],
+                y,
+                f"avg {avg:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
 
     ax.set_xticks(x)
     ax.set_xticklabels(methods)
@@ -602,6 +625,7 @@ def _plot_combined(
             benches,
             methods,
             "Relative to Qiskit",
+            show_avg=True,
         )
         _plot_panel(
             axes[row, 1],
@@ -610,6 +634,7 @@ def _plot_combined(
             benches,
             methods,
             "Relative to Qiskit",
+            show_avg=True,
         )
         if fidelity_by_size:
             fidelity = fidelity_by_size.get(size, {})
@@ -1290,7 +1315,7 @@ def main() -> None:
     parser.add_argument("--timing-plot", action="store_true")
     parser.add_argument("--overhead-plot", action="store_true")
     parser.add_argument("--with-fidelity", action="store_true")
-    parser.add_argument("--fidelity-shots", type=int, default=2000)
+    parser.add_argument("--fidelity-shots", type=int, default=200)
     parser.add_argument("--fidelity-seed", type=int, default=7)
     parser.add_argument("--fidelity-p1", type=float, default=0.001, help="1-qubit depolarizing error.")
     parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")

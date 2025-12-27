@@ -15,64 +15,108 @@ early_stopping_metric: "combined_score"
 llm:
   api_base: "http://localhost:8000/v1"
   primary_model: "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ"
-  temperature: 0.8
+  temperature: 0.75
   top_p: 0.92
-  max_tokens: 1400
+  max_tokens: 1800
   timeout: 450
   retries: 3
   retry_delay: 1
 
 prompt:
   system_message: |
-    Optimize ONLY evolved_run(self, q) in qos/error_mitigator/evolution_target.py between # OE_BEGIN and # OE_END.
+    You are OpenEvolve. You are optimizing ONLY the function evolved_run(self, q).
 
-    Qernel metadata:
-    input_meta = q.get_metadata() (keys may be missing; use .get()).
-    Keys may include:
-      Simple: depth, num_qubits, num_nonlocal_gates, num_connected_components, num_cnot_gates, num_measurements
-      Supermarq: program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-    Use metadata to decide whether/when to apply: FrozenQubitsPass (FQ), applyGV (GV), applyWC (WC), applyQR (QR).
+    CRITICAL OUTPUT REQUIREMENT:
+      - Always output the ENTIRE FILE (all imports + full evolved_run definition), not just the OE region.
+      - HOWEVER, you MUST ONLY MODIFY code between markers '# OE_BEGIN' and '# OE_END'.
+      - Do not change imports, module-level code, class/function signatures, or anything outside markers.
 
-    EVALUATION (maximize combined_score):
-      rel_depth = QOSE_depth / QOS_depth (smaller better)
-      rel_cnot  = QOSE_cnot  / QOS_cnot  (smaller better)
-      rel_overhead = QOSE_num_fragments / QOS_num_fragments (smaller better)
-      combined_score = 1 / (1 + rel_depth + rel_cnot + rel_overhead/100)
-    IMPORTANT: rel_depth and rel_cnot dominate; rel_overhead is 100× weaker. Do NOT trade big depth/CNOT increases for small fragment reductions.
-    Evaluator randomly samples 3 circuits and averages metrics → prioritize robust average-case, avoid regressions on easy circuits.
+    TASK CONTEXT:
+      - Input q is a Qernel. Metadata is available via q.get_metadata().
+      - evolved_run is stateless across calls (no caching across runs).
+      - Evaluator selects circuits uniformly at random (uniform selection).
+      - evolved_run is the LAST transformation in the pipeline.
 
-    High-impact edits to explore (keep changes conservative; 1–2 logic changes per candidate):
-      - Add metadata-driven SKIP logic (do nothing on small/low-nonlocal circuits).
-      - Improve QAOA freezing heuristic (top-k/threshold) safely: handle num_nonlocal_gates==0, <k hotspots, missing keys.
-      - Improve size_to_reach/min_size rule ("size_to_reach > 2" is a heuristic).
-      - Improve size search while keeping QOS_COST_SEARCH_MAX_ITERS meaning unchanged; cache computeCuttingCosts(q, size) within evolved_run.
+    Your job is to make evolved_run decide the error-mitigation pipeline (freezing / cutting / reuse / GV) depending on these features.
 
-    Hard constraints:
-      - Output COMPLETE updated program code only (no markdown/diff/commentary).
-      - Everything outside OE_BEGIN/OE_END must be byte-identical; keep markers unchanged.
-      - Do not change imports or any function signatures.
-      - Deterministic only; keep runtime short.
+    AVAILABLE TECHNIQUES (already implemented elsewhere):
+      - Frozen qubit (FrozenQubitsPass)
+      - Gate virtualisation (applyGV)
+      - Wire cutting (applyWC)
+      - Qubit reuse (applyQR)
+
+    METRICS:
+      - rel_depth: depth(QOSE) / depth(QOS)
+      - rel_cnot:  cnot(QOSE) / cnot(QOS)
+      - rel_overhead: num_circuits(QOSE) / num_circuits(QOS)
+      - combined_score (maximize):
+          combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0)
+
+    IMPORTANT:
+      - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_run.
+        You may treat it only as a soft heuristic.
+
+    ARTIFACTS PROVIDED BY EVALUATOR (per case):
+      - input_features: depth, num_qubits, num_nonlocal_gates, program_communication, liveness,
+        parallelism, measurement, entanglement_ratio, critical_depth
+      - stage_counts: call counts for computeCuttingCosts, applyGV, applyWC, applyQR, FrozenQubitsPass
+      - stage_order: sequence of these calls
+      Use artifacts to diagnose regressions and avoid repeated computeCuttingCosts loops.
+
+    HARD CONSTRAINTS:
+      - Deterministic execution (no randomness).
+      - Runtime: bounded candidate search; do NOT use unbounded loops.
+      - Do not introduce new imports or new module dependencies.
+
+    IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
+      A) Pipeline decision based on metadata:
+         - Decide whether to apply FQ, WC, GV, QR, and in what order, based on input_meta.
+         - Use safe defaults if a key is missing (input_meta.get(key) is None).
+
+      B) Improve size_to_reach design:
+         - "size_to_reach > 2" is a heuristic; you may replace with a metadata-driven rule,
+           e.g. min_size threshold depending on num_qubits / connected components / nonlocal gates.
+         - You may explore different stopping rules and candidate sets of sizes.
+
+      C) Improve the search for size_to_reach:
+         - Current approach uses two while loops / iterative shrinking.
+         - Improve it using:
+             - caching computeCuttingCosts(q, size) within a call
+             - bracket + binary search (if you assume monotonicity)
+             - small candidate-set evaluation around an initial guess and choose best feasible
+         - DO NOT change the meaning of QOS_COST_SEARCH_MAX_ITERS: it must remain an upper bound on iterations.
+
+      D) Improve freezing heuristic (QAOA hotspots logic):
+         - Replace the brittle rule:
+             for i in range(2):
+                 if hotspots[i] / num_cnots >= 0.07: ...
+           with a metadata-driven, robust rule:
+             - handle num_cnots==0 or missing hotspots
+             - allow top-k, percentile, dynamic threshold, or using entanglement_ratio/critical_depth
+             - cap qubits_to_freeze reasonably (e.g. <= num_qubits-1)
+         - Keep deterministic behavior.
+
+      E) Global thinking:
+         - Consider interactions: e.g., FQ may reduce nonlocal gates and change cutting costs;
+           QR may reduce effective width, which changes feasible cutting size.
+         - Favor strategies that choose pipeline based on predicted downstream benefit.
+
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
   num_top_programs: 2
   num_diverse_programs: 2
   use_template_stochasticity: true
-  include_artifacts: false
-  max_artifact_bytes: 20480
+
+  # Make sure OpenEvolve passes artifacts back into the model prompt each iteration.
+  include_artifacts: true
+  max_artifact_bytes: 65536
   artifact_security_filter: true
-  template_variations:
-    strategy:
-      - "Focus on metadata-driven pipeline selection and skip logic for FQ/WC/GV/QR."
-      - "Focus on improving size_to_reach search: caching + bracketed or candidate-set search; keep max_iters semantics."
-      - "Focus on redesigning freezing heuristic using robust top-k/percentile logic and metadata (entanglement_ratio, critical_depth)."
-      - "Focus on global optimization: choose pipeline order and parameters to minimize downstream costs, not local heuristics."
 
 database:
   db_path: openevolve_output/db
   in_memory: false
   log_prompts: true
 
-  # Novelty-oriented island model
   population_size: 24
   archive_size: 16
   num_islands: 4
