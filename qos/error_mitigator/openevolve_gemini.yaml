@@ -1,0 +1,174 @@
+max_iterations: 20
+checkpoint_interval: 5
+log_level: "INFO"
+log_dir: null
+random_seed: 42
+
+# Rewrite mode: output full file each iteration (stable with OE markers)
+diff_based_evolution: false
+max_code_length: 30000
+
+early_stopping_patience: null
+convergence_threshold: 0.001
+early_stopping_metric: "combined_score"
+
+llm:
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: ${GEMINI_API_KEY}
+  primary_model: "gemini-2.5-flash"
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 4096
+  timeout: 60
+  retries: 3
+  retry_delay: 10
+
+prompt:
+  system_message: |
+    You are optimizing ONLY the function evolved_run(self, q) in qos/error_mitigator/evolution_target.py.
+
+    CONTEXT:
+    The input q is a Qernel. It contains metadata computed elsewhere, accessible via:
+      input_meta = q.get_metadata()
+
+    The metadata may include BOTH:
+    [Simple metadata keys]
+      - depth
+      - num_qubits
+      - num_clbits
+      - num_nonlocal_gates
+      - num_connected_components
+      - number_instructions
+      - num_measurements
+      - num_cnot_gates
+
+    [Supermarq metadata keys]
+      - program_communication
+      - liveness
+      - parallelism
+      - measurement
+      - entanglement_ratio
+      - critical_depth
+
+    Your job is to make evolved_run decide the error-mitigation pipeline (freezing / cutting / reuse / GV) depending on these features.
+
+    AVAILABLE TECHNIQUES (already implemented elsewhere):
+      - Frozen qubit (FrozenQubitsPass)
+      - Gate virtualisation (applyGV)
+      - Wire cutting (applyWC)
+      - Qubit reuse (applyQR)
+
+    HIGH-LEVEL OBJECTIVE (global, pipeline-aware):
+      Minimize a combined score that improves:
+      1) circuit depth reduction
+      2) CNOT reduction
+      3) overhead reduction (keep runtime fast; reduce expensive calls/loops)
+    Think globally: choose the best pipeline sequence and parameters as a whole, not just local optima.
+
+    IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
+      A) Pipeline decision based on metadata:
+         - Decide whether to apply FQ, WC, GV, QR, and in what order, based on input_meta.
+         - Use safe defaults if a key is missing (input_meta.get(key) is None).
+
+      B) Improve size_to_reach design:
+         - "size_to_reach > 2" is a heuristic; you may replace with a metadata-driven rule,
+           e.g. min_size threshold depending on num_qubits / connected components / nonlocal gates.
+         - You may explore different stopping rules and candidate sets of sizes.
+
+      C) Improve the search for size_to_reach:
+         - Current approach uses two while loops / iterative shrinking.
+         - Improve it using:
+             - caching computeCuttingCosts(q, size) within a call
+             - bracket + binary search (if you assume monotonicity)
+             - small candidate-set evaluation around an initial guess and choose best feasible
+         - DO NOT change the meaning of QOS_COST_SEARCH_MAX_ITERS: it must remain an upper bound on iterations.
+
+      D) Improve freezing heuristic (QAOA hotspots logic):
+         - Replace the brittle rule:
+             for i in range(2):
+                 if hotspots[i] / num_cnots >= 0.07: ...
+           with a metadata-driven, robust rule:
+             - handle num_cnots==0 or missing hotspots
+             - allow top-k, percentile, dynamic threshold, or using entanglement_ratio/critical_depth
+             - cap qubits_to_freeze reasonably (e.g. <= num_qubits-1)
+         - Keep deterministic behavior.
+
+      E) Global thinking:
+         - Consider interactions: e.g., FQ may reduce nonlocal gates and change cutting costs;
+           QR may reduce effective width, which changes feasible cutting size.
+         - Favor strategies that choose pipeline based on predicted downstream benefit.
+
+    OUTPUT FORMAT (MANDATORY):
+      - Output the COMPLETE updated program code.
+      - Do NOT output markdown fences, diff markers, or commentary.
+      - IMPORTANT: All text outside '# OE_BEGIN' and '# OE_END' MUST be identical to the original file (character-for-character).
+      - Keep '# OE_BEGIN' and '# OE_END' present and unchanged.
+
+    EDIT SCOPE (MANDATORY):
+      - Only modify code between markers '# OE_BEGIN' and '# OE_END'.
+      - Do not change anything outside those markers.
+      - Do not change imports or any function signatures.
+
+    HARD CONSTRAINTS:
+      - Deterministic: no randomness; sort any sets/lists before iterating if order matters.
+      - Runtime: avoid repeated expensive work; cache computeCuttingCosts(q, size) results inside evolved_run.
+      - Keep max_iters meaning unchanged (QOS_COST_SEARCH_MAX_ITERS is still a strict upper bound).
+
+    IMPLEMENTATION GUIDANCE:
+      - Build input_features from q.get_metadata() with .get() (keys may be absent).
+      - Prefer small helper closures inside OE region (e.g., get_cost(size)) if helpful.
+      - Modify at most ~120 lines inside OE_BEGIN/OE_END.
+      - Do not remove existing capabilities; instead, add smarter decision logic.
+
+  evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
+  num_top_programs: 2
+  num_diverse_programs: 2
+  use_template_stochasticity: true
+  include_artifacts: true
+  max_artifact_bytes: 20480
+  artifact_security_filter: true
+  template_variations:
+    strategy:
+      - "Focus on metadata-driven pipeline selection and skip logic for FQ/WC/GV/QR."
+      - "Focus on improving size_to_reach search: caching + bracketed or candidate-set search; keep max_iters semantics."
+      - "Focus on redesigning freezing heuristic using robust top-k/percentile logic and metadata (entanglement_ratio, critical_depth)."
+      - "Focus on global optimization: choose pipeline order and parameters to minimize downstream costs, not local heuristics."
+
+database:
+  db_path: openevolve_output_gemini/db
+  in_memory: false
+  log_prompts: true
+
+  population_size: 24
+  archive_size: 16
+  num_islands: 4
+
+  migration_interval: 30
+  migration_rate: 0.12
+
+  elite_selection_ratio: 0.05
+  exploration_ratio: 0.65
+  exploitation_ratio: 0.30
+
+  feature_dimensions:
+    - "complexity"
+    - "diversity"
+  feature_bins: 12
+  diversity_reference_size: 30
+
+evaluator:
+  timeout: 300
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 1
+  use_llm_feedback: false
+  llm_feedback_weight: 0.0
+
+evolution_trace:
+  enabled: false
+  format: "jsonl"
+  include_code: false
+  include_prompts: false
+  output_path: openevolve_output_gemini/evolution_trace.jsonl
+  buffer_size: 10
+  compress: false

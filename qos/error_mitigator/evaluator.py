@@ -165,7 +165,7 @@ def _evaluate_impl(program_path):
     rel_cnot /= count
     rel_overhead /= count
 
-    combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/100.)
+    combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.)
     metrics = {
         "rel_depth": rel_depth,
         "rel_cnot": rel_cnot,
