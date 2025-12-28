@@ -16,7 +16,6 @@ from evaluation.full_eval import (
     _run_mitigator,
 )
 from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
-from qos.error_mitigator.optimiser import FrozenQubitsPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 
@@ -50,7 +49,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "1"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "2"))
         seed = os.getenv("QOSE_SEED")
         rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
         if sample_count <= 1:
@@ -118,43 +117,22 @@ def _evaluate_impl(program_path):
             mitigator._cost_search_impl = evolved_cost_search.__get__(
                 mitigator, ErrorMitigator
             )
-            stage_counts = {}
-            stage_order = []
-            stage_names = (
-                "computeCuttingCosts",
-                "applyGV",
-                "applyWC",
-                "applyQR",
-                "applyBestCut",
-            )
-            for stage_name in stage_names:
-                if not hasattr(mitigator, stage_name):
-                    continue
-                orig = getattr(mitigator, stage_name)
+            mitigator._gv_cost_calls = 0
+            mitigator._wc_cost_calls = 0
+            mitigator._cost_search_calls = 0
+            mitigator._cost_search_time = 0.0
+            orig_cost_search = mitigator.cost_search
 
-                def _wrap_stage(orig_fn, name):
-                    def _wrapped(*args, **kwargs):
-                        stage_counts[name] = stage_counts.get(name, 0) + 1
-                        stage_order.append(name)
-                        return orig_fn(*args, **kwargs)
+            def _wrap_cost_search(*args, **kwargs):
+                size, costs, cost_time, timed_out = orig_cost_search(*args, **kwargs)
+                mitigator._cost_search_calls += 1
+                mitigator._cost_search_time += cost_time
+                return size, costs, cost_time, timed_out
 
-                    return _wrapped
-
-                setattr(mitigator, stage_name, _wrap_stage(orig, stage_name))
-            fq_orig = FrozenQubitsPass.run
-
-            def _fq_run(self, *args, **kwargs):
-                stage_counts["FrozenQubitsPass"] = stage_counts.get("FrozenQubitsPass", 0) + 1
-                stage_order.append("FrozenQubitsPass")
-                return fq_orig(self, *args, **kwargs)
-
-            FrozenQubitsPass.run = _fq_run
-            try:
-                t0 = time.perf_counter()
-                q = mitigator.run(q)
-                run_time = time.perf_counter() - t0
-            finally:
-                FrozenQubitsPass.run = fq_orig
+            mitigator.cost_search = _wrap_cost_search
+            t0 = time.perf_counter()
+            q = mitigator.run(q)
+            run_time = time.perf_counter() - t0
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
@@ -191,9 +169,11 @@ def _evaluate_impl(program_path):
                     "qose_cnot": qose_m["num_nonlocal_gates"],
                     "qose_num_circuits": len(qose_circs),
                     "evolved_run_sec": run_time,
+                    "cost_search_sec": mitigator._cost_search_time,
+                    "cost_search_calls": mitigator._cost_search_calls,
+                    "gv_cost_calls": mitigator._gv_cost_calls,
+                    "wc_cost_calls": mitigator._wc_cost_calls,
                     "input_features": input_features,
-                    "stage_counts": stage_counts,
-                    "stage_order": stage_order,
                 }
             )
             count += 1
@@ -212,9 +192,17 @@ def _evaluate_impl(program_path):
         "rel_overhead": rel_overhead,
         "combined_score": combined_score,
     }
+    avg_cost_search = 0.0
+    total_cost_search_calls = sum(c["cost_search_calls"] for c in cases)
+    if total_cost_search_calls:
+        total_cost_search = sum(c["cost_search_sec"] for c in cases)
+        avg_cost_search = total_cost_search / total_cost_search_calls
     artifacts = {
         "baseline_mode": baseline_mode,
         "evolved_run_sec_avg": (total_run_time / count) if count else 0.0,
+        "cost_search_sec_avg": avg_cost_search,
+        "gv_cost_calls_total": sum(c["gv_cost_calls"] for c in cases),
+        "wc_cost_calls_total": sum(c["wc_cost_calls"] for c in cases),
         "cases": cases,
     }
     return metrics, artifacts
