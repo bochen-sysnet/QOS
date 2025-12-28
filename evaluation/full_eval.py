@@ -1024,7 +1024,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
         for bench, _label in benches:
             if args.verbose:
                 print(f"size={size} bench={bench}", flush=True)
+            bench_start = time.perf_counter()
             qc = _load_qasm_circuit(bench, size)
+            if args.verbose:
+                print(f"  load_qasm_sec={time.perf_counter() - bench_start:.2f}", flush=True)
             base = _analyze_circuit(
                 qc,
                 args.metric_mode,
@@ -1032,30 +1035,54 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 args.metrics_optimization_level,
             )
             if args.verbose:
-                print(f"  baseline depth={base['depth']} cnot={base['num_nonlocal_gates']}", flush=True)
+                print(
+                    f"  baseline depth={base['depth']} cnot={base['num_nonlocal_gates']} "
+                    f"sec={time.perf_counter() - bench_start:.2f}",
+                    flush=True,
+                )
+            qos_t0 = time.perf_counter()
             qos_m, qos_t, qos_circs = _run_mitigator(qc, [], args)
             if args.verbose:
-                print(f"  qos depth={qos_m['depth']} cnot={qos_m['num_nonlocal_gates']}", flush=True)
+                print(
+                    f"  qos depth={qos_m['depth']} cnot={qos_m['num_nonlocal_gates']} "
+                    f"sec={time.perf_counter() - qos_t0:.2f}",
+                    flush=True,
+                )
+            fq_t0 = time.perf_counter()
             fq_m, fq_t, fq_circs = _run_mitigator(qc, ["QF"], args)
             if args.verbose:
-                print(f"  frozen depth={fq_m['depth']} cnot={fq_m['num_nonlocal_gates']}", flush=True)
+                print(
+                    f"  frozen depth={fq_m['depth']} cnot={fq_m['num_nonlocal_gates']} "
+                    f"sec={time.perf_counter() - fq_t0:.2f}",
+                    flush=True,
+                )
 
             cutqc_methods = ["GV"] if args.cutqc_method == "gv" else ["WC"]
+            cutqc_t0 = time.perf_counter()
             cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(qc, cutqc_methods, args)
             if args.verbose:
-                print(f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']}", flush=True)
+                print(
+                    f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']} "
+                    f"sec={time.perf_counter() - cutqc_t0:.2f}",
+                    flush=True,
+                )
 
             qose_m = None
             qose_t = {}
             qose_circs = []
             if include_qose:
+                qose_t0 = time.perf_counter()
                 qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_run)
                 if qose_m is None:
                     qose_m = qos_m
                     qose_circs = qos_circs
                     qose_t = {}
                 if args.verbose:
-                    print(f"  qose depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']}", flush=True)
+                    print(
+                        f"  qose depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']} "
+                        f"sec={time.perf_counter() - qose_t0:.2f}",
+                        flush=True,
+                    )
 
             if args.fragment_fidelity_sweep:
                 fragment_fidelity[(size, bench)] = _fragment_fidelity_sweep(
@@ -1080,6 +1107,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 )
 
             if args.with_fidelity:
+                if args.verbose:
+                    print("  fidelity sim start", flush=True)
                 sim_times = {}
                 t0 = time.perf_counter()
                 base_fidelity = _average_fidelity([qc], args.fidelity_shots, noise, args.fidelity_seed)
@@ -1099,6 +1128,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                     sim_times["QOSE"] = time.perf_counter() - t0
                 else:
                     qose_fidelity = ""
+                if args.verbose:
+                    print(f"  fidelity sim sec={sum(sim_times.values()):.2f}", flush=True)
                 fidelity_by_size[size][bench] = {
                     "Qiskit": base_fidelity,
                     "QOS": qos_fidelity,
@@ -1218,6 +1249,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                     cut_circuits[(size, bench, "QOSE")] = qose_circs
                 cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
                 cut_circuits[(size, bench, "CutQC")] = cutqc_circs
+            if args.verbose:
+                print(f"  total_bench_sec={time.perf_counter() - bench_start:.2f}", flush=True)
 
         rel_by_size[size] = (rel_depth, rel_nonlocal)
 

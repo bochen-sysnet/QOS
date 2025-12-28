@@ -2,6 +2,8 @@ from typing import Any, Dict, List
 from abc import ABC, abstractmethod
 import pdb
 from time import sleep
+import os
+import time
 import networkx as nx
 
 from qiskit.circuit.library import Barrier
@@ -167,6 +169,9 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
         optimal_decomposition_pass = OptimalDecompositionPass(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
         cost = 0
+        verbose = os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}
+        t0 = time.perf_counter()
+        call_count = 0
 
         if len(vsqs) > 0:
             highest_cost = 0
@@ -174,18 +179,30 @@ class GVOptimalDecompositionPass(GateVirtualizationPass):
                 qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 try:
                     cost = optimal_decomposition_pass.get_budget(qc)
+                    call_count += 1
                 except ValueError:
                     cost = 1000
+                    call_count += 1
                 if cost > highest_cost:
                     highest_cost = cost
         else:
             qc = _unwrap_virtual_circuit(q.get_circuit())
             try:
                 cost = optimal_decomposition_pass.get_budget(qc)
+                call_count += 1
             except ValueError:
                 cost = 1000
+                call_count += 1
 
         final_cost.value = cost
+
+        if verbose:
+            total_sec = time.perf_counter() - t0
+            print(
+                f"[QOS] GV cost size_to_reach={self._size_to_reach} "
+                f"calls={call_count} sec={total_sec:.2f}",
+                flush=True,
+            )
 
         return cost
 
@@ -370,6 +387,9 @@ class OptimalWireCuttingPass(WireCuttingPass):
         optimal_wire_cutting_pass = OptimalWireCutter(self._size_to_reach)
         vsqs = q.get_virtual_subqernels()
         cost = 0
+        verbose = os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}
+        t0 = time.perf_counter()
+        call_count = 0
 
         if len(vsqs) > 0:
             highest_cost = 0
@@ -377,18 +397,30 @@ class OptimalWireCuttingPass(WireCuttingPass):
                 qc = _unwrap_virtual_circuit(vsq.get_circuit())
                 try:
                     cost = optimal_wire_cutting_pass.get_budget(qc)
+                    call_count += 1
                 except ValueError:
                     cost = 1000
+                    call_count += 1
                 if cost > highest_cost:
                     highest_cost = cost
         else:
             qc = _unwrap_virtual_circuit(q.get_circuit())
             try:
                 cost = optimal_wire_cutting_pass.get_budget(qc)
+                call_count += 1
             except ValueError:
                 cost = 1000
+                call_count += 1
         
         final_cost.value = cost
+
+        if verbose:
+            total_sec = time.perf_counter() - t0
+            print(
+                f"[QOS] WC cost size_to_reach={self._size_to_reach} "
+                f"calls={call_count} sec={total_sec:.2f}",
+                flush=True,
+            )
 
         return cost
 

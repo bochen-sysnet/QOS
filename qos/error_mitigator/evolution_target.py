@@ -41,9 +41,14 @@ def evolved_run(self, q: Qernel):
             q = self.applyWC(q, size_to_reach)
     else:
         costs = self.computeCuttingCosts(q, size_to_reach)
+        gv_enabled = self.methods.get("GV", False)
+        wc_enabled = self.methods.get("WC", False)
         max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "5"))
         iter_ctr = 0
-        while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
+        while (
+            (gv_enabled and costs["GV"] <= budget)
+            or (wc_enabled and costs["WC"] <= budget)
+        ) and size_to_reach > 2:
             iter_ctr += 1
             if max_iters > 0 and iter_ctr > max_iters:
                 break
@@ -51,7 +56,10 @@ def evolved_run(self, q: Qernel):
             costs = self.computeCuttingCosts(q, size_to_reach)
 
         iter_ctr = 0
-        while costs["GV"] > budget and costs["WC"] > budget:
+        while (
+            (gv_enabled and costs["GV"] > budget)
+            and (wc_enabled and costs["WC"] > budget)
+        ):
             iter_ctr += 1
             if max_iters > 0 and iter_ctr > max_iters:
                 break
