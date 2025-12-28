@@ -47,8 +47,9 @@ prompt:
       - rel_depth: depth(QOSE) / depth(QOS)
       - rel_cnot:  cnot(QOSE) / cnot(QOS)
       - rel_overhead: num_circuits(QOSE) / num_circuits(QOS)
+      - avg_run_time: average evolved mitigator runtime in seconds
       - combined_score (maximize):
-          combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0)
+          combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0 + avg_run_time/10.0)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
@@ -57,9 +58,17 @@ prompt:
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
       - input_features: depth, num_qubits, num_nonlocal_gates, program_communication, liveness,
         parallelism, measurement, entanglement_ratio, critical_depth
-      - stage_counts: call counts for computeCuttingCosts, applyGV, applyWC, applyQR, FrozenQubitsPass
-      - stage_order: sequence of these calls
+      - cost_search_sec: time spent in cost_search for the case
+      - cost_search_calls: number of cost_search invocations for the case
+      - gv_cost_calls: number of GV cost calls for the case
+      - wc_cost_calls: number of WC cost calls for the case
       Use artifacts to diagnose regressions and avoid repeated computeCuttingCosts loops.
+
+    ARTIFACTS PROVIDED BY EVALUATOR (summary):
+      - evolved_run_sec_avg: average runtime of evolved mitigator
+      - cost_search_sec_avg: average time per cost_search call
+      - gv_cost_calls_total: total GV cost calls
+      - wc_cost_calls_total: total WC cost calls
 
     HARD CONSTRAINTS:
       - Deterministic execution (no randomness).
@@ -67,19 +76,11 @@ prompt:
       - Do not introduce new imports or new module dependencies.
 
     IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
-      A) Improve size_to_reach design:
-         - "size_to_reach > 2" is a heuristic; you may replace with a metadata-driven rule,
-           e.g. min_size threshold depending on num_qubits / connected components / nonlocal gates.
-         - You may explore different stopping rules and candidate sets of sizes.
+      A) Decide to use WC or GV selectively instead of always using both.
 
-      B) Improve the search for size_to_reach:
-         - Current approach uses two while loops / iterative shrinking.
-         - Improve it using:
-             - caching computeCuttingCosts(q, size) within a call
-             - bracket + binary search (if you assume monotonicity)
-             - small candidate-set evaluation around an initial guess and choose best feasible
-         - DO NOT change the meaning of QOS_COST_SEARCH_MAX_ITERS: it must remain an upper bound on iterations.
+      B) Explore size_to_reach efficiently instead of using two while loops.
 
+      C) Explore early stopping rules for WC and GV.
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
   num_top_programs: 2

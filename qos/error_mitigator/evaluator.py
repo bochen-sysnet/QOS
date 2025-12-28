@@ -49,7 +49,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "2"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
         seed = os.getenv("QOSE_SEED")
         rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
         if sample_count <= 1:
@@ -185,11 +185,13 @@ def _evaluate_impl(program_path):
     rel_cnot /= count
     rel_overhead /= count
 
-    combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.)
+    avg_run_time = (total_run_time / count) if count else 0.0
+    combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0 + avg_run_time/10.0)
     metrics = {
         "rel_depth": rel_depth,
         "rel_cnot": rel_cnot,
         "rel_overhead": rel_overhead,
+        "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
     avg_cost_search = 0.0
