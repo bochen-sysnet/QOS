@@ -16,6 +16,7 @@ from evaluation.full_eval import (
     _run_mitigator,
 )
 from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
+from qos.error_mitigator.optimiser import GVOptimalDecompositionPass, OptimalWireCuttingPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 
@@ -122,17 +123,35 @@ def _evaluate_impl(program_path):
             mitigator._cost_search_calls = 0
             mitigator._cost_search_time = 0.0
             orig_cost_search = mitigator.cost_search
+            gv_cost_orig = GVOptimalDecompositionPass.cost
+            wc_cost_orig = OptimalWireCuttingPass.cost
 
             def _wrap_cost_search(*args, **kwargs):
+                t0 = time.perf_counter()
                 size, costs, cost_time, timed_out = orig_cost_search(*args, **kwargs)
+                dt = time.perf_counter() - t0
                 mitigator._cost_search_calls += 1
-                mitigator._cost_search_time += cost_time
+                mitigator._cost_search_time += dt
                 return size, costs, cost_time, timed_out
 
             mitigator.cost_search = _wrap_cost_search
-            t0 = time.perf_counter()
-            q = mitigator.run(q)
-            run_time = time.perf_counter() - t0
+            def _gv_cost(self, *args, **kwargs):
+                mitigator._gv_cost_calls += 1
+                return gv_cost_orig(self, *args, **kwargs)
+
+            def _wc_cost(self, *args, **kwargs):
+                mitigator._wc_cost_calls += 1
+                return wc_cost_orig(self, *args, **kwargs)
+
+            GVOptimalDecompositionPass.cost = _gv_cost
+            OptimalWireCuttingPass.cost = _wc_cost
+            try:
+                t0 = time.perf_counter()
+                q = mitigator.run(q)
+                run_time = time.perf_counter() - t0
+            finally:
+                GVOptimalDecompositionPass.cost = gv_cost_orig
+                OptimalWireCuttingPass.cost = wc_cost_orig
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
