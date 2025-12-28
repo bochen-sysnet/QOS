@@ -189,9 +189,20 @@ def _load_qose_run(qose_program: Path) -> Callable:
         raise ImportError(f"Unable to load QOSE program at {qose_program}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    evolved_cost_search = getattr(module, "evolved_cost_search", None)
+    if callable(evolved_cost_search):
+        def _wrapped(mitigator: ErrorMitigator, q: Qernel):
+            mitigator._cost_search_impl = evolved_cost_search.__get__(
+                mitigator, ErrorMitigator
+            )
+            return mitigator.run(q)
+
+        return _wrapped
     evolved_run = getattr(module, "evolved_run", None)
     if not callable(evolved_run):
-        raise AttributeError(f"Program {qose_program} has no callable evolved_run()")
+        raise AttributeError(
+            f"Program {qose_program} has no callable evolved_cost_search() or evolved_run()"
+        )
     return evolved_run
 
 

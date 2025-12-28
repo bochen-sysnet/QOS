@@ -97,6 +97,58 @@ class ErrorMitigator():
                 flush=True,
             )
         return {"GV": gv_cost, "WC": wc_cost}
+
+    def _cost_search_impl(self, q: Qernel, size_to_reach: int, budget: int):
+        cost_time = 0.0
+        t0 = time.perf_counter()
+        costs = self.computeCuttingCosts(q, size_to_reach)
+        cost_time += time.perf_counter() - t0
+        max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
+        if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
+            print(
+                f"[QOS] cost_search init size_to_reach={size_to_reach} "
+                f"GV={costs['GV']} WC={costs['WC']} budget={budget} "
+                f"max_iters={max_iters}",
+                flush=True,
+            )
+        iter_ctr = 0
+        while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
+            iter_ctr += 1
+            if max_iters > 0 and iter_ctr > max_iters:
+                break
+            size_to_reach = size_to_reach - 1
+            t0 = time.perf_counter()
+            costs = self.computeCuttingCosts(q, size_to_reach)
+            cost_time += time.perf_counter() - t0
+            if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
+                print(
+                    f"[QOS] cost_search shrink iter={iter_ctr} size_to_reach={size_to_reach} "
+                    f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
+                    flush=True,
+                )
+
+        iter_ctr = 0
+        while costs["GV"] > budget and costs["WC"] > budget:
+            iter_ctr += 1
+            if max_iters > 0 and iter_ctr > max_iters:
+                break
+            size_to_reach = size_to_reach + 1
+            t0 = time.perf_counter()
+            costs = self.computeCuttingCosts(q, size_to_reach)
+            cost_time += time.perf_counter() - t0
+            if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
+                print(
+                    f"[QOS] cost_search grow iter={iter_ctr} size_to_reach={size_to_reach} "
+                    f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
+                    flush=True,
+                )
+        return size_to_reach, costs, cost_time
+
+    def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
+        size_to_reach, costs, cost_time = self._cost_search_impl(
+            q, size_to_reach, budget
+        )
+        return size_to_reach, costs, cost_time, False
     
     def applyGV(self, q: Qernel, size_to_reach: int):
         if self.methods["GV"]:
@@ -202,53 +254,20 @@ class ErrorMitigator():
                         q = self.applyBestCut(q, self.size_to_reach)
                 else:
                     size_to_reach = self.size_to_reach
-                    cost_time = 0.0
-                    t0 = time.perf_counter()
-                    costs = self.computeCuttingCosts(q, size_to_reach)
-                    cost_time += time.perf_counter() - t0
-                    max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
-                    if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                        print(
-                            f"[QOS] cost_search init size_to_reach={size_to_reach} "
-                            f"GV={costs['GV']} WC={costs['WC']} budget={budget} "
-                            f"max_iters={max_iters}",
-                            flush=True,
-                        )
-                    iter_ctr = 0
-                    while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
-                        iter_ctr += 1
-                        if max_iters > 0 and iter_ctr > max_iters:
-                            break
-                        size_to_reach = size_to_reach - 1
-                        t0 = time.perf_counter()
-                        costs = self.computeCuttingCosts(q, size_to_reach)
-                        cost_time += time.perf_counter() - t0
-                        if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                            print(
-                                f"[QOS] cost_search shrink iter={iter_ctr} size_to_reach={size_to_reach} "
-                                f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                                flush=True,
-                            )
-                
-                    iter_ctr = 0
-                    while costs["GV"] > budget and costs["WC"] > budget:
-                        iter_ctr += 1
-                        if max_iters > 0 and iter_ctr > max_iters:
-                            break
-                        size_to_reach = size_to_reach + 1
-                        t0 = time.perf_counter()
-                        costs = self.computeCuttingCosts(q, size_to_reach)
-                        cost_time += time.perf_counter() - t0
-                        if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                            print(
-                                f"[QOS] cost_search grow iter={iter_ctr} size_to_reach={size_to_reach} "
-                                f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                                flush=True,
-                            )
+                    size_to_reach, costs, cost_time, timed_out = self.cost_search(
+                        q, size_to_reach, budget
+                    )
                     if self.collect_timing:
                         self.timings["cost_search"] = cost_time
 
-                    if costs["GV"] <= budget or costs["WC"] <= budget:
+                    if timed_out:
+                        if self.collect_timing:
+                            t0 = time.perf_counter()
+                            q = self.applyGV(q, self.size_to_reach)
+                            self.timings["gv"] = time.perf_counter() - t0
+                        else:
+                            q = self.applyGV(q, self.size_to_reach)
+                    elif costs["GV"] <= budget or costs["WC"] <= budget:
                         if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
                             if self.collect_timing:
                                 t0 = time.perf_counter()
@@ -289,54 +308,20 @@ class ErrorMitigator():
                     q = self.applyBestCut(q, self.size_to_reach)
             else:
                 size_to_reach = self.size_to_reach
-                cost_time = 0.0
-                t0 = time.perf_counter()
-                costs = self.computeCuttingCosts(q, size_to_reach)
-                cost_time += time.perf_counter() - t0
-                max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
-                if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                    print(
-                        f"[QOS] cost_search init size_to_reach={size_to_reach} "
-                        f"GV={costs['GV']} WC={costs['WC']} budget={self.budget} "
-                        f"max_iters={max_iters}",
-                        flush=True,
-                    )
-                iter_ctr = 0
-
-                while (costs["GV"] <= self.budget or costs["WC"] <= self.budget) and size_to_reach > 2:
-                    iter_ctr += 1
-                    if max_iters > 0 and iter_ctr > max_iters:
-                        break
-                    size_to_reach = size_to_reach - 1
-                    t0 = time.perf_counter()
-                    costs = self.computeCuttingCosts(q, size_to_reach)                
-                    cost_time += time.perf_counter() - t0
-                    if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                        print(
-                            f"[QOS] cost_search shrink iter={iter_ctr} size_to_reach={size_to_reach} "
-                            f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                            flush=True,
-                        )
-                
-                iter_ctr = 0
-                while costs["GV"] > self.budget and costs["WC"] > self.budget:
-                    iter_ctr += 1
-                    if max_iters > 0 and iter_ctr > max_iters:
-                        break
-                    size_to_reach = size_to_reach + 1
-                    t0 = time.perf_counter()
-                    costs = self.computeCuttingCosts(q, size_to_reach)
-                    cost_time += time.perf_counter() - t0
-                    if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                        print(
-                            f"[QOS] cost_search grow iter={iter_ctr} size_to_reach={size_to_reach} "
-                            f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                            flush=True,
-                        )
+                size_to_reach, costs, cost_time, timed_out = self.cost_search(
+                    q, size_to_reach, self.budget
+                )
                 if self.collect_timing:
                     self.timings["cost_search"] = cost_time
 
-                if costs["GV"] <= self.budget or costs["WC"] <= self.budget:
+                if timed_out:
+                    if self.collect_timing:
+                        t0 = time.perf_counter()
+                        q = self.applyGV(q, self.size_to_reach)
+                        self.timings["gv"] = time.perf_counter() - t0
+                    else:
+                        q = self.applyGV(q, self.size_to_reach)
+                elif costs["GV"] <= self.budget or costs["WC"] <= self.budget:
                     if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
                         if self.collect_timing:
                             t0 = time.perf_counter()

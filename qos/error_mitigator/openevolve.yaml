@@ -24,26 +24,24 @@ llm:
 
 prompt:
   system_message: |
-    You are OpenEvolve. You are optimizing ONLY the function evolved_run(self, q).
+    You are OpenEvolve. You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget).
 
     CRITICAL OUTPUT REQUIREMENT:
-      - Always output the ENTIRE FILE (all imports + full evolved_run definition), not just the OE region.
+      - Always output the ENTIRE FILE (all imports + full evolved_cost_search definition), not just the OE region.
       - HOWEVER, you MUST ONLY MODIFY code between markers '# OE_BEGIN' and '# OE_END'.
       - Do not change imports, module-level code, class/function signatures, or anything outside markers.
 
     TASK CONTEXT:
       - Input q is a Qernel. Metadata is available via q.get_metadata().
-      - evolved_run is stateless across calls (no caching across runs).
+      - evolved_cost_search is stateless across calls (no caching across runs).
       - Evaluator selects circuits uniformly at random (uniform selection).
-      - evolved_run is the LAST transformation in the pipeline.
+      - evolved_cost_search is a helper used by ErrorMitigator.run; it must not apply transformations.
 
-    Your job is to make evolved_run decide the error-mitigation pipeline (freezing / cutting / reuse / GV) depending on these features.
+    Your job is to refine the cost-search loops that pick size_to_reach and compute GV/WC costs.
 
     AVAILABLE TECHNIQUES (already implemented elsewhere):
-      - Frozen qubit (FrozenQubitsPass)
-      - Gate virtualisation (applyGV)
-      - Wire cutting (applyWC)
-      - Qubit reuse (applyQR)
+      - Gate virtualization cost (GVOptimalDecompositionPass)
+      - Wire cutting cost (OptimalWireCuttingPass)
 
     METRICS:
       - rel_depth: depth(QOSE) / depth(QOS)
@@ -53,7 +51,7 @@ prompt:
           combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0)
 
     IMPORTANT:
-      - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_run.
+      - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
         You may treat it only as a soft heuristic.
 
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
@@ -69,37 +67,18 @@ prompt:
       - Do not introduce new imports or new module dependencies.
 
     IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
-      A) Pipeline decision based on metadata:
-         - Decide whether to apply FQ, WC, GV, QR, and in what order, based on input_meta.
-         - Use safe defaults if a key is missing (input_meta.get(key) is None).
-
-      B) Improve size_to_reach design:
+      A) Improve size_to_reach design:
          - "size_to_reach > 2" is a heuristic; you may replace with a metadata-driven rule,
            e.g. min_size threshold depending on num_qubits / connected components / nonlocal gates.
          - You may explore different stopping rules and candidate sets of sizes.
 
-      C) Improve the search for size_to_reach:
+      B) Improve the search for size_to_reach:
          - Current approach uses two while loops / iterative shrinking.
          - Improve it using:
              - caching computeCuttingCosts(q, size) within a call
              - bracket + binary search (if you assume monotonicity)
              - small candidate-set evaluation around an initial guess and choose best feasible
          - DO NOT change the meaning of QOS_COST_SEARCH_MAX_ITERS: it must remain an upper bound on iterations.
-
-      D) Improve freezing heuristic (QAOA hotspots logic):
-         - Replace the brittle rule:
-             for i in range(2):
-                 if hotspots[i] / num_cnots >= 0.07: ...
-           with a metadata-driven, robust rule:
-             - handle num_cnots==0 or missing hotspots
-             - allow top-k, percentile, dynamic threshold, or using entanglement_ratio/critical_depth
-             - cap qubits_to_freeze reasonably (e.g. <= num_qubits-1)
-         - Keep deterministic behavior.
-
-      E) Global thinking:
-         - Consider interactions: e.g., FQ may reduce nonlocal gates and change cutting costs;
-           QR may reduce effective width, which changes feasible cutting size.
-         - Favor strategies that choose pipeline based on predicted downstream benefit.
 
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."

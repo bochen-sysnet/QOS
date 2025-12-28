@@ -30,9 +30,9 @@ def _evaluate_impl(program_path):
     spec = importlib.util.spec_from_file_location("candidate", program_path)
     candidate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(candidate)
-    evolved_run = getattr(candidate, "evolved_run", None)
-    if evolved_run is None:
-        return {"combined_score": 0.0}, {"error": "Missing evolved_run"}
+    evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
+    if evolved_cost_search is None:
+        return {"combined_score": 0.0}, {"error": "Missing evolved_cost_search"}
 
     args = SimpleNamespace(
         size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "7")),
@@ -50,7 +50,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "1"))
         seed = os.getenv("QOSE_SEED")
         rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
         if sample_count <= 1:
@@ -115,6 +115,9 @@ def _evaluate_impl(program_path):
                 use_cost_search=args.qos_cost_search,
                 collect_timing=False,
             )
+            mitigator._cost_search_impl = evolved_cost_search.__get__(
+                mitigator, ErrorMitigator
+            )
             stage_counts = {}
             stage_order = []
             stage_names = (
@@ -148,7 +151,7 @@ def _evaluate_impl(program_path):
             FrozenQubitsPass.run = _fq_run
             try:
                 t0 = time.perf_counter()
-                q = evolved_run(mitigator, q)
+                q = mitigator.run(q)
                 run_time = time.perf_counter() - t0
             finally:
                 FrozenQubitsPass.run = fq_orig
