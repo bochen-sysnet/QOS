@@ -32,29 +32,37 @@ def evolved_run(self, q: Qernel):
             budget = budget - qubits_to_freeze
 
     size_to_reach = self.size_to_reach
-    costs = self.computeCuttingCosts(q, size_to_reach)
-    max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "5"))
-    iter_ctr = 0
-    while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
-        iter_ctr += 1
-        if max_iters > 0 and iter_ctr > max_iters:
-            break
-        size_to_reach = size_to_reach - 1
-        costs = self.computeCuttingCosts(q, size_to_reach)
-
-    iter_ctr = 0
-    while costs["GV"] > budget and costs["WC"] > budget:
-        iter_ctr += 1
-        if max_iters > 0 and iter_ctr > max_iters:
-            break
-        size_to_reach = size_to_reach + 1
-        costs = self.computeCuttingCosts(q, size_to_reach)
-
-    if costs["GV"] <= budget or costs["WC"] <= budget:
-        if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
+    if not getattr(self, "use_cost_search", True):
+        if self.methods["GV"] and self.methods["WC"]:
+            q = self.applyBestCut(q, size_to_reach)
+        elif self.methods["GV"]:
             q = self.applyGV(q, size_to_reach)
-        else:
+        elif self.methods["WC"]:
             q = self.applyWC(q, size_to_reach)
+    else:
+        costs = self.computeCuttingCosts(q, size_to_reach)
+        max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "5"))
+        iter_ctr = 0
+        while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
+            iter_ctr += 1
+            if max_iters > 0 and iter_ctr > max_iters:
+                break
+            size_to_reach = size_to_reach - 1
+            costs = self.computeCuttingCosts(q, size_to_reach)
+
+        iter_ctr = 0
+        while costs["GV"] > budget and costs["WC"] > budget:
+            iter_ctr += 1
+            if max_iters > 0 and iter_ctr > max_iters:
+                break
+            size_to_reach = size_to_reach + 1
+            costs = self.computeCuttingCosts(q, size_to_reach)
+
+        if costs["GV"] <= budget or costs["WC"] <= budget:
+            if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
+                q = self.applyGV(q, size_to_reach)
+            else:
+                q = self.applyWC(q, size_to_reach)
 
     q = self.applyQR(q, size_to_reach)
 

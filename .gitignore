@@ -13,6 +13,9 @@ __pycache__/
 # log files
 *.log
 
+# key files
+*.key
+
 # Distribution / packaging
 .Python
 build/
