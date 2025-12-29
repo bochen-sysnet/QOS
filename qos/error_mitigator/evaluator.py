@@ -50,15 +50,25 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
         seed = os.getenv("QOSE_SEED")
-        rng = random.Random(int(seed)) if seed is not None else random.SystemRandom()
-        if sample_count <= 1:
-            benches = [rng.choice(bench_choices)]
-        elif sample_count <= len(bench_choices):
-            benches = rng.sample(bench_choices, sample_count)
+        if seed is None:
+            if sample_count <= 1:
+                benches = [bench_choices[0]]
+            elif sample_count <= len(bench_choices):
+                benches = bench_choices[:sample_count]
+            else:
+                benches = [
+                    bench_choices[idx % len(bench_choices)] for idx in range(sample_count)
+                ]
         else:
-            benches = [rng.choice(bench_choices) for _ in range(sample_count)]
+            rng = random.Random(int(seed))
+            if sample_count <= 1:
+                benches = [rng.choice(bench_choices)]
+            elif sample_count <= len(bench_choices):
+                benches = rng.sample(bench_choices, sample_count)
+            else:
+                benches = [rng.choice(bench_choices) for _ in range(sample_count)]
 
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
