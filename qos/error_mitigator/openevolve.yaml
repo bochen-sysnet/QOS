@@ -42,12 +42,12 @@ prompt:
         num_qubits is high or nonlocal density is low.
 
     METRICS:
-      - rel_depth: depth(QOSE) / depth(QOS)
-      - rel_cnot:  cnot(QOSE) / cnot(QOS)
-      - rel_overhead: num_circuits(QOSE) / num_circuits(QOS)
+      - qose_depth: average absolute depth of QOSE
+      - qose_cnot: average absolute nonlocal gate count of QOSE
+      - qose_overhead: average absolute number of QOSE circuits
       - avg_run_time: average evolved mitigator runtime in seconds
       - combined_score (maximize):
-          combined_score = -(rel_depth + rel_cnot + rel_overhead + avg_run_time/10.0)
+          combined_score = -(qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.

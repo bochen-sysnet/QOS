@@ -10,10 +10,8 @@ from openevolve.evaluation_result import EvaluationResult
 from evaluation.full_eval import (
     BENCHES,
     _load_qasm_circuit,
-    _analyze_circuit,
     _analyze_qernel,
     _extract_circuits,
-    _run_mitigator,
 )
 from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAnalysisPass
 from qos.error_mitigator.optimiser import GVOptimalDecompositionPass, OptimalWireCuttingPass
@@ -75,11 +73,7 @@ def _evaluate_impl(program_path):
     if unknown:
         return {"combined_score": 0.0}, {"error": f"Unknown benches: {', '.join(unknown)}"}
     sizes = [int(s) for s in os.getenv("QOSE_SIZES", "12").split(",") if s]
-    baseline_mode = os.getenv("QOSE_BASELINE", "qos").strip().lower()
-    if baseline_mode not in {"qos", "qiskit"}:
-        return {"combined_score": 0.0}, {"error": f"Unknown QOSE_BASELINE: {baseline_mode}"}
-
-    rel_depth = rel_cnot = rel_overhead = 0.0
+    depth_sum = cnot_sum = overhead_sum = 0.0
     count = 0
     cases = []
 
@@ -99,17 +93,6 @@ def _evaluate_impl(program_path):
     for bench in benches:
         for size in sizes:
             qc = _load_qasm_circuit(bench, size)
-
-            if baseline_mode == "qiskit":
-                base = _analyze_circuit(
-                    qc,
-                    args.metric_mode,
-                    args.metrics_baseline,
-                    args.metrics_optimization_level,
-                )
-            else:
-                base = None
-                qos_m, _t, qos_circs = _run_mitigator(qc, [], args)
 
             # Evolved QOSE
             q = Qernel(qc.copy())
@@ -171,29 +154,13 @@ def _evaluate_impl(program_path):
             qose_circs = _extract_circuits(q)
             total_run_time += run_time
 
-            if baseline_mode == "qiskit":
-                rel_depth += qose_m["depth"] / max(1, base["depth"])
-                rel_cnot += qose_m["num_nonlocal_gates"] / max(1, base["num_nonlocal_gates"])
-                rel_overhead += float(max(1, len(qose_circs)))
-                baseline_depth = base["depth"]
-                baseline_cnot = base["num_nonlocal_gates"]
-                baseline_label = "qiskit"
-            else:
-                rel_depth += qose_m["depth"] / max(1, qos_m["depth"])
-                rel_cnot += qose_m["num_nonlocal_gates"] / max(
-                    1, qos_m["num_nonlocal_gates"]
-                )
-                rel_overhead += len(qose_circs) / max(1, len(qos_circs))
-                baseline_depth = qos_m["depth"]
-                baseline_cnot = qos_m["num_nonlocal_gates"]
-                baseline_label = "qos"
+            depth_sum += qose_m["depth"]
+            cnot_sum += qose_m["num_nonlocal_gates"]
+            overhead_sum += len(qose_circs)
             cases.append(
                 {
                     "bench": bench,
                     "size": size,
-                    "baseline_mode": baseline_label,
-                    "baseline_depth": baseline_depth,
-                    "baseline_cnot": baseline_cnot,
                     "qose_depth": qose_m["depth"],
                     "qose_cnot": qose_m["num_nonlocal_gates"],
                     "qose_num_circuits": len(qose_circs),
@@ -210,16 +177,16 @@ def _evaluate_impl(program_path):
     if count == 0:
         return {"combined_score": 0.0}, {"error": "No benches/sizes"}
 
-    rel_depth /= count
-    rel_cnot /= count
-    rel_overhead /= count
+    avg_depth = depth_sum / count
+    avg_cnot = cnot_sum / count
+    avg_overhead = overhead_sum / count
 
     avg_run_time = (total_run_time / count) if count else 0.0
-    combined_score = -(rel_depth + rel_cnot + rel_overhead + avg_run_time/10.0)
+    combined_score = -(avg_depth + avg_cnot + avg_overhead * 10.0 + avg_run_time)
     metrics = {
-        "rel_depth": rel_depth,
-        "rel_cnot": rel_cnot,
-        "rel_overhead": rel_overhead,
+        "qose_depth": avg_depth,
+        "qose_cnot": avg_cnot,
+        "qose_overhead": avg_overhead,
         "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
@@ -229,7 +196,6 @@ def _evaluate_impl(program_path):
         total_cost_search = sum(c["cost_search_sec"] for c in cases)
         avg_cost_search = total_cost_search / total_cost_search_calls
     artifacts = {
-        "baseline_mode": baseline_mode,
         "evolved_run_sec_avg": (total_run_time / count) if count else 0.0,
         "cost_search_sec_avg": avg_cost_search,
         "gv_cost_calls_total": sum(c["gv_cost_calls"] for c in cases),
