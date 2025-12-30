@@ -215,7 +215,7 @@ def _evaluate_impl(program_path):
     rel_overhead /= count
 
     avg_run_time = (total_run_time / count) if count else 0.0
-    combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0 + avg_run_time/10.0)
+    combined_score = -(rel_depth + rel_cnot + rel_overhead + avg_run_time/10.0)
     metrics = {
         "rel_depth": rel_depth,
         "rel_cnot": rel_cnot,

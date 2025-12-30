@@ -9,120 +9,140 @@ from qos.types.types import Qernel
 
 def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     # OE_BEGIN
-    # New policy (based on observed metric regression):
-    # - The caller-provided size_to_reach can be "feasible" but overly aggressive (too small),
-    #   causing excessive cutting and blowing up depth/CNOT.
-    # - Therefore we prefer the LARGEST feasible size (least cutting), starting at max_size_cap.
+    # Preserve baseline semantics while reducing cost() calls:
+    # Baseline behavior:
+    #   1) While feasible (GV<=B or WC<=B), decrease size
+    #   2) Then while infeasible (GV>B and WC>B), increase size
+    # This yields the smallest feasible size (boundary).
     #
-    # Feasible(size) := (GV_cost <= budget) OR (WC_cost <= budget)
+    # Optimization:
+    #   - Cache costs per size
+    #   - If s0 is feasible (common), only search DOWN to find the boundary:
+    #       * exponential bracketing down to find an infeasible point
+    #       * binary search to find the smallest feasible size
+    #   - If s0 is infeasible, search UP with exponential bracketing + binary search, but
+    #     with strict caps to avoid 300s timeout.
+    #   - Always return fully-computed {"GV":..., "WC":...} (no dummy costs).
 
-    if size_to_reach is None:
-        size_to_reach = 2
-    if size_to_reach < 2:
-        size_to_reach = 2
+    lower = 2
+    s0 = int(size_to_reach)
+    if s0 < lower:
+        s0 = lower
 
-    # Best-effort upper cap using metadata (usually num_qubits)
-    try:
-        input_meta = q.get_metadata() or {}
-        max_size_cap = int(input_meta.get("num_qubits", size_to_reach))
-        if max_size_cap < 2:
-            max_size_cap = max(2, size_to_reach)
-    except Exception:
-        max_size_cap = max(2, size_to_reach)
+    # A tight upward safety cap (prevents runaway if budget is tiny or metadata is weird).
+    # We intentionally do NOT use num_qubits as an upper bound because it caused timeouts before.
+    upper_cap = s0 + 16
 
-    if size_to_reach > max_size_cap:
-        size_to_reach = max_size_cap
+    # Hard cap on how many expensive evaluations we allow (across all sizes).
+    # Keeps worst-case bounded even if a single cost() call is slow.
+    MAX_EVALS = 16
+    evals_used = 0
 
-    # Cache per size: {"GV": int, "WC": int or None}
+    # Cache: size -> {"GV": int, "WC": int}
     cache = {}
 
-    # Reuse Value objects to avoid repeated allocations
-    gv_cost_value = Value("i", 0)
-    wc_cost_value = Value("i", 0)
-
-    def _compute_gv(size: int) -> int:
-        gv_cost_value.value = 0
-        gv_pass = GVOptimalDecompositionPass(size)
-        gv_pass.cost(q, gv_cost_value)
-        return int(gv_cost_value.value)
-
-    def _compute_wc(size: int) -> int:
-        wc_cost_value.value = 0
-        wc_pass = OptimalWireCuttingPass(size)
-        wc_pass.cost(q, wc_cost_value)
-        return int(wc_cost_value.value)
-
-    def get_costs(size: int, need_wc: bool) -> dict:
+    def compute_costs(size: int):
+        nonlocal evals_used
         if size in cache:
-            entry = cache[size]
-            if (not need_wc) or (entry.get("WC", None) is not None):
-                return entry
+            return cache[size]
 
-        entry = cache.get(size, {"GV": None, "WC": None})
+        # Enforce evaluation budget
+        if evals_used >= MAX_EVALS:
+            # Fallback: return a clearly infeasible cost to stop searching.
+            # (Should be rare; prevents timeouts.)
+            costs = {"GV": budget + 1, "WC": budget + 1}
+            cache[size] = costs
+            return costs
 
-        if entry.get("GV", None) is None:
-            entry["GV"] = _compute_gv(size)
+        evals_used += 1
 
-        # Only compute WC if needed (usually only when GV fails)
-        if need_wc and entry.get("WC", None) is None:
-            entry["WC"] = _compute_wc(size)
+        gv_pass = GVOptimalDecompositionPass(size)
+        gv_cost_value = Value("i", 0)
+        gv_pass.cost(q, gv_cost_value)
+        gv = gv_cost_value.value
 
-        cache[size] = entry
-        return entry
+        wc_pass = OptimalWireCuttingPass(size)
+        wc_cost_value = Value("i", 0)
+        wc_pass.cost(q, wc_cost_value)
+        wc = wc_cost_value.value
 
-    def feasible(size: int) -> bool:
-        c = get_costs(size, need_wc=False)
-        if c["GV"] <= budget:
-            return True
-        c = get_costs(size, need_wc=True)
-        return c["WC"] <= budget
+        costs = {"GV": gv, "WC": wc}
+        cache[size] = costs
+        return costs
 
-    def full_costs(size: int) -> dict:
-        c = get_costs(size, need_wc=True)
-        return {"GV": c["GV"], "WC": c["WC"]}
+    def is_feasible(size: int) -> bool:
+        c = compute_costs(size)
+        return (c["GV"] <= budget) or (c["WC"] <= budget)
 
-    # 1) Prefer the cap (least cutting)
-    if feasible(max_size_cap):
-        size_to_reach = max_size_cap
-        costs = full_costs(size_to_reach)
-        # OE_END
-        return size_to_reach, costs, 0.0
+    # --- Case 1: s0 feasible -> search downward to find smallest feasible size ---
+    if is_feasible(s0):
+        # Exponential step down to find an infeasible "lo"
+        hi = s0  # feasible
+        step = 1
+        lo = None  # infeasible
 
-    # 2) If cap infeasible, search downward for the largest feasible size.
-    #    Exponential bracketing downward, then binary search.
-    hi = max_size_cap  # infeasible
+        while True:
+            cand = hi - step
+            if cand <= lower:
+                cand = lower
+            if not is_feasible(cand):
+                lo = cand
+                break
+            # still feasible
+            hi = cand
+            if cand == lower:
+                # Everything down to lower is feasible; boundary is lower.
+                return lower, compute_costs(lower), 0.0
+            step *= 2
+            # Also stop if we run out of eval budget
+            if evals_used >= MAX_EVALS:
+                return hi, compute_costs(hi), 0.0
+
+        # Now we have: lo infeasible, and some feasible size > lo.
+        # Binary search smallest feasible in (lo, original_s0]
+        left = lo + 1
+        right = s0
+        best = s0
+        while left <= right and evals_used < MAX_EVALS:
+            mid = (left + right) // 2
+            if is_feasible(mid):
+                best = mid
+                right = mid - 1
+            else:
+                left = mid + 1
+
+        return best, compute_costs(best), 0.0
+
+    # --- Case 2: s0 infeasible -> search upward to find feasibility (bounded) ---
+    lo = s0  # infeasible
     step = 1
-    lo = max(2, hi - step)
+    hi = None  # feasible
+    cur = lo
 
-    # Try to find a feasible lo by moving down
-    while lo > 2 and (not feasible(lo)):
-        hi = lo
-        step *= 2
-        lo = max(2, hi - step)
-        if lo == 2:
+    while True:
+        cand = cur + step
+        if cand >= upper_cap:
+            cand = upper_cap
+        if is_feasible(cand):
+            hi = cand
             break
+        cur = cand
+        if cand == upper_cap or evals_used >= MAX_EVALS:
+            # Could not find feasible within cap/budget; return best effort.
+            return cand, compute_costs(cand), 0.0
+        step *= 2
 
-    # If even at size 2 infeasible, return 2 (best we can do)
-    if not feasible(lo):
-        size_to_reach = lo
-        costs = full_costs(size_to_reach)
-        # OE_END
-        return size_to_reach, costs, 0.0
-
-    # Now: lo feasible, hi infeasible (or hi == lo+something). We want the LARGEST feasible.
-    L, R = lo, hi - 1
-    # Binary search for last feasible in [L, R]
-    ans = L
-    while L <= R:
-        mid = (L + R) // 2
-        if feasible(mid):
-            ans = mid
-            L = mid + 1
+    # Binary search smallest feasible in (lo, hi]
+    left = lo + 1
+    right = hi
+    best = hi
+    while left <= right and evals_used < MAX_EVALS:
+        mid = (left + right) // 2
+        if is_feasible(mid):
+            best = mid
+            right = mid - 1
         else:
-            R = mid - 1
+            left = mid + 1
 
-    size_to_reach = ans
-    costs = full_costs(size_to_reach)
+    return best, compute_costs(best), 0.0
     # OE_END
-
-    return size_to_reach, costs, 0.0

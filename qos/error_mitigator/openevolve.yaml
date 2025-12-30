@@ -32,16 +32,14 @@ prompt:
       - Do not change imports, module-level code, class/function signatures, or anything outside markers.
 
     TASK CONTEXT:
-      - Input q is a Qernel. Metadata is available via q.get_metadata().
-      - evolved_cost_search is stateless across calls (no caching across runs).
-      - Evaluator selects circuits uniformly at random (uniform selection).
       - evolved_cost_search is a helper used by ErrorMitigator.run; it must not apply transformations.
-
-    Your job is to refine the cost-search loops that pick size_to_reach and compute GV/WC costs.
-
-    AVAILABLE TECHNIQUES (already implemented elsewhere):
-      - Gate virtualization cost (GVOptimalDecompositionPass)
-      - Wire cutting cost (OptimalWireCuttingPass)
+      - Each Qernel has unique metadata properties from q.get_metadata(); use them to decide how to apply
+        GVOptimalDecompositionPass vs OptimalWireCuttingPass and to adjust size_to_reach. Useful keys include:
+          * depth, num_qubits, num_nonlocal_gates, num_connected_components, number_instructions,
+            num_measurements, num_cnot_gates
+          * program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
+      - OptimalWireCuttingPass scales poorly as num_qubits grows; prefer GV or larger size_to_reach when
+        num_qubits is high or nonlocal density is low.
 
     METRICS:
       - rel_depth: depth(QOSE) / depth(QOS)
@@ -49,7 +47,7 @@ prompt:
       - rel_overhead: num_circuits(QOSE) / num_circuits(QOS)
       - avg_run_time: average evolved mitigator runtime in seconds
       - combined_score (maximize):
-          combined_score = 1.0 / (1.0 + rel_depth + rel_cnot + rel_overhead/10.0 + avg_run_time/10.0)
+          combined_score = -(rel_depth + rel_cnot + rel_overhead + avg_run_time/10.0)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
@@ -72,13 +70,12 @@ prompt:
 
     HARD CONSTRAINTS:
       - Deterministic execution (no randomness).
-      - Runtime: bounded candidate search; do NOT use unbounded loops.
       - Do not introduce new imports or new module dependencies.
 
     IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
       A) Decide to use WC or GV selectively instead of always using both.
 
-      B) Explore size_to_reach efficiently instead of using two while loops.
+      B) Explore size_to_reach efficiently instead of using two while loops iteratively.
 
       C) Explore early stopping rules for WC and GV.
 
