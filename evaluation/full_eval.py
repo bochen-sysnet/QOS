@@ -207,28 +207,28 @@ def _load_qose_run(qose_program: Path) -> Callable:
 
 
 def _relative_methods(include_qose: bool) -> List[str]:
-    methods = ["FrozenQubits", "CutQC", "QOS"]
+    methods = ["FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
         methods.append("QOSE")
     return methods
 
 
 def _fidelity_methods(include_qose: bool) -> List[str]:
-    methods = ["Qiskit", "FrozenQubits", "CutQC", "QOS"]
+    methods = ["Qiskit", "FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
         methods.append("QOSE")
     return methods
 
 
 def _timing_methods(include_qose: bool) -> List[str]:
-    methods = ["FrozenQubits", "CutQC", "QOS"]
+    methods = ["FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
         methods.append("QOSE")
     return methods
 
 
 def _cut_methods(include_qose: bool) -> List[str]:
-    methods = ["Qiskit", "QOS"]
+    methods = ["Qiskit", "QOS", "QOSN"]
     if include_qose:
         methods.append("QOSE")
     methods.extend(["FrozenQubits", "CutQC"])
@@ -451,16 +451,22 @@ def _analyze_qernel(
 
 
 def _run_mitigator(
-    qc: QuantumCircuit, methods: List[str], args
+    qc: QuantumCircuit,
+    methods: List[str],
+    args,
+    use_cost_search_override: Optional[bool] = None,
 ) -> Tuple[Dict[str, int], Dict[str, float], List[QuantumCircuit]]:
     size_candidates = [args.size_to_reach, qc.num_qubits]
     budget = args.budget
 
     for size_to_reach in size_candidates:
         q = Qernel(qc.copy())
-        use_cost_search = bool(methods == [] and args.qos_cost_search)
+        if use_cost_search_override is None:
+            use_cost_search = bool(methods == [] and args.qos_cost_search)
+        else:
+            use_cost_search = bool(methods == [] and use_cost_search_override)
         mitigator_cls = ErrorMitigator
-        if args.collect_timing and methods == [] and args.qos_cost_search:
+        if args.collect_timing and methods == [] and use_cost_search:
             mitigator_cls = _CountingMitigator
         mitigator = mitigator_cls(
             size_to_reach=size_to_reach,
@@ -853,6 +859,7 @@ def _plot_overheads(
         "FrozenQubits": ("fq_classical_overhead", "fq_quantum_overhead"),
         "CutQC": ("cutqc_classical_overhead", "cutqc_quantum_overhead"),
         "QOS": ("qos_classical_overhead", "qos_quantum_overhead"),
+        "QOSN": ("qosn_classical_overhead", "qosn_quantum_overhead"),
     }
     if include_qose:
         method_keys["QOSE"] = ("qose_classical_overhead", "qose_quantum_overhead")
@@ -862,7 +869,7 @@ def _plot_overheads(
         by_bench = {r["bench"]: r for r in size_rows}
         bench_labels = [(b, label) for b, label in benches if b in by_bench]
         x = np.arange(len(bench_labels))
-        width = 0.22
+        width = 0.8 / max(1, len(methods))
 
         ax = axes[row_idx, 0]
         for idx, method in enumerate(methods):
@@ -870,7 +877,8 @@ def _plot_overheads(
             key, _qkey = method_keys[method]
             for bench, _label in bench_labels:
                 vals.append(_val(by_bench[bench], key))
-            ax.bar(x + (idx - 1) * width, vals, width, label=method)
+            offset = (idx - (len(methods) - 1) / 2) * width
+            ax.bar(x + offset, vals, width, label=method)
         ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
         ax.set_title(f"Classical Overhead - {size} qubits")
         ax.set_ylabel("Factor vs Qiskit")
@@ -885,7 +893,8 @@ def _plot_overheads(
             _ckey, qkey = method_keys[method]
             for bench, _label in bench_labels:
                 vals.append(_val(by_bench[bench], qkey))
-            ax.bar(x + (idx - 1) * width, vals, width, label=method)
+            offset = (idx - (len(methods) - 1) / 2) * width
+            ax.bar(x + offset, vals, width, label=method)
         ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
         ax.set_title(f"Quantum Overhead - {size} qubits")
         ax.set_ylabel("Factor vs Qiskit")
@@ -1059,6 +1068,16 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                     f"sec={time.perf_counter() - qos_t0:.2f}",
                     flush=True,
                 )
+            qosn_t0 = time.perf_counter()
+            qosn_m, qosn_t, qosn_circs = _run_mitigator(
+                qc, [], args, use_cost_search_override=False
+            )
+            if args.verbose:
+                print(
+                    f"  qosn depth={qosn_m['depth']} cnot={qosn_m['num_nonlocal_gates']} "
+                    f"sec={time.perf_counter() - qosn_t0:.2f}",
+                    flush=True,
+                )
             fq_t0 = time.perf_counter()
             fq_m, fq_t, fq_circs = _run_mitigator(qc, ["QF"], args)
             if args.verbose:
@@ -1106,12 +1125,16 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
             rel_depth[bench]["QOS"] = _relative(qos_m["depth"], base["depth"])
             rel_depth[bench]["FrozenQubits"] = _relative(fq_m["depth"], base["depth"])
             rel_depth[bench]["CutQC"] = _relative(cutqc_m["depth"], base["depth"])
+            rel_depth[bench]["QOSN"] = _relative(qosn_m["depth"], base["depth"])
             if include_qose:
                 rel_depth[bench]["QOSE"] = _relative(qose_m["depth"], base["depth"])
 
             rel_nonlocal[bench]["QOS"] = _relative(qos_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
             rel_nonlocal[bench]["FrozenQubits"] = _relative(fq_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
             rel_nonlocal[bench]["CutQC"] = _relative(cutqc_m["num_nonlocal_gates"], base["num_nonlocal_gates"])
+            rel_nonlocal[bench]["QOSN"] = _relative(
+                qosn_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
+            )
             if include_qose:
                 rel_nonlocal[bench]["QOSE"] = _relative(
                     qose_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
@@ -1127,6 +1150,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 t0 = time.perf_counter()
                 qos_fidelity = _average_fidelity(qos_circs, args.fidelity_shots, noise, args.fidelity_seed)
                 sim_times["QOS"] = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                qosn_fidelity = _average_fidelity(qosn_circs, args.fidelity_shots, noise, args.fidelity_seed)
+                sim_times["QOSN"] = time.perf_counter() - t0
                 t0 = time.perf_counter()
                 fq_fidelity = _average_fidelity(fq_circs, args.fidelity_shots, noise, args.fidelity_seed)
                 sim_times["FrozenQubits"] = time.perf_counter() - t0
@@ -1144,12 +1170,14 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 fidelity_by_size[size][bench] = {
                     "Qiskit": base_fidelity,
                     "QOS": qos_fidelity,
+                    "QOSN": qosn_fidelity,
                     "FrozenQubits": fq_fidelity,
                     "CutQC": cutqc_fidelity,
                 }
                 if include_qose:
                     fidelity_by_size[size][bench]["QOSE"] = qose_fidelity
                 rel_fidelity_qos = _relative(qos_fidelity, base_fidelity)
+                rel_fidelity_qosn = _relative(qosn_fidelity, base_fidelity)
                 rel_fidelity_fq = _relative(fq_fidelity, base_fidelity)
                 rel_fidelity_cutqc = _relative(cutqc_fidelity, base_fidelity)
                 if include_qose:
@@ -1160,29 +1188,35 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 sim_times = {}
                 base_fidelity = ""
                 qos_fidelity = ""
+                qosn_fidelity = ""
                 fq_fidelity = ""
                 cutqc_fidelity = ""
                 qose_fidelity = ""
                 rel_fidelity_qos = ""
+                rel_fidelity_qosn = ""
                 rel_fidelity_fq = ""
                 rel_fidelity_cutqc = ""
                 rel_fidelity_qose = ""
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
             qos_sim = float(sim_times.get("QOS", 0.0))
+            qosn_sim = float(sim_times.get("QOSN", 0.0))
             fq_sim = float(sim_times.get("FrozenQubits", 0.0))
             cutqc_sim = float(sim_times.get("CutQC", 0.0))
             qose_sim = float(sim_times.get("QOSE", 0.0))
 
             qos_num_circuits = max(1, len(qos_circs))
+            qosn_num_circuits = max(1, len(qosn_circs))
             fq_num_circuits = max(1, len(fq_circs))
             cutqc_num_circuits = max(1, len(cutqc_circs))
             qose_num_circuits = max(1, len(qose_circs)) if include_qose else 0
 
             qos_classical_overhead = _safe_ratio(qos_sim, qiskit_sim)
+            qosn_classical_overhead = _safe_ratio(qosn_sim, qiskit_sim)
             fq_classical_overhead = _safe_ratio(fq_sim, qiskit_sim)
             cutqc_classical_overhead = _safe_ratio(cutqc_sim, qiskit_sim)
             qos_quantum_overhead = float(qos_num_circuits)
+            qosn_quantum_overhead = float(qosn_num_circuits)
             fq_quantum_overhead = float(fq_num_circuits)
             cutqc_quantum_overhead = float(cutqc_num_circuits)
             qose_classical_overhead = _safe_ratio(qose_sim, qiskit_sim) if include_qose else ""
@@ -1199,6 +1233,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 "qos_nonlocal": qos_m["num_nonlocal_gates"],
                 "qos_fidelity": qos_fidelity,
                 "qos_sim_time": qos_sim,
+                "qosn_depth": qosn_m["depth"],
+                "qosn_nonlocal": qosn_m["num_nonlocal_gates"],
+                "qosn_fidelity": qosn_fidelity,
+                "qosn_sim_time": qosn_sim,
                 "fq_depth": fq_m["depth"],
                 "fq_nonlocal": fq_m["num_nonlocal_gates"],
                 "fq_fidelity": fq_fidelity,
@@ -1208,21 +1246,27 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
                 "cutqc_fidelity": cutqc_fidelity,
                 "cutqc_sim_time": cutqc_sim,
                 "qos_num_circuits": qos_num_circuits,
+                "qosn_num_circuits": qosn_num_circuits,
                 "fq_num_circuits": fq_num_circuits,
                 "cutqc_num_circuits": cutqc_num_circuits,
                 "qos_classical_overhead": qos_classical_overhead,
+                "qosn_classical_overhead": qosn_classical_overhead,
                 "fq_classical_overhead": fq_classical_overhead,
                 "cutqc_classical_overhead": cutqc_classical_overhead,
                 "qos_quantum_overhead": qos_quantum_overhead,
+                "qosn_quantum_overhead": qosn_quantum_overhead,
                 "fq_quantum_overhead": fq_quantum_overhead,
                 "cutqc_quantum_overhead": cutqc_quantum_overhead,
                 "rel_depth_qos": rel_depth[bench]["QOS"],
+                "rel_depth_qosn": rel_depth[bench]["QOSN"],
                 "rel_depth_fq": rel_depth[bench]["FrozenQubits"],
                 "rel_depth_cutqc": rel_depth[bench]["CutQC"],
                 "rel_nonlocal_qos": rel_nonlocal[bench]["QOS"],
+                "rel_nonlocal_qosn": rel_nonlocal[bench]["QOSN"],
                 "rel_nonlocal_fq": rel_nonlocal[bench]["FrozenQubits"],
                 "rel_nonlocal_cutqc": rel_nonlocal[bench]["CutQC"],
                 "rel_fidelity_qos": rel_fidelity_qos,
+                "rel_fidelity_qosn": rel_fidelity_qosn,
                 "rel_fidelity_fq": rel_fidelity_fq,
                 "rel_fidelity_cutqc": rel_fidelity_cutqc,
             }
@@ -1244,9 +1288,14 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
             all_rows.append(row)
 
             if args.collect_timing:
-                timing_methods = [("QOS", qos_t), ("FrozenQubits", fq_t), ("CutQC", cutqc_t)]
+                timing_methods = [
+                    ("QOS", qos_t),
+                    ("QOSN", qosn_t),
+                    ("FrozenQubits", fq_t),
+                    ("CutQC", cutqc_t),
+                ]
                 if include_qose:
-                    timing_methods.insert(1, ("QOSE", qose_t))
+                    timing_methods.insert(2, ("QOSE", qose_t))
                 for method, timing in timing_methods:
                     row = {"bench": bench, "size": size, "method": method}
                     row.update(timing)
@@ -1256,6 +1305,7 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable]):
             if args.cut_visualization:
                 cut_circuits[(size, bench, "Qiskit")] = [qc]
                 cut_circuits[(size, bench, "QOS")] = qos_circs
+                cut_circuits[(size, bench, "QOSN")] = qosn_circs
                 if include_qose:
                     cut_circuits[(size, bench, "QOSE")] = qose_circs
                 cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
@@ -1329,7 +1379,7 @@ def _import_matplotlib():
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare QOS, FrozenQubits, CutQC, and optional QOSE vs Qiskit baseline."
+        description="Compare QOS, QOSN, FrozenQubits, CutQC, and optional QOSE vs Qiskit baseline."
     )
     parser.add_argument("--sizes", default="12,24", help="Comma-separated qubit sizes.")
     parser.add_argument("--budget", type=int, default=3)

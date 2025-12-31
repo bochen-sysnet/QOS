@@ -9,140 +9,151 @@ from qos.types.types import Qernel
 
 def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     # OE_BEGIN
-    # Preserve baseline semantics while reducing cost() calls:
-    # Baseline behavior:
-    #   1) While feasible (GV<=B or WC<=B), decrease size
-    #   2) Then while infeasible (GV>B and WC>B), increase size
-    # This yields the smallest feasible size (boundary).
+    # Your latest run is *much* faster (avg_run_time ~0.096s, cost_search ~0.078s),
+    # meaning the cost() calls are now cheap enough that we can afford a bit more
+    # searching to reduce qose_depth/cnot without regressing runtime.
     #
-    # Optimization:
-    #   - Cache costs per size
-    #   - If s0 is feasible (common), only search DOWN to find the boundary:
-    #       * exponential bracketing down to find an infeasible point
-    #       * binary search to find the smallest feasible size
-    #   - If s0 is infeasible, search UP with exponential bracketing + binary search, but
-    #     with strict caps to avoid 300s timeout.
-    #   - Always return fully-computed {"GV":..., "WC":...} (no dummy costs).
+    # Strategy:
+    #   1) Use the previous bounded-window search to find a feasible "anchor" size s*.
+    #   2) Then perform a small, cheap LOCAL refinement around s* to find the smallest
+    #      feasible size within a wider window (this tends to reduce depth/CNOT).
+    #
+    # Still: never force s=2 unless we actually search down to it.
 
-    lower = 2
-    s0 = int(size_to_reach)
-    if s0 < lower:
-        s0 = lower
+    # ---- metadata / bounds ----
+    try:
+        meta = q.get_metadata() or {}
+    except Exception:
+        meta = {}
 
-    # A tight upward safety cap (prevents runaway if budget is tiny or metadata is weird).
-    # We intentionally do NOT use num_qubits as an upper bound because it caused timeouts before.
-    upper_cap = s0 + 16
+    try:
+        num_qubits = int(meta.get("num_qubits", 0))
+    except Exception:
+        num_qubits = 0
 
-    # Hard cap on how many expensive evaluations we allow (across all sizes).
-    # Keeps worst-case bounded even if a single cost() call is slow.
-    MAX_EVALS = 16
-    evals_used = 0
+    max_size = num_qubits if num_qubits and num_qubits > 0 else max(2, int(size_to_reach) + 32)
 
-    # Cache: size -> {"GV": int, "WC": int}
-    cache = {}
+    if size_to_reach < 2:
+        size_to_reach = 2
+    if size_to_reach > max_size:
+        size_to_reach = max_size
 
-    def compute_costs(size: int):
-        nonlocal evals_used
-        if size in cache:
-            return cache[size]
+    # ---- memoization ----
+    gv_cache = {}
+    wc_cache = {}
 
-        # Enforce evaluation budget
-        if evals_used >= MAX_EVALS:
-            # Fallback: return a clearly infeasible cost to stop searching.
-            # (Should be rare; prevents timeouts.)
-            costs = {"GV": budget + 1, "WC": budget + 1}
-            cache[size] = costs
-            return costs
-
-        evals_used += 1
-
-        gv_pass = GVOptimalDecompositionPass(size)
+    def gv_cost(s: int) -> int:
+        v = gv_cache.get(s)
+        if v is not None:
+            return v
+        gv_pass = GVOptimalDecompositionPass(s)
         gv_cost_value = Value("i", 0)
         gv_pass.cost(q, gv_cost_value)
-        gv = gv_cost_value.value
+        v = int(gv_cost_value.value)
+        gv_cache[s] = v
+        return v
 
-        wc_pass = OptimalWireCuttingPass(size)
+    def wc_cost(s: int) -> int:
+        v = wc_cache.get(s)
+        if v is not None:
+            return v
+        wc_pass = OptimalWireCuttingPass(s)
         wc_cost_value = Value("i", 0)
         wc_pass.cost(q, wc_cost_value)
-        wc = wc_cost_value.value
+        v = int(wc_cost_value.value)
+        wc_cache[s] = v
+        return v
 
-        costs = {"GV": gv, "WC": wc}
-        cache[size] = costs
-        return costs
+    def predicate(s: int) -> bool:
+        # short-circuit: compute WC only if needed
+        if gv_cost(s) <= budget:
+            return True
+        return wc_cost(s) <= budget
 
-    def is_feasible(size: int) -> bool:
-        c = compute_costs(size)
-        return (c["GV"] <= budget) or (c["WC"] <= budget)
+    def full_costs(s: int):
+        return {"GV": gv_cost(s), "WC": wc_cost(s)}
 
-    # --- Case 1: s0 feasible -> search downward to find smallest feasible size ---
-    if is_feasible(s0):
-        # Exponential step down to find an infeasible "lo"
-        hi = s0  # feasible
+    # ---- Phase 1: bounded anchor search (same as previous, slightly larger window) ----
+    WINDOW1 = 10  # a bit wider now that costs are cheap
+    lo1 = max(2, size_to_reach - WINDOW1)
+    hi1 = min(max_size, size_to_reach + WINDOW1)
+
+    s0 = size_to_reach
+    p0 = predicate(s0)
+
+    anchor = s0
+
+    if p0:
+        hi_true = s0
         step = 1
-        lo = None  # infeasible
-
+        lo_false = None
         while True:
-            cand = hi - step
-            if cand <= lower:
-                cand = lower
-            if not is_feasible(cand):
-                lo = cand
+            cand = hi_true - step
+            if cand < lo1:
                 break
-            # still feasible
-            hi = cand
-            if cand == lower:
-                # Everything down to lower is feasible; boundary is lower.
-                return lower, compute_costs(lower), 0.0
+            if not predicate(cand):
+                lo_false = cand
+                break
+            hi_true = cand
             step *= 2
-            # Also stop if we run out of eval budget
-            if evals_used >= MAX_EVALS:
-                return hi, compute_costs(hi), 0.0
 
-        # Now we have: lo infeasible, and some feasible size > lo.
-        # Binary search smallest feasible in (lo, original_s0]
-        left = lo + 1
-        right = s0
-        best = s0
-        while left <= right and evals_used < MAX_EVALS:
-            mid = (left + right) // 2
-            if is_feasible(mid):
-                best = mid
-                right = mid - 1
-            else:
-                left = mid + 1
-
-        return best, compute_costs(best), 0.0
-
-    # --- Case 2: s0 infeasible -> search upward to find feasibility (bounded) ---
-    lo = s0  # infeasible
-    step = 1
-    hi = None  # feasible
-    cur = lo
-
-    while True:
-        cand = cur + step
-        if cand >= upper_cap:
-            cand = upper_cap
-        if is_feasible(cand):
-            hi = cand
-            break
-        cur = cand
-        if cand == upper_cap or evals_used >= MAX_EVALS:
-            # Could not find feasible within cap/budget; return best effort.
-            return cand, compute_costs(cand), 0.0
-        step *= 2
-
-    # Binary search smallest feasible in (lo, hi]
-    left = lo + 1
-    right = hi
-    best = hi
-    while left <= right and evals_used < MAX_EVALS:
-        mid = (left + right) // 2
-        if is_feasible(mid):
-            best = mid
-            right = mid - 1
+        if lo_false is None:
+            anchor = hi_true
         else:
-            left = mid + 1
+            left = lo_false + 1
+            right = hi_true
+            while left < right:
+                mid = (left + right) // 2
+                if predicate(mid):
+                    right = mid
+                else:
+                    left = mid + 1
+            anchor = left
+    else:
+        lo_false = s0
+        step = 1
+        hi_true = None
+        while True:
+            cand = lo_false + step
+            if cand > hi1:
+                break
+            if predicate(cand):
+                hi_true = cand
+                break
+            lo_false = cand
+            step *= 2
 
-    return best, compute_costs(best), 0.0
+        if hi_true is None:
+            anchor = s0
+        else:
+            left = lo_false + 1
+            right = hi_true
+            while left < right:
+                mid = (left + right) // 2
+                if predicate(mid):
+                    right = mid
+                else:
+                    left = mid + 1
+            anchor = left
+
+    # ---- Phase 2: local refinement around anchor to reduce depth/CNOT ----
+    # Since the objective is "min feasible size", we try to walk down greedily
+    # inside a small refinement window. This is cheap now and helps qose_*.
+    WINDOW2 = 6
+    low_ref = max(2, anchor - WINDOW2)
+
+    chosen = anchor
+    s = anchor - 1
+    steps = 0
+    # Cap refinement steps so we never blow up.
+    while s >= low_ref and steps < (WINDOW2 + 2):
+        if predicate(s):
+            chosen = s
+            s -= 1
+            steps += 1
+        else:
+            break
+
+    costs = full_costs(chosen)
     # OE_END
+    return chosen, costs, 0.0

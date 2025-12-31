@@ -32,9 +32,8 @@ prompt:
       - Do not change imports, module-level code, class/function signatures, or anything outside markers.
 
     TASK CONTEXT:
-      - evolved_cost_search is a helper used by ErrorMitigator.run; it must not apply transformations.
       - Each Qernel has unique metadata properties from q.get_metadata(); use them to decide how to apply
-        GVOptimalDecompositionPass vs OptimalWireCuttingPass and to adjust size_to_reach. Useful keys include:
+        GVOptimalDecompositionPass or OptimalWireCuttingPass and to adjust size_to_reach. Useful keys include:
           * depth, num_qubits, num_nonlocal_gates, num_connected_components, number_instructions,
             num_measurements, num_cnot_gates
           * program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
@@ -112,7 +111,7 @@ database:
   diversity_reference_size: 30
 
 evaluator:
-  timeout: 300
+  timeout: 100
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1

@@ -30,7 +30,7 @@ def _evaluate_impl(program_path):
     spec.loader.exec_module(candidate)
     evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
     if evolved_cost_search is None:
-        return {"combined_score": 0.0}, {"error": "Missing evolved_cost_search"}
+        return {"combined_score": 0.0}, {"info": "Missing evolved_cost_search"}
 
     args = SimpleNamespace(
         size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "7")),
@@ -71,7 +71,7 @@ def _evaluate_impl(program_path):
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
     if unknown:
-        return {"combined_score": 0.0}, {"error": f"Unknown benches: {', '.join(unknown)}"}
+        return {"combined_score": 0.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
     sizes = [int(s) for s in os.getenv("QOSE_SIZES", "12").split(",") if s]
     depth_sum = cnot_sum = overhead_sum = 0.0
     count = 0
@@ -175,7 +175,7 @@ def _evaluate_impl(program_path):
             count += 1
 
     if count == 0:
-        return {"combined_score": 0.0}, {"error": "No benches/sizes"}
+        return {"combined_score": 0.0}, {"info": "No benches/sizes"}
 
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
@@ -210,12 +210,12 @@ def _evaluate_worker(program_path, queue):
         metrics, artifacts = _evaluate_impl(program_path)
     except Exception as exc:
         metrics = {"combined_score": 0.0}
-        artifacts = {"error": f"Evaluation failed: {exc}"}
+        artifacts = {"info": f"Evaluation failed: {exc}"}
     queue.put({"metrics": metrics, "artifacts": artifacts})
 
 
 def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "300"))
+    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "100"))
     if timeout_sec <= 0:
         metrics, artifacts = _evaluate_impl(program_path)
         return EvaluationResult(metrics=metrics, artifacts=artifacts)
@@ -229,12 +229,12 @@ def evaluate(program_path):
         proc.join()
         return EvaluationResult(
             metrics={"combined_score": 0.0},
-            artifacts={"error": f"Timeout after {timeout_sec}s"},
+            artifacts={"info": f"Timeout after {timeout_sec}s"},
         )
     if queue.empty():
         return EvaluationResult(
             metrics={"combined_score": 0.0},
-            artifacts={"error": "No result returned"},
+            artifacts={"info": "No result returned"},
         )
     result = queue.get()
     metrics = result.get("metrics", {"combined_score": 0.0})
