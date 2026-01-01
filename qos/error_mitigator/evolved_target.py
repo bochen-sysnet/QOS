@@ -9,16 +9,17 @@ from qos.types.types import Qernel
 
 def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     # OE_BEGIN
-    # Your latest run is *much* faster (avg_run_time ~0.096s, cost_search ~0.078s),
-    # meaning the cost() calls are now cheap enough that we can afford a bit more
-    # searching to reduce qose_depth/cnot without regressing runtime.
+    # We observed a failure mode: any strategy that evaluates MANY sizes can "walk into"
+    # a pathological cost() region and blow up to 10s~30s per case (even without timeouts),
+    # because we cannot preempt a long-running cost() call.
     #
-    # Strategy:
-    #   1) Use the previous bounded-window search to find a feasible "anchor" size s*.
-    #   2) Then perform a small, cheap LOCAL refinement around s* to find the smallest
-    #      feasible size within a wider window (this tends to reduce depth/CNOT).
+    # So this version is STRICTLY constant-work:
+    #   - At most 2 sizes tested for "hard/entangling" circuits
+    #   - At most 2 sizes tested + a single 1-step refinement for "normal" circuits
+    #   - Never scans / binary searches / wide windows
     #
-    # Still: never force s=2 unless we actually search down to it.
+    # This should keep runtime stable (like your best 0.03s run) while recovering
+    # some qose_depth/cnot by a *single* downward refinement when safe.
 
     # ---- metadata / bounds ----
     try:
@@ -31,12 +32,20 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     except Exception:
         num_qubits = 0
 
-    max_size = num_qubits if num_qubits and num_qubits > 0 else max(2, int(size_to_reach) + 32)
+    max_size = num_qubits if num_qubits and num_qubits > 0 else max(2, int(size_to_reach) + 8)
 
     if size_to_reach < 2:
         size_to_reach = 2
     if size_to_reach > max_size:
         size_to_reach = max_size
+
+    # Heuristic: high-entanglement circuits were the ones that previously exploded in cost_search.
+    # For them, we do *fewer probes* (no downward refinement).
+    try:
+        er = float(meta.get("entanglement_ratio", 0.0))
+    except Exception:
+        er = 0.0
+    is_hard = er >= 0.80
 
     # ---- memoization ----
     gv_cache = {}
@@ -64,96 +73,44 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
         wc_cache[s] = v
         return v
 
-    def predicate(s: int) -> bool:
-        # short-circuit: compute WC only if needed
-        if gv_cost(s) <= budget:
-            return True
-        return wc_cost(s) <= budget
-
-    def full_costs(s: int):
+    def costs_both(s: int):
         return {"GV": gv_cost(s), "WC": wc_cost(s)}
 
-    # ---- Phase 1: bounded anchor search (same as previous, slightly larger window) ----
-    WINDOW1 = 10  # a bit wider now that costs are cheap
-    lo1 = max(2, size_to_reach - WINDOW1)
-    hi1 = min(max_size, size_to_reach + WINDOW1)
+    def feasible(s: int) -> bool:
+        # Order by circuit type: for highly entangling circuits, check WC first (often cheaper / smoother),
+        # otherwise check GV first.
+        if is_hard:
+            if wc_cost(s) <= budget:
+                return True
+            return gv_cost(s) <= budget
+        else:
+            if gv_cost(s) <= budget:
+                return True
+            return wc_cost(s) <= budget
 
     s0 = size_to_reach
-    p0 = predicate(s0)
 
-    anchor = s0
+    # ---- Probe 1: s0 ----
+    if feasible(s0):
+        # Optional 1-step refinement down (ONLY for non-hard circuits)
+        if (not is_hard) and s0 > 2:
+            s1 = s0 - 1
+            if feasible(s1):
+                return s1, costs_both(s1), 0.0
+        return s0, costs_both(s0), 0.0
 
-    if p0:
-        hi_true = s0
-        step = 1
-        lo_false = None
-        while True:
-            cand = hi_true - step
-            if cand < lo1:
-                break
-            if not predicate(cand):
-                lo_false = cand
-                break
-            hi_true = cand
-            step *= 2
+    # ---- Probe 2: s0+1 ----
+    s_up1 = s0 + 1
+    if s_up1 <= max_size and feasible(s_up1):
+        # If we had to go up, do not refine down (keeps calls bounded and avoids oscillation).
+        return s_up1, costs_both(s_up1), 0.0
 
-        if lo_false is None:
-            anchor = hi_true
-        else:
-            left = lo_false + 1
-            right = hi_true
-            while left < right:
-                mid = (left + right) // 2
-                if predicate(mid):
-                    right = mid
-                else:
-                    left = mid + 1
-            anchor = left
-    else:
-        lo_false = s0
-        step = 1
-        hi_true = None
-        while True:
-            cand = lo_false + step
-            if cand > hi1:
-                break
-            if predicate(cand):
-                hi_true = cand
-                break
-            lo_false = cand
-            step *= 2
+    # For non-hard circuits only, allow ONE more upward probe (still constant)
+    if not is_hard:
+        s_up2 = s0 + 2
+        if s_up2 <= max_size and feasible(s_up2):
+            return s_up2, costs_both(s_up2), 0.0
 
-        if hi_true is None:
-            anchor = s0
-        else:
-            left = lo_false + 1
-            right = hi_true
-            while left < right:
-                mid = (left + right) // 2
-                if predicate(mid):
-                    right = mid
-                else:
-                    left = mid + 1
-            anchor = left
-
-    # ---- Phase 2: local refinement around anchor to reduce depth/CNOT ----
-    # Since the objective is "min feasible size", we try to walk down greedily
-    # inside a small refinement window. This is cheap now and helps qose_*.
-    WINDOW2 = 6
-    low_ref = max(2, anchor - WINDOW2)
-
-    chosen = anchor
-    s = anchor - 1
-    steps = 0
-    # Cap refinement steps so we never blow up.
-    while s >= low_ref and steps < (WINDOW2 + 2):
-        if predicate(s):
-            chosen = s
-            s -= 1
-            steps += 1
-        else:
-            break
-
-    costs = full_costs(chosen)
+    # Fallback (bounded-time): return s0 with computed costs (cached)
+    return s0, costs_both(s0), 0.0
     # OE_END
-    return chosen, costs, 0.0

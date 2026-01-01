@@ -37,8 +37,13 @@ prompt:
           * depth, num_qubits, num_nonlocal_gates, num_connected_components, number_instructions,
             num_measurements, num_cnot_gates
           * program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-      - OptimalWireCuttingPass scales poorly as num_qubits grows; prefer GV or larger size_to_reach when
-        num_qubits is high or nonlocal density is low.
+      - OptimalWireCuttingPass scales poorly as num_qubits grows.
+      - Heuristics include but are not limited to:
+          * Prefer GV or larger size_to_reach when num_qubits is high or nonlocal density is low.
+          * Favor GV when liveness > program_communication or entanglement_ratio is low.
+          * Favor WC when nonlocal density is high and num_qubits is moderate.
+          * Increase size_to_reach when num_qubits is large or critical_depth is high; decrease it when
+            num_qubits is small and nonlocal density is high.
 
     METRICS:
       - qose_depth: average absolute depth of QOSE
@@ -46,7 +51,7 @@ prompt:
       - qose_overhead: average absolute number of QOSE circuits
       - avg_run_time: average evolved mitigator runtime in seconds
       - combined_score (maximize):
-          combined_score = -(qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time)
+          combined_score = 1.0 / (1.0 + qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
@@ -66,6 +71,16 @@ prompt:
       - cost_search_sec_avg: average time per cost_search call
       - gv_cost_calls_total: total GV cost calls
       - wc_cost_calls_total: total WC cost calls
+
+    AN EXAMPLE OF EVOLVEMENT without cost search (Not Optimal):
+    def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
+      metadata = q.get_metadata()
+      pc = metadata["program_communication"]
+      liveness = metadata['liveness']
+      if liveness > pc:
+          return size_to_reach, "WC", 0.0
+      else:
+          return size_to_reach, "GV", 0.0
 
     HARD CONSTRAINTS:
       - Deterministic execution (no randomness).

@@ -142,13 +142,19 @@ class ErrorMitigator():
                     f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
                     flush=True,
                 )
-        return size_to_reach, costs, cost_time
+
+        method = None
+        if costs["GV"] <= costs["WC"]:
+            method = "GV"
+        else:
+            method = "WC" 
+        return size_to_reach, method, cost_time
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
-        size_to_reach, costs, cost_time = self._cost_search_impl(
+        size_to_reach, method, cost_time = self._cost_search_impl(
             q, size_to_reach, budget
         )
-        return size_to_reach, costs, cost_time, False
+        return size_to_reach, method, cost_time, False
     
     def applyGV(self, q: Qernel, size_to_reach: int):
         if self.methods["GV"]:
@@ -254,7 +260,7 @@ class ErrorMitigator():
                         q = self.applyBestCut(q, self.size_to_reach)
                 else:
                     size_to_reach = self.size_to_reach
-                    size_to_reach, costs, cost_time, timed_out = self.cost_search(
+                    size_to_reach, method, cost_time, timed_out = self.cost_search(
                         q, size_to_reach, budget
                     )
                     if self.collect_timing:
@@ -267,8 +273,8 @@ class ErrorMitigator():
                             self.timings["gv"] = time.perf_counter() - t0
                         else:
                             q = self.applyGV(q, self.size_to_reach)
-                    elif costs["GV"] <= budget or costs["WC"] <= budget:
-                        if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
+                    else:
+                        if method == "GV":
                             if self.collect_timing:
                                 t0 = time.perf_counter()
                                 q = self.applyGV(q, size_to_reach)

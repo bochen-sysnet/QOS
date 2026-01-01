@@ -182,7 +182,9 @@ def _evaluate_impl(program_path):
     avg_overhead = overhead_sum / count
 
     avg_run_time = (total_run_time / count) if count else 0.0
-    combined_score = -(avg_depth + avg_cnot + avg_overhead * 10.0 + avg_run_time)
+    combined_score = 1.0 / (
+        1.0 + avg_depth + avg_cnot + (avg_overhead * 10.0) + avg_run_time
+    )
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,

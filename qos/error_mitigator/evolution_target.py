@@ -30,6 +30,8 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     while costs["GV"] > budget and costs["WC"] > budget:
         size_to_reach = size_to_reach + 1
         costs = computeCuttingCosts(q, size_to_reach)
+
+    method = "GV" if costs["GV"] <= costs["WC"] else "WC"
     # OE_END
 
-    return size_to_reach, costs, 0.0
+    return size_to_reach, method, 0.0
