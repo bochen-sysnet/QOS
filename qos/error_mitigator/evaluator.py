@@ -160,6 +160,12 @@ def _evaluate_impl(program_path):
             mitigator._wc_cost_calls = 0
             mitigator._cost_search_calls = 0
             mitigator._cost_search_time = 0.0
+            mitigator._qose_cost_search_input_size = None
+            mitigator._qose_cost_search_budget = None
+            mitigator._qose_cost_search_output_size = None
+            mitigator._qose_cost_search_method = None
+            mitigator._qose_gv_cost_trace = None
+            mitigator._qose_wc_cost_trace = None
             orig_cost_search = mitigator.cost_search
             gv_cost_orig = GVOptimalDecompositionPass.cost
             wc_cost_orig = OptimalWireCuttingPass.cost
@@ -232,7 +238,10 @@ def _evaluate_impl(program_path):
                     "qos_num_circuits": qos_overhead,
                     "qose_run_sec": run_time,
                     "qos_run_sec": qos_run_time,
-                    "cost_search_calls": mitigator._cost_search_calls,
+                    "qose_output_size": mitigator._qose_cost_search_output_size,
+                    "qose_method": mitigator._qose_cost_search_method,
+                    "qose_gv_cost_trace": mitigator._qose_gv_cost_trace,
+                    "qose_wc_cost_trace": mitigator._qose_wc_cost_trace,
                     "gv_cost_calls": mitigator._gv_cost_calls,
                     "wc_cost_calls": mitigator._wc_cost_calls,
                     "input_features": input_features,
@@ -258,6 +267,8 @@ def _evaluate_impl(program_path):
         "combined_score": combined_score,
     }
     artifacts = {
+        "qose_input_size": args.size_to_reach,
+        "qose_budget": args.budget,
         "qose_run_sec_avg": (total_run_time / count) if count else 0.0,
         "qos_run_sec_avg": (total_qos_run_time / count) if count else 0.0,
         "gv_cost_calls_total": sum(c["gv_cost_calls"] for c in cases),
