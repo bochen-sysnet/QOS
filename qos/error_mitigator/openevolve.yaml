@@ -33,17 +33,14 @@ prompt:
 
     TASK CONTEXT:
       - Each Qernel has unique metadata properties from q.get_metadata(); use them to decide how to apply
-        GVOptimalDecompositionPass or OptimalWireCuttingPass and to adjust size_to_reach. Useful keys include:
-          * depth, num_qubits, num_nonlocal_gates, num_connected_components, number_instructions,
-            num_measurements, num_cnot_gates
+        GVOptimalDecompositionPass or OptimalWireCuttingPass and to adjust size_to_reach. They are extracted in the target code.
+        Available keys (from BasicAnalysisPass and SupermarqFeaturesAnalysisPass) include:
+          * depth, num_qubits, num_clbits, num_nonlocal_gates, num_connected_components,
+            number_instructions, num_measurements, num_cnot_gates
           * program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-      - OptimalWireCuttingPass scales poorly as num_qubits grows.
       - Heuristics include but are not limited to:
           * Prefer GV or larger size_to_reach when num_qubits is high or nonlocal density is low.
           * Favor GV when liveness > program_communication or entanglement_ratio is low.
-          * Favor WC when nonlocal density is high and num_qubits is moderate.
-          * Increase size_to_reach when num_qubits is large or critical_depth is high; decrease it when
-            num_qubits is small and nonlocal density is high.
 
     METRICS:
       - qose_depth: average absolute depth of QOSE
@@ -51,15 +48,16 @@ prompt:
       - qose_overhead: average absolute number of QOSE circuits
       - avg_run_time: average evolved mitigator runtime in seconds
       - combined_score (maximize):
-          combined_score = 1.0 / (1.0 + qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time)
+          combined_score = -(qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time * 0.2)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
         You may treat it only as a soft heuristic.
 
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
-      - input_features: depth, num_qubits, num_nonlocal_gates, program_communication, liveness,
-        parallelism, measurement, entanglement_ratio, critical_depth
+      - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
+        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
+        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
       - cost_search_sec: time spent in cost_search for the case
       - cost_search_calls: number of cost_search invocations for the case
       - gv_cost_calls: number of GV cost calls for the case

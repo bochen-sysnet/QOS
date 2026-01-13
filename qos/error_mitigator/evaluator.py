@@ -30,7 +30,7 @@ def _evaluate_impl(program_path):
     spec.loader.exec_module(candidate)
     evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
     if evolved_cost_search is None:
-        return {"combined_score": 0.0}, {"info": "Missing evolved_cost_search"}
+        return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
 
     args = SimpleNamespace(
         size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "7")),
@@ -71,7 +71,7 @@ def _evaluate_impl(program_path):
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
     if unknown:
-        return {"combined_score": 0.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
+        return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
     sizes = [int(s) for s in os.getenv("QOSE_SIZES", "12").split(",") if s]
     depth_sum = cnot_sum = overhead_sum = 0.0
     count = 0
@@ -80,7 +80,12 @@ def _evaluate_impl(program_path):
     feature_keys = [
         "depth",
         "num_qubits",
+        "num_clbits",
         "num_nonlocal_gates",
+        "num_connected_components",
+        "number_instructions",
+        "num_measurements",
+        "num_cnot_gates",
         "program_communication",
         "liveness",
         "parallelism",
@@ -175,15 +180,15 @@ def _evaluate_impl(program_path):
             count += 1
 
     if count == 0:
-        return {"combined_score": 0.0}, {"info": "No benches/sizes"}
+        return {"combined_score": -1000.0}, {"info": "No benches/sizes"}
 
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
     avg_overhead = overhead_sum / count
 
     avg_run_time = (total_run_time / count) if count else 0.0
-    combined_score = 1.0 / (
-        1.0 + avg_depth + avg_cnot + (avg_overhead * 10.0) + avg_run_time
+    combined_score = -(
+        avg_depth + avg_cnot + (avg_overhead * 10.0) + avg_run_time * 0.2
     )
     metrics = {
         "qose_depth": avg_depth,
@@ -211,7 +216,7 @@ def _evaluate_worker(program_path, queue):
     try:
         metrics, artifacts = _evaluate_impl(program_path)
     except Exception as exc:
-        metrics = {"combined_score": 0.0}
+        metrics = {"combined_score": -1000.0}
         artifacts = {"info": f"Evaluation failed: {exc}"}
     queue.put({"metrics": metrics, "artifacts": artifacts})
 
@@ -230,15 +235,15 @@ def evaluate(program_path):
         proc.terminate()
         proc.join()
         return EvaluationResult(
-            metrics={"combined_score": 0.0},
+            metrics={"combined_score": -1000.0},
             artifacts={"info": f"Timeout after {timeout_sec}s"},
         )
     if queue.empty():
         return EvaluationResult(
-            metrics={"combined_score": 0.0},
+            metrics={"combined_score": -1000.0},
             artifacts={"info": "No result returned"},
         )
     result = queue.get()
-    metrics = result.get("metrics", {"combined_score": 0.0})
+    metrics = result.get("metrics", {"combined_score": -1000.0})
     artifacts = result.get("artifacts", {})
     return EvaluationResult(metrics=metrics, artifacts=artifacts)
