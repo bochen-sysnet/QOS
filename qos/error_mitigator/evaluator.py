@@ -1,6 +1,7 @@
 import importlib.util
 import logging
 import multiprocessing as mp
+import numbers
 import os
 import random
 import time
@@ -22,6 +23,22 @@ logging.getLogger("qiskit").setLevel(logging.WARNING)
 logging.getLogger("qiskit.transpiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.compiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
+
+def _round_float_values(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral):
+        return round(float(value), 4)
+    if isinstance(value, dict):
+        return {k: _round_float_values(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_round_float_values(v) for v in value]
+    return value
+
+def _safe_ratio(numerator, denominator):
+    if denominator <= 0:
+        return float(numerator)
+    return float(numerator) / float(denominator)
 
 def _evaluate_impl(program_path):
     # Load candidate
@@ -48,7 +65,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
         seed = os.getenv("QOSE_SEED")
         if seed is None:
             if sample_count <= 1:
@@ -73,7 +90,8 @@ def _evaluate_impl(program_path):
     if unknown:
         return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
     sizes = [int(s) for s in os.getenv("QOSE_SIZES", "12").split(",") if s]
-    depth_sum = cnot_sum = overhead_sum = 0.0
+    depth_sum = cnot_sum = overhead_sum = run_time_sum = 0.0
+    qos_depth_sum = qos_cnot_sum = qos_overhead_sum = qos_run_time_sum = 0.0
     count = 0
     cases = []
 
@@ -95,9 +113,31 @@ def _evaluate_impl(program_path):
     ]
 
     total_run_time = 0.0
+    total_qos_run_time = 0.0
     for bench in benches:
         for size in sizes:
             qc = _load_qasm_circuit(bench, size)
+
+            # Baseline QOS
+            qos_q = Qernel(qc.copy())
+            qos_mitigator = ErrorMitigator(
+                size_to_reach=args.size_to_reach,
+                ideal_size_to_reach=args.ideal_size_to_reach,
+                budget=args.budget,
+                methods=[],
+                use_cost_search=args.qos_cost_search,
+                collect_timing=False,
+            )
+            t0 = time.perf_counter()
+            qos_q = qos_mitigator.run(qos_q)
+            qos_run_time = time.perf_counter() - t0
+            qos_m = _analyze_qernel(
+                qos_q,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            )
+            qos_circs = _extract_circuits(qos_q)
 
             # Evolved QOSE
             q = Qernel(qc.copy())
@@ -158,19 +198,40 @@ def _evaluate_impl(program_path):
             )
             qose_circs = _extract_circuits(q)
             total_run_time += run_time
+            total_qos_run_time += qos_run_time
 
-            depth_sum += qose_m["depth"]
-            cnot_sum += qose_m["num_nonlocal_gates"]
-            overhead_sum += len(qose_circs)
+            qose_depth = qose_m["depth"]
+            qose_cnot = qose_m["num_nonlocal_gates"]
+            qose_overhead = len(qose_circs)
+            qos_depth = qos_m["depth"]
+            qos_cnot = qos_m["num_nonlocal_gates"]
+            qos_overhead = len(qos_circs)
+
+            rel_depth = _safe_ratio(qose_depth, qos_depth)
+            rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
+            rel_overhead = _safe_ratio(qose_overhead, qos_overhead)
+            rel_run_time = _safe_ratio(run_time, qos_run_time)
+
+            depth_sum += rel_depth
+            cnot_sum += rel_cnot
+            overhead_sum += rel_overhead
+            run_time_sum += rel_run_time
+            qos_depth_sum += qos_depth
+            qos_cnot_sum += qos_cnot
+            qos_overhead_sum += qos_overhead
+            qos_run_time_sum += qos_run_time
             cases.append(
                 {
                     "bench": bench,
                     "size": size,
-                    "qose_depth": qose_m["depth"],
-                    "qose_cnot": qose_m["num_nonlocal_gates"],
-                    "qose_num_circuits": len(qose_circs),
-                    "evolved_run_sec": run_time,
-                    "cost_search_sec": mitigator._cost_search_time,
+                    "qose_depth": qose_depth,
+                    "qos_depth": qos_depth,
+                    "qose_cnot": qose_cnot,
+                    "qos_cnot": qos_cnot,
+                    "qose_num_circuits": qose_overhead,
+                    "qos_num_circuits": qos_overhead,
+                    "qose_run_sec": run_time,
+                    "qos_run_sec": qos_run_time,
                     "cost_search_calls": mitigator._cost_search_calls,
                     "gv_cost_calls": mitigator._gv_cost_calls,
                     "wc_cost_calls": mitigator._wc_cost_calls,
@@ -185,10 +246,9 @@ def _evaluate_impl(program_path):
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
     avg_overhead = overhead_sum / count
-
-    avg_run_time = (total_run_time / count) if count else 0.0
+    avg_run_time = run_time_sum / count
     combined_score = -(
-        avg_depth + avg_cnot + (avg_overhead * 10.0) + avg_run_time * 0.2
+        avg_depth + avg_cnot + avg_overhead + avg_run_time * 0.1
     )
     metrics = {
         "qose_depth": avg_depth,
@@ -197,19 +257,17 @@ def _evaluate_impl(program_path):
         "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
-    avg_cost_search = 0.0
-    total_cost_search_calls = sum(c["cost_search_calls"] for c in cases)
-    if total_cost_search_calls:
-        total_cost_search = sum(c["cost_search_sec"] for c in cases)
-        avg_cost_search = total_cost_search / total_cost_search_calls
     artifacts = {
-        "evolved_run_sec_avg": (total_run_time / count) if count else 0.0,
-        "cost_search_sec_avg": avg_cost_search,
+        "qose_run_sec_avg": (total_run_time / count) if count else 0.0,
+        "qos_run_sec_avg": (total_qos_run_time / count) if count else 0.0,
         "gv_cost_calls_total": sum(c["gv_cost_calls"] for c in cases),
         "wc_cost_calls_total": sum(c["wc_cost_calls"] for c in cases),
+        "qos_depth_avg": (qos_depth_sum / count) if count else 0.0,
+        "qos_cnot_avg": (qos_cnot_sum / count) if count else 0.0,
+        "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,
         "cases": cases,
     }
-    return metrics, artifacts
+    return _round_float_values(metrics), _round_float_values(artifacts)
 
 
 def _evaluate_worker(program_path, queue):
@@ -246,4 +304,7 @@ def evaluate(program_path):
     result = queue.get()
     metrics = result.get("metrics", {"combined_score": -1000.0})
     artifacts = result.get("artifacts", {})
-    return EvaluationResult(metrics=metrics, artifacts=artifacts)
+    return EvaluationResult(
+        metrics=_round_float_values(metrics),
+        artifacts=_round_float_values(artifacts),
+    )
