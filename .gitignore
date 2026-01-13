@@ -50,3 +50,6 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# evolved codes
+openaievolve/
+

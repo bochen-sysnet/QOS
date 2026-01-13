@@ -1,6 +1,5 @@
 import importlib.util
 import logging
-import multiprocessing as mp
 import numbers
 import os
 import random
@@ -55,7 +54,6 @@ def _evaluate_impl(program_path):
         budget=int(os.getenv("QOSE_BUDGET", "3")),
         qos_cost_search=True,
         collect_timing=False,
-        timeout_sec=int(os.getenv("QOSE_TIMEOUT_SEC", "45")),
         metric_mode="fragment",
         metrics_baseline="kolkata",
         metrics_optimization_level=3,
@@ -66,7 +64,7 @@ def _evaluate_impl(program_path):
     else:
         bench_choices = [b for b, _label in BENCHES]
         sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
-        seed = os.getenv("QOSE_SEED")
+        seed = 42
         if seed is None:
             if sample_count <= 1:
                 benches = [bench_choices[0]]
@@ -172,11 +170,11 @@ def _evaluate_impl(program_path):
 
             def _wrap_cost_search(*args, **kwargs):
                 t0 = time.perf_counter()
-                size, costs, cost_time, timed_out = orig_cost_search(*args, **kwargs)
+                size, method, cost_time, timed_out = orig_cost_search(*args, **kwargs)
                 dt = time.perf_counter() - t0
                 mitigator._cost_search_calls += 1
                 mitigator._cost_search_time += dt
-                return size, costs, cost_time, timed_out
+                return size, method, cost_time, timed_out
 
             mitigator.cost_search = _wrap_cost_search
             def _gv_cost(self, *args, **kwargs):
@@ -281,40 +279,12 @@ def _evaluate_impl(program_path):
     return _round_float_values(metrics), _round_float_values(artifacts)
 
 
-def _evaluate_worker(program_path, queue):
+def evaluate(program_path):
     try:
         metrics, artifacts = _evaluate_impl(program_path)
     except Exception as exc:
         metrics = {"combined_score": -1000.0}
         artifacts = {"info": f"Evaluation failed: {exc}"}
-    queue.put({"metrics": metrics, "artifacts": artifacts})
-
-
-def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_TIMEOUT_SEC", "100"))
-    if timeout_sec <= 0:
-        metrics, artifacts = _evaluate_impl(program_path)
-        return EvaluationResult(metrics=metrics, artifacts=artifacts)
-
-    queue = mp.Queue()
-    proc = mp.Process(target=_evaluate_worker, args=(program_path, queue))
-    proc.start()
-    proc.join(timeout_sec)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
-        return EvaluationResult(
-            metrics={"combined_score": -1000.0},
-            artifacts={"info": f"Timeout after {timeout_sec}s"},
-        )
-    if queue.empty():
-        return EvaluationResult(
-            metrics={"combined_score": -1000.0},
-            artifacts={"info": "No result returned"},
-        )
-    result = queue.get()
-    metrics = result.get("metrics", {"combined_score": -1000.0})
-    artifacts = result.get("artifacts", {})
     return EvaluationResult(
         metrics=_round_float_values(metrics),
         artifacts=_round_float_values(artifacts),

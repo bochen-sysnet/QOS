@@ -9,7 +9,7 @@ diff_based_evolution: false
 max_code_length: 30000
 
 early_stopping_patience: null
-convergence_threshold: 0.001
+convergence_threshold: 0.0005
 early_stopping_metric: "combined_score"
 
 llm:
@@ -43,6 +43,7 @@ prompt:
       - Heuristics include but are not limited to:
           * Prefer GV or larger size_to_reach when num_qubits is high or nonlocal density is low.
           * Favor GV when liveness > program_communication or entanglement_ratio is low.
+      - size_to_reach is required to be >=2 and <= num_qubits. If == num_qubits, it will be no-op. If == 1, it is trivial.
 
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
@@ -50,7 +51,7 @@ prompt:
       - qose_overhead: average number of circuits to run ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
-          combined_score = -(qose_depth + qose_cnot + qose_overhead * 10.0 + avg_run_time * 0.2)
+          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time * 0.1)
 
     IMPORTANT:
       - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
@@ -85,9 +86,9 @@ prompt:
       pc = metadata["program_communication"]
       liveness = metadata['liveness']
       if liveness > pc:
-          return size_to_reach, "WC", 0.0
+          return size_to_reach, "WC"
       else:
-          return size_to_reach, "GV", 0.0
+          return size_to_reach, "GV"
 
     HARD CONSTRAINTS:
       - Deterministic execution (no randomness).

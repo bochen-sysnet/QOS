@@ -66,4 +66,4 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     self._qose_gv_cost_trace = gv_cost_trace
     self._qose_wc_cost_trace = wc_cost_trace
 
-    return size_to_reach, method, 0.0
+    return size_to_reach, method

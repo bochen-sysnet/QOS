@@ -173,6 +173,7 @@ def _find_qose_program(path_hint: str) -> Optional[Path]:
     candidates.extend(
         [
             str(ROOT / "openevolve_output" / "best" / "best_program.py"),
+            str(ROOT / "openaievolve" / "evolved_target.py"),
             str(ROOT / "qos" / "error_mitigator" / "evolution_target.py"),
         ]
     )

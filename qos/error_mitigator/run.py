@@ -1,9 +1,27 @@
-from multiprocessing import Process, Value
+from multiprocessing import Process, Queue, Value
 import os
 import time
 
 from qos.error_mitigator.analyser import *
 from qos.error_mitigator.optimiser import *
+
+_COST_SEARCH_ATTRS = (
+    "_qose_cost_search_input_size",
+    "_qose_cost_search_budget",
+    "_qose_cost_search_output_size",
+    "_qose_cost_search_method",
+    "_qose_gv_cost_trace",
+    "_qose_wc_cost_trace",
+)
+
+
+def _cost_search_worker(mitigator, q, size_to_reach, budget, queue):
+    try:
+        size, method = mitigator._cost_search_impl(q, size_to_reach, budget)
+        attrs = {name: getattr(mitigator, name, None) for name in _COST_SEARCH_ATTRS}
+        queue.put({"ok": True, "size": size, "method": method, "attrs": attrs})
+    except Exception as exc:
+        queue.put({"ok": False, "error": str(exc)})
 
 class ErrorMitigator():
     budget: int
@@ -99,10 +117,7 @@ class ErrorMitigator():
         return {"GV": gv_cost, "WC": wc_cost}
 
     def _cost_search_impl(self, q: Qernel, size_to_reach: int, budget: int):
-        cost_time = 0.0
-        t0 = time.perf_counter()
         costs = self.computeCuttingCosts(q, size_to_reach)
-        cost_time += time.perf_counter() - t0
         max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
         if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
             print(
@@ -117,9 +132,7 @@ class ErrorMitigator():
             if max_iters > 0 and iter_ctr > max_iters:
                 break
             size_to_reach = size_to_reach - 1
-            t0 = time.perf_counter()
             costs = self.computeCuttingCosts(q, size_to_reach)
-            cost_time += time.perf_counter() - t0
             if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
                 print(
                     f"[QOS] cost_search shrink iter={iter_ctr} size_to_reach={size_to_reach} "
@@ -133,9 +146,7 @@ class ErrorMitigator():
             if max_iters > 0 and iter_ctr > max_iters:
                 break
             size_to_reach = size_to_reach + 1
-            t0 = time.perf_counter()
             costs = self.computeCuttingCosts(q, size_to_reach)
-            cost_time += time.perf_counter() - t0
             if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
                 print(
                     f"[QOS] cost_search grow iter={iter_ctr} size_to_reach={size_to_reach} "
@@ -148,13 +159,40 @@ class ErrorMitigator():
             method = "GV"
         else:
             method = "WC" 
-        return size_to_reach, method, cost_time
+        return size_to_reach, method
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
-        size_to_reach, method, cost_time = self._cost_search_impl(
-            q, size_to_reach, budget
+        t0 = time.perf_counter()
+        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
+        if timeout_sec <= 0:
+            size_to_reach, method = self._cost_search_impl(q, size_to_reach, budget)
+            cost_time = time.perf_counter() - t0
+            return size_to_reach, method, cost_time, False
+
+        queue = Queue()
+        proc = Process(
+            target=_cost_search_worker,
+            args=(self, q, size_to_reach, budget, queue),
         )
-        return size_to_reach, method, cost_time, False
+        proc.start()
+        proc.join(timeout_sec)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            cost_time = time.perf_counter() - t0
+            return size_to_reach, "GV", cost_time, True
+
+        cost_time = time.perf_counter() - t0
+        if queue.empty():
+            return size_to_reach, "GV", cost_time, True
+
+        result = queue.get()
+        if not result.get("ok"):
+            return size_to_reach, "GV", cost_time, True
+
+        for name, value in result.get("attrs", {}).items():
+            setattr(self, name, value)
+        return result["size"], result["method"], cost_time, False
     
     def applyGV(self, q: Qernel, size_to_reach: int):
         if self.methods["GV"]:
