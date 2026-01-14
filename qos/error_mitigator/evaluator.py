@@ -63,7 +63,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
         seed = None
         if seed is None:
             if sample_count <= 1:
@@ -112,6 +112,10 @@ def _evaluate_impl(program_path):
 
     total_run_time = 0.0
     total_qos_run_time = 0.0
+    total_gv_calls = 0
+    total_wc_calls = 0
+    total_qos_gv_calls = 0
+    total_qos_wc_calls = 0
     for bench in benches:
         for size in sizes:
             qc = _load_qasm_circuit(bench, size)
@@ -126,9 +130,13 @@ def _evaluate_impl(program_path):
                 use_cost_search=args.qos_cost_search,
                 collect_timing=False,
             )
+            qos_mitigator._gv_cost_calls = 0
+            qos_mitigator._wc_cost_calls = 0
             t0 = time.perf_counter()
             qos_q = qos_mitigator.run(qos_q)
             qos_run_time = time.perf_counter() - t0
+            total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
+            total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
             qos_m = _analyze_qernel(
                 qos_q,
                 args.metric_mode,
@@ -215,7 +223,6 @@ def _evaluate_impl(program_path):
             rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
             rel_overhead = _safe_ratio(qose_overhead, qos_overhead)
             rel_run_time = _safe_ratio(run_time, qos_run_time)
-
             depth_sum += rel_depth
             cnot_sum += rel_cnot
             overhead_sum += rel_overhead
@@ -224,6 +231,22 @@ def _evaluate_impl(program_path):
             qos_cnot_sum += qos_cnot
             qos_overhead_sum += qos_overhead
             qos_run_time_sum += qos_run_time
+            gv_calls = mitigator._gv_cost_calls
+            wc_calls = mitigator._wc_cost_calls
+            gv_trace = mitigator._qose_gv_cost_trace
+            wc_trace = mitigator._qose_wc_cost_trace
+            if gv_trace is not None and not isinstance(gv_trace, (str, bytes)):
+                try:
+                    gv_calls = len(gv_trace)
+                except TypeError:
+                    pass
+            if wc_trace is not None and not isinstance(wc_trace, (str, bytes)):
+                try:
+                    wc_calls = len(wc_trace)
+                except TypeError:
+                    pass
+            total_gv_calls += gv_calls
+            total_wc_calls += wc_calls
             cases.append(
                 {
                     "bench": bench,
@@ -240,8 +263,6 @@ def _evaluate_impl(program_path):
                     "qose_method": mitigator._qose_cost_search_method,
                     "qose_gv_cost_trace": mitigator._qose_gv_cost_trace,
                     "qose_wc_cost_trace": mitigator._qose_wc_cost_trace,
-                    "gv_cost_calls": mitigator._gv_cost_calls,
-                    "wc_cost_calls": mitigator._wc_cost_calls,
                     "input_features": input_features,
                 }
             )
@@ -254,9 +275,7 @@ def _evaluate_impl(program_path):
     avg_cnot = cnot_sum / count
     avg_overhead = overhead_sum / count
     avg_run_time = run_time_sum / count
-    combined_score = -(
-        avg_depth + avg_cnot + avg_overhead + avg_run_time * 0.1
-    )
+    combined_score = -(avg_depth + avg_cnot + avg_overhead + avg_run_time)
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,
@@ -269,8 +288,10 @@ def _evaluate_impl(program_path):
         "qose_budget": args.budget,
         "qose_run_sec_avg": (total_run_time / count) if count else 0.0,
         "qos_run_sec_avg": (total_qos_run_time / count) if count else 0.0,
-        "gv_cost_calls_total": sum(c["gv_cost_calls"] for c in cases),
-        "wc_cost_calls_total": sum(c["wc_cost_calls"] for c in cases),
+        "gv_cost_calls_total": total_gv_calls,
+        "wc_cost_calls_total": total_wc_calls,
+        "qos_gv_cost_calls_total": total_qos_gv_calls,
+        "qos_wc_cost_calls_total": total_qos_wc_calls,
         "qos_depth_avg": (qos_depth_sum / count) if count else 0.0,
         "qos_cnot_avg": (qos_cnot_sum / count) if count else 0.0,
         "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,

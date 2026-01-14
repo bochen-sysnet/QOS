@@ -28,8 +28,7 @@ prompt:
     in qos/error_mitigator/evolution_target.py.
 
     GENERALIZATION REQUIREMENT (CRITICAL):
-    - The evaluation will typically use a RANDOM subset of circuits (often 3 per iteration).
-      Do NOT overfit to a small set of benchmarks.
+    - The evaluation will use a set of 9 circuits.
     - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.).
     - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
 
@@ -71,7 +70,7 @@ prompt:
       - qose_overhead: average number of circuits to run ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
-          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time * 0.1)
+          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
 
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
       - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
@@ -81,8 +80,6 @@ prompt:
         qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
       - qose_output_size, qose_method
       - qose_gv_cost_trace, qose_wc_cost_trace
-      - gv_cost_calls: number of GV cost calls for the case
-      - wc_cost_calls: number of WC cost calls for the case
       Use artifacts to diagnose decisions.
 
     ARTIFACTS PROVIDED BY EVALUATOR (summary):
@@ -92,6 +89,8 @@ prompt:
       - qos_run_sec_avg: average runtime of baseline QOS
       - gv_cost_calls_total: total GV cost calls
       - wc_cost_calls_total: total WC cost calls
+      - qos_gv_cost_calls_total: total GV cost calls for baseline QOS
+      - qos_wc_cost_calls_total: total WC cost calls for baseline QOS
       - qos_depth_avg: average absolute depth of QOS
       - qos_cnot_avg: average absolute nonlocal gate count of QOS
       - qos_overhead_avg: average absolute number of QOS circuits

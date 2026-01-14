@@ -6,6 +6,8 @@ from qos.error_mitigator.analyser import *
 from qos.error_mitigator.optimiser import *
 
 _COST_SEARCH_ATTRS = (
+    "_gv_cost_calls",
+    "_wc_cost_calls",
     "_qose_cost_search_input_size",
     "_qose_cost_search_budget",
     "_qose_cost_search_output_size",
@@ -70,6 +72,10 @@ class ErrorMitigator():
         
     def computeCuttingCosts(self, q: Qernel, size_to_reach: int):
         verbose = os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}
+        if not hasattr(self, "_gv_cost_calls"):
+            self._gv_cost_calls = 0
+        if not hasattr(self, "_wc_cost_calls"):
+            self._wc_cost_calls = 0
         gv_sec = 0.0
         wc_sec = 0.0
         use_gv = self.methods.get("GV", True)
@@ -83,6 +89,7 @@ class ErrorMitigator():
         wc_cost = Value("i", 1000)
 
         if use_gv:
+            self._gv_cost_calls += 1
             p = Process(target=gv_pass.cost, args=(q, gv_cost))
             t0 = time.perf_counter()
             p.start()
@@ -96,6 +103,7 @@ class ErrorMitigator():
             gv_cost = 1000
 
         if use_wc:
+            self._wc_cost_calls += 1
             p = Process(target=wc_pass.cost, args=(q, wc_cost))
             t0 = time.perf_counter()
             p.start()
