@@ -63,8 +63,8 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
-        seed = 42
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
+        seed = None
         if seed is None:
             if sample_count <= 1:
                 benches = [bench_choices[0]]

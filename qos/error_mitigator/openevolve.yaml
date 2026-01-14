@@ -24,26 +24,46 @@ llm:
 
 prompt:
   system_message: |
-    You are OpenEvolve. You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget).
+   You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget)
+    in qos/error_mitigator/evolution_target.py.
 
-    CRITICAL OUTPUT REQUIREMENT:
-      - Always output the ENTIRE FILE (all imports + full evolved_cost_search definition), not just the OE region.
-      - HOWEVER, you MUST ONLY MODIFY code between markers '# OE_BEGIN' and '# OE_END'.
-      - Do not change imports, module-level code, class/function signatures, or anything outside markers.
+    GENERALIZATION REQUIREMENT (CRITICAL):
+    - The evaluation will typically use a RANDOM subset of circuits (often 3 per iteration).
+      Do NOT overfit to a small set of benchmarks.
+    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.).
+    - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
 
-    TASK CONTEXT:
-      - Each Qernel has unique metadata properties from q.get_metadata(); use them to decide how to apply
-        GVOptimalDecompositionPass or OptimalWireCuttingPass and to adjust size_to_reach. They are extracted in the target code.
-        Available keys (from BasicAnalysisPass and SupermarqFeaturesAnalysisPass) include:
-          * depth, num_qubits, num_clbits, num_nonlocal_gates, num_connected_components,
-            number_instructions, num_measurements, num_cnot_gates
-          * program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-      - The evolved_cost_search output (size_to_reach, method) determines whether GV or WC is applied
-        to the circuit and which size_to_reach is targeted for the method.
-      - Heuristics include but are not limited to:
-          * Prefer GV or larger size_to_reach when num_qubits is high or nonlocal density is low.
-          * Favor GV when liveness > program_communication or entanglement_ratio is low.
-      - size_to_reach is required to be >=2 and <= num_qubits. If == num_qubits, it will be no-op. If == 1, it is trivial.
+    FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
+    - Do NOT change the function signature.
+      It MUST remain: evolved_cost_search(self, q, size_to_reach, budget)
+    - It MUST return EXACTLY 3 values:
+        (size_to_reach: int, method: str, score: float)
+      where method is "GV" or "WC".
+    - If you violate signature/return arity, evaluation will fail.
+
+    CONTEXT:
+    The input q is a Qernel. It contains metadata computed elsewhere, accessible via:
+      input_meta = q.get_metadata()
+
+    Useful fields may include:
+      depth, num_qubits, num_clbits, num_nonlocal_gates, num_connected_components,
+      number_instructions, num_measurements, num_cnot_gates,
+      program_communication, liveness, parallelism, measurement,
+      entanglement_ratio, critical_depth.
+
+    IMPORTANT PRACTICAL CONSTRAINTS:
+    - `budget` is only meaningful for your cost-search logic (i.e., your own GV/WC cost queries).
+      Do not assume downstream will enforce budget.
+    - If size_to_reach >= num_qubits, the decomposition can become a no-op.
+      Use that ONLY as an explicit fallback when costs indicate everything else is too expensive.
+      Prefer to clamp sizes into a meaningful range (e.g., [2, num_qubits-1]) for real action.
+
+    EFFICIENCY / GENERALIZATION GUIDELINES (HIGH IMPACT):
+    - Minimize gv/wc cost calls. Avoid long +/-1 stepping loops.
+      Prefer a small number of probes + bounded search (e.g., check a few candidate sizes,
+      or use a short binary/ternary-style search on a clamped interval).
+    - Use cheap metadata heuristics first; only call compute_*_cost when needed.
+    - Keep behavior monotone and stable: similar circuits should yield similar decisions.
 
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
@@ -52,10 +72,6 @@ prompt:
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
           combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time * 0.1)
-
-    IMPORTANT:
-      - budget is the constraint for baseline QOS and is NOT necessarily a hard constraint for evolved_cost_search.
-        You may treat it only as a soft heuristic.
 
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
       - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
@@ -67,7 +83,7 @@ prompt:
       - qose_gv_cost_trace, qose_wc_cost_trace
       - gv_cost_calls: number of GV cost calls for the case
       - wc_cost_calls: number of WC cost calls for the case
-      Use artifacts to diagnose regressions and avoid repeated computeCuttingCosts loops.
+      Use artifacts to diagnose decisions.
 
     ARTIFACTS PROVIDED BY EVALUATOR (summary):
       - qose_input_size: input size_to_reach for all cases
@@ -90,11 +106,7 @@ prompt:
       else:
           return size_to_reach, "GV"
 
-    HARD CONSTRAINTS:
-      - Deterministic execution (no randomness).
-      - Do not introduce new imports or new module dependencies.
-
-    IMPORTANT LEVERS TO EXPLORE (must explore across evolution):
+    POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
 
       B) Explore size_to_reach efficiently instead of using two while loops iteratively.
