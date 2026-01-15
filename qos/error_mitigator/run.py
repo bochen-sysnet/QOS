@@ -1,4 +1,5 @@
 from multiprocessing import Process, Queue, Value
+import multiprocessing as mp
 import os
 import time
 
@@ -19,13 +20,96 @@ _COST_SEARCH_ATTRS = (
 )
 
 
-def _cost_search_worker(mitigator, q, size_to_reach, budget, queue):
+def compute_gv_cost(q: Qernel, size_to_reach: int) -> int:
+    gv_pass = GVOptimalDecompositionPass(size_to_reach)
+    gv_cost_value = Value("i", 0)
+    gv_pass.cost(q, gv_cost_value)
+    return gv_cost_value.value
+
+
+def compute_wc_cost(q: Qernel, size_to_reach: int) -> int:
+    wc_pass = OptimalWireCuttingPass(size_to_reach)
+    wc_cost_value = Value("i", 0)
+    wc_pass.cost(q, wc_cost_value)
+    return wc_cost_value.value
+
+
+def _cost_search_worker(
+    mitigator,
+    q,
+    size_to_reach,
+    budget,
+    queue,
+    state,
+    gv_cost_trace,
+    wc_cost_trace,
+    gv_time_trace,
+    wc_time_trace,
+):
+    gv_cost_orig = GVOptimalDecompositionPass.cost
+    wc_cost_orig = OptimalWireCuttingPass.cost
     try:
+        mitigator._qose_cost_search_input_size = size_to_reach
+        mitigator._qose_cost_search_budget = budget
+        mitigator._qose_cost_search_output_size = None
+        mitigator._qose_cost_search_method = None
+        mitigator._qose_gv_cost_trace = gv_cost_trace
+        mitigator._qose_wc_cost_trace = wc_cost_trace
+        mitigator._qose_gv_time_trace = gv_time_trace
+        mitigator._qose_wc_time_trace = wc_time_trace
+        state["size"] = size_to_reach
+        state["gv_cost"] = None
+        state["wc_cost"] = None
+
+        def _gv_cost(self, *args, **kwargs):
+            t0 = time.perf_counter()
+            result = gv_cost_orig(self, *args, **kwargs)
+            dt = time.perf_counter() - t0
+            cost_val = None
+            if len(args) >= 2:
+                cost_val = args[1]
+            else:
+                cost_val = kwargs.get("cost") or kwargs.get("cost_value")
+            if hasattr(cost_val, "value"):
+                cost_val = cost_val.value
+            gv_cost_trace.append(cost_val)
+            gv_time_trace.append(dt)
+            state["size"] = getattr(self, "_size_to_reach", state.get("size"))
+            state["gv_cost"] = cost_val
+            return result
+
+        def _wc_cost(self, *args, **kwargs):
+            t0 = time.perf_counter()
+            result = wc_cost_orig(self, *args, **kwargs)
+            dt = time.perf_counter() - t0
+            cost_val = None
+            if len(args) >= 2:
+                cost_val = args[1]
+            else:
+                cost_val = kwargs.get("cost") or kwargs.get("cost_value")
+            if hasattr(cost_val, "value"):
+                cost_val = cost_val.value
+            wc_cost_trace.append(cost_val)
+            wc_time_trace.append(dt)
+            state["size"] = getattr(self, "_size_to_reach", state.get("size"))
+            state["wc_cost"] = cost_val
+            return result
+
+        GVOptimalDecompositionPass.cost = _gv_cost
+        OptimalWireCuttingPass.cost = _wc_cost
+
         size, method = mitigator._cost_search_impl(q, size_to_reach, budget)
+        mitigator._qose_cost_search_output_size = size
+        mitigator._qose_cost_search_method = method
+        state["size"] = size
+        state["method"] = method
         attrs = {name: getattr(mitigator, name, None) for name in _COST_SEARCH_ATTRS}
         queue.put({"ok": True, "size": size, "method": method, "attrs": attrs})
     except Exception as exc:
         queue.put({"ok": False, "error": str(exc)})
+    finally:
+        GVOptimalDecompositionPass.cost = gv_cost_orig
+        OptimalWireCuttingPass.cost = wc_cost_orig
 
 class ErrorMitigator():
     budget: int
@@ -177,34 +261,107 @@ class ErrorMitigator():
         t0 = time.perf_counter()
         timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
         if timeout_sec <= 0:
+            self._qose_cost_search_input_size = size_to_reach
+            self._qose_cost_search_budget = budget
             size_to_reach, method = self._cost_search_impl(q, size_to_reach, budget)
             cost_time = time.perf_counter() - t0
+            self._qose_cost_search_output_size = size_to_reach
+            self._qose_cost_search_method = method
             return size_to_reach, method, cost_time, False
 
         queue = Queue()
+        manager = mp.Manager()
+        state = manager.dict()
+        gv_cost_trace = manager.list()
+        wc_cost_trace = manager.list()
+        gv_time_trace = manager.list()
+        wc_time_trace = manager.list()
         proc = Process(
             target=_cost_search_worker,
-            args=(self, q, size_to_reach, budget, queue),
+            args=(
+                self,
+                q,
+                size_to_reach,
+                budget,
+                queue,
+                state,
+                gv_cost_trace,
+                wc_cost_trace,
+                gv_time_trace,
+                wc_time_trace,
+            ),
         )
         proc.start()
         proc.join(timeout_sec)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join()
+        try:
             cost_time = time.perf_counter() - t0
-            return size_to_reach, "GV", cost_time, True
+            self._qose_cost_search_input_size = size_to_reach
+            self._qose_cost_search_budget = budget
+            self._qose_gv_cost_trace = list(gv_cost_trace)
+            self._qose_wc_cost_trace = list(wc_cost_trace)
+            self._qose_gv_time_trace = list(gv_time_trace)
+            self._qose_wc_time_trace = list(wc_time_trace)
 
-        cost_time = time.perf_counter() - t0
-        if queue.empty():
-            return size_to_reach, "GV", cost_time, True
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+                size = state.get("size", size_to_reach)
+                gv_cost = state.get("gv_cost")
+                wc_cost = state.get("wc_cost")
+                if gv_cost is not None and wc_cost is not None:
+                    method = "GV" if gv_cost <= wc_cost else "WC"
+                else:
+                    method = "GV"
+                self._qose_cost_search_output_size = size
+                self._qose_cost_search_method = method
+                return size, method, cost_time, True
 
-        result = queue.get()
-        if not result.get("ok"):
-            return size_to_reach, "GV", cost_time, True
+            if queue.empty():
+                size = state.get("size", size_to_reach)
+                gv_cost = state.get("gv_cost")
+                wc_cost = state.get("wc_cost")
+                if gv_cost is not None and wc_cost is not None:
+                    method = "GV" if gv_cost <= wc_cost else "WC"
+                else:
+                    method = "GV"
+                self._qose_cost_search_output_size = size
+                self._qose_cost_search_method = method
+                return size, method, cost_time, True
 
-        for name, value in result.get("attrs", {}).items():
-            setattr(self, name, value)
-        return result["size"], result["method"], cost_time, False
+            result = queue.get()
+            if not result.get("ok"):
+                size = state.get("size", size_to_reach)
+                gv_cost = state.get("gv_cost")
+                wc_cost = state.get("wc_cost")
+                if gv_cost is not None and wc_cost is not None:
+                    method = "GV" if gv_cost <= wc_cost else "WC"
+                else:
+                    method = "GV"
+                self._qose_cost_search_output_size = size
+                self._qose_cost_search_method = method
+                return size, method, cost_time, True
+
+            for name, value in result.get("attrs", {}).items():
+                if name in {
+                    "_qose_gv_cost_trace",
+                    "_qose_wc_cost_trace",
+                    "_qose_gv_time_trace",
+                    "_qose_wc_time_trace",
+                }:
+                    if value is None:
+                        continue
+                    try:
+                        setattr(self, name, list(value))
+                    except TypeError:
+                        setattr(self, name, value)
+                    continue
+                setattr(self, name, value)
+            return result["size"], result["method"], cost_time, False
+        finally:
+            try:
+                manager.shutdown()
+            except Exception:
+                pass
     
     def applyGV(self, q: Qernel, size_to_reach: int):
         if self.methods["GV"]:
@@ -316,28 +473,20 @@ class ErrorMitigator():
                     if self.collect_timing:
                         self.timings["cost_search"] = cost_time
 
-                    if timed_out:
+                    if method == "GV":
                         if self.collect_timing:
                             t0 = time.perf_counter()
-                            q = self.applyGV(q, self.size_to_reach)
+                            q = self.applyGV(q, size_to_reach)
                             self.timings["gv"] = time.perf_counter() - t0
                         else:
-                            q = self.applyGV(q, self.size_to_reach)
+                            q = self.applyGV(q, size_to_reach)
                     else:
-                        if method == "GV":
-                            if self.collect_timing:
-                                t0 = time.perf_counter()
-                                q = self.applyGV(q, size_to_reach)
-                                self.timings["gv"] = time.perf_counter() - t0
-                            else:
-                                q = self.applyGV(q, size_to_reach)
+                        if self.collect_timing:
+                            t0 = time.perf_counter()
+                            q = self.applyWC(q, size_to_reach)
+                            self.timings["wc"] = time.perf_counter() - t0
                         else:
-                            if self.collect_timing:
-                                t0 = time.perf_counter()
-                                q = self.applyWC(q, size_to_reach)
-                                self.timings["wc"] = time.perf_counter() - t0
-                            else:
-                                q = self.applyWC(q, size_to_reach)          
+                            q = self.applyWC(q, size_to_reach)          
             elif self.methods["GV"]:
                 if self.collect_timing:
                     t0 = time.perf_counter()
@@ -364,34 +513,26 @@ class ErrorMitigator():
                     q = self.applyBestCut(q, self.size_to_reach)
             else:
                 size_to_reach = self.size_to_reach
-                size_to_reach, costs, cost_time, timed_out = self.cost_search(
+                size_to_reach, method, cost_time, timed_out = self.cost_search(
                     q, size_to_reach, self.budget
                 )
                 if self.collect_timing:
                     self.timings["cost_search"] = cost_time
 
-                if timed_out:
+                if method == "GV":
                     if self.collect_timing:
                         t0 = time.perf_counter()
-                        q = self.applyGV(q, self.size_to_reach)
+                        q = self.applyGV(q, size_to_reach)
                         self.timings["gv"] = time.perf_counter() - t0
                     else:
-                        q = self.applyGV(q, self.size_to_reach)
-                elif costs["GV"] <= self.budget or costs["WC"] <= self.budget:
-                    if costs["GV"] <= costs["WC"] or (costs["GV"] == 0 and costs["WC"] == 0):
-                        if self.collect_timing:
-                            t0 = time.perf_counter()
-                            q = self.applyGV(q, size_to_reach)
-                            self.timings["gv"] = time.perf_counter() - t0
-                        else:
-                            q = self.applyGV(q, size_to_reach)
+                        q = self.applyGV(q, size_to_reach)
+                else:
+                    if self.collect_timing:
+                        t0 = time.perf_counter()
+                        q = self.applyWC(q, size_to_reach)
+                        self.timings["wc"] = time.perf_counter() - t0
                     else:
-                        if self.collect_timing:
-                            t0 = time.perf_counter()
-                            q = self.applyWC(q, size_to_reach)
-                            self.timings["wc"] = time.perf_counter() - t0
-                        else:
-                            q = self.applyWC(q, size_to_reach)
+                        q = self.applyWC(q, size_to_reach)
         elif self.methods["GV"]:
              if self.collect_timing:
                  t0 = time.perf_counter()
