@@ -1,115 +1,128 @@
 from multiprocessing import Process, Queue, Value
 import multiprocessing as mp
+import queue as queue_mod
 import os
 import time
 
 from qos.error_mitigator.analyser import *
 from qos.error_mitigator.optimiser import *
 
-_COST_SEARCH_ATTRS = (
-    "_gv_cost_calls",
-    "_wc_cost_calls",
-    "_qose_cost_search_input_size",
-    "_qose_cost_search_budget",
-    "_qose_cost_search_output_size",
-    "_qose_cost_search_method",
-    "_qose_gv_cost_trace",
-    "_qose_wc_cost_trace",
-    "_qose_gv_time_trace",
-    "_qose_wc_time_trace",
-)
+_TRACE_QUEUE = None
+
+
+def _emit_trace(event: dict) -> None:
+    if _TRACE_QUEUE is None:
+        return
+    try:
+        _TRACE_QUEUE.put_nowait(event)
+    except Exception:
+        pass
+
+
+def _drain_trace_queue(trace_queue) -> list:
+    events = []
+    while True:
+        try:
+            events.append(trace_queue.get_nowait())
+        except queue_mod.Empty:
+            break
+        except Exception:
+            break
+    return events
+
+
+def _choose_method(gv_cost, wc_cost) -> str:
+    if gv_cost is not None and wc_cost is not None:
+        return "GV" if gv_cost <= wc_cost else "WC"
+    return "GV"
+
+
+def _parse_trace_events(events, default_size):
+    gv_cost_trace = []
+    wc_cost_trace = []
+    gv_time_trace = []
+    wc_time_trace = []
+    last_size = default_size
+    last_gv_cost = None
+    last_wc_cost = None
+    for event in events:
+        kind = event.get("kind")
+        if kind == "PAIR":
+            size = event.get("size", last_size)
+            gv_cost = event.get("gv_cost")
+            wc_cost = event.get("wc_cost")
+            gv_sec = event.get("gv_sec")
+            wc_sec = event.get("wc_sec")
+            last_size = size
+            last_gv_cost = gv_cost
+            last_wc_cost = wc_cost
+            gv_cost_trace.append(gv_cost)
+            wc_cost_trace.append(wc_cost)
+            gv_time_trace.append(gv_sec)
+            wc_time_trace.append(wc_sec)
+        elif kind == "GV":
+            size = event.get("size", last_size)
+            gv_cost = event.get("cost")
+            gv_sec = event.get("sec")
+            last_size = size
+            last_gv_cost = gv_cost
+            gv_cost_trace.append(gv_cost)
+            gv_time_trace.append(gv_sec)
+        elif kind == "WC":
+            size = event.get("size", last_size)
+            wc_cost = event.get("cost")
+            wc_sec = event.get("sec")
+            last_size = size
+            last_wc_cost = wc_cost
+            wc_cost_trace.append(wc_cost)
+            wc_time_trace.append(wc_sec)
+    return (
+        gv_cost_trace,
+        wc_cost_trace,
+        gv_time_trace,
+        wc_time_trace,
+        last_size,
+        last_gv_cost,
+        last_wc_cost,
+    )
 
 
 def compute_gv_cost(q: Qernel, size_to_reach: int) -> int:
     gv_pass = GVOptimalDecompositionPass(size_to_reach)
     gv_cost_value = Value("i", 0)
+    t0 = time.perf_counter()
     gv_pass.cost(q, gv_cost_value)
-    return gv_cost_value.value
+    gv_sec = time.perf_counter() - t0
+    gv_cost = gv_cost_value.value
+    _emit_trace(
+        {"kind": "GV", "size": size_to_reach, "cost": gv_cost, "sec": gv_sec}
+    )
+    return gv_cost
 
 
 def compute_wc_cost(q: Qernel, size_to_reach: int) -> int:
     wc_pass = OptimalWireCuttingPass(size_to_reach)
     wc_cost_value = Value("i", 0)
+    t0 = time.perf_counter()
     wc_pass.cost(q, wc_cost_value)
-    return wc_cost_value.value
+    wc_sec = time.perf_counter() - t0
+    wc_cost = wc_cost_value.value
+    _emit_trace(
+        {"kind": "WC", "size": size_to_reach, "cost": wc_cost, "sec": wc_sec}
+    )
+    return wc_cost
 
 
-def _cost_search_worker(
-    mitigator,
-    q,
-    size_to_reach,
-    budget,
-    queue,
-    state,
-    gv_cost_trace,
-    wc_cost_trace,
-    gv_time_trace,
-    wc_time_trace,
-):
-    gv_cost_orig = GVOptimalDecompositionPass.cost
-    wc_cost_orig = OptimalWireCuttingPass.cost
+def _cost_search_worker(mitigator, q, size_to_reach, budget, result_queue, trace_queue):
+    global _TRACE_QUEUE
+    _TRACE_QUEUE = trace_queue
     try:
-        mitigator._qose_cost_search_input_size = size_to_reach
-        mitigator._qose_cost_search_budget = budget
-        mitigator._qose_cost_search_output_size = None
-        mitigator._qose_cost_search_method = None
-        mitigator._qose_gv_cost_trace = gv_cost_trace
-        mitigator._qose_wc_cost_trace = wc_cost_trace
-        mitigator._qose_gv_time_trace = gv_time_trace
-        mitigator._qose_wc_time_trace = wc_time_trace
-        state["size"] = size_to_reach
-        state["gv_cost"] = None
-        state["wc_cost"] = None
-
-        def _gv_cost(self, *args, **kwargs):
-            t0 = time.perf_counter()
-            result = gv_cost_orig(self, *args, **kwargs)
-            dt = time.perf_counter() - t0
-            cost_val = None
-            if len(args) >= 2:
-                cost_val = args[1]
-            else:
-                cost_val = kwargs.get("cost") or kwargs.get("cost_value")
-            if hasattr(cost_val, "value"):
-                cost_val = cost_val.value
-            gv_cost_trace.append(cost_val)
-            gv_time_trace.append(dt)
-            state["size"] = getattr(self, "_size_to_reach", state.get("size"))
-            state["gv_cost"] = cost_val
-            return result
-
-        def _wc_cost(self, *args, **kwargs):
-            t0 = time.perf_counter()
-            result = wc_cost_orig(self, *args, **kwargs)
-            dt = time.perf_counter() - t0
-            cost_val = None
-            if len(args) >= 2:
-                cost_val = args[1]
-            else:
-                cost_val = kwargs.get("cost") or kwargs.get("cost_value")
-            if hasattr(cost_val, "value"):
-                cost_val = cost_val.value
-            wc_cost_trace.append(cost_val)
-            wc_time_trace.append(dt)
-            state["size"] = getattr(self, "_size_to_reach", state.get("size"))
-            state["wc_cost"] = cost_val
-            return result
-
-        GVOptimalDecompositionPass.cost = _gv_cost
-        OptimalWireCuttingPass.cost = _wc_cost
-
         size, method = mitigator._cost_search_impl(q, size_to_reach, budget)
-        mitigator._qose_cost_search_output_size = size
-        mitigator._qose_cost_search_method = method
-        state["size"] = size
-        state["method"] = method
-        attrs = {name: getattr(mitigator, name, None) for name in _COST_SEARCH_ATTRS}
-        queue.put({"ok": True, "size": size, "method": method, "attrs": attrs})
+        result_queue.put({"ok": True, "size": size, "method": method})
     except Exception as exc:
-        queue.put({"ok": False, "error": str(exc)})
+        result_queue.put({"ok": False, "error": str(exc)})
     finally:
-        GVOptimalDecompositionPass.cost = gv_cost_orig
-        OptimalWireCuttingPass.cost = wc_cost_orig
+        _TRACE_QUEUE = None
 
 class ErrorMitigator():
     budget: int
@@ -208,6 +221,16 @@ class ErrorMitigator():
                 f"WC={wc_cost} ({wc_sec:.2f}s)",
                 flush=True,
             )
+        _emit_trace(
+            {
+                "kind": "PAIR",
+                "size": size_to_reach,
+                "gv_cost": gv_cost,
+                "wc_cost": wc_cost,
+                "gv_sec": gv_sec,
+                "wc_sec": wc_sec,
+            }
+        )
         self._last_gv_sec = gv_sec
         self._last_wc_sec = wc_sec
         return {"GV": gv_cost, "WC": wc_cost}
@@ -259,109 +282,91 @@ class ErrorMitigator():
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
         t0 = time.perf_counter()
-        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
+        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "60"))
         if timeout_sec <= 0:
-            self._qose_cost_search_input_size = size_to_reach
-            self._qose_cost_search_budget = budget
-            size_to_reach, method = self._cost_search_impl(q, size_to_reach, budget)
+            trace_queue = queue_mod.Queue()
+            global _TRACE_QUEUE
+            _TRACE_QUEUE = trace_queue
+            try:
+                self._qose_cost_search_input_size = size_to_reach
+                self._qose_cost_search_budget = budget
+                size_to_reach, method = self._cost_search_impl(q, size_to_reach, budget)
+            finally:
+                _TRACE_QUEUE = None
             cost_time = time.perf_counter() - t0
-            self._qose_cost_search_output_size = size_to_reach
-            self._qose_cost_search_method = method
-            return size_to_reach, method, cost_time, False
-
-        queue = Queue()
-        manager = mp.Manager()
-        state = manager.dict()
-        gv_cost_trace = manager.list()
-        wc_cost_trace = manager.list()
-        gv_time_trace = manager.list()
-        wc_time_trace = manager.list()
-        proc = Process(
-            target=_cost_search_worker,
-            args=(
-                self,
-                q,
-                size_to_reach,
-                budget,
-                queue,
-                state,
+            events = _drain_trace_queue(trace_queue)
+            (
                 gv_cost_trace,
                 wc_cost_trace,
                 gv_time_trace,
                 wc_time_trace,
-            ),
+                last_size,
+                last_gv_cost,
+                last_wc_cost,
+            ) = _parse_trace_events(events, size_to_reach)
+            self._qose_gv_cost_trace = gv_cost_trace
+            self._qose_wc_cost_trace = wc_cost_trace
+            self._qose_gv_time_trace = gv_time_trace
+            self._qose_wc_time_trace = wc_time_trace
+            self._qose_cost_search_output_size = size_to_reach
+            self._qose_cost_search_method = method
+            return size_to_reach, method, cost_time, False
+
+        result_queue = Queue()
+        trace_queue = Queue()
+        proc = Process(
+            target=_cost_search_worker,
+            args=(self, q, size_to_reach, budget, result_queue, trace_queue),
         )
         proc.start()
         proc.join(timeout_sec)
+        cost_time = time.perf_counter() - t0
+
+        events = _drain_trace_queue(trace_queue)
+        (
+            gv_cost_trace,
+            wc_cost_trace,
+            gv_time_trace,
+            wc_time_trace,
+            last_size,
+            last_gv_cost,
+            last_wc_cost,
+        ) = _parse_trace_events(events, size_to_reach)
+
+        self._qose_cost_search_input_size = size_to_reach
+        self._qose_cost_search_budget = budget
+        self._qose_gv_cost_trace = gv_cost_trace
+        self._qose_wc_cost_trace = wc_cost_trace
+        self._qose_gv_time_trace = gv_time_trace
+        self._qose_wc_time_trace = wc_time_trace
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            method = _choose_method(last_gv_cost, last_wc_cost)
+            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_method = method
+            return last_size, method, cost_time, True
+
         try:
-            cost_time = time.perf_counter() - t0
-            self._qose_cost_search_input_size = size_to_reach
-            self._qose_cost_search_budget = budget
-            self._qose_gv_cost_trace = list(gv_cost_trace)
-            self._qose_wc_cost_trace = list(wc_cost_trace)
-            self._qose_gv_time_trace = list(gv_time_trace)
-            self._qose_wc_time_trace = list(wc_time_trace)
+            result = result_queue.get_nowait()
+        except queue_mod.Empty:
+            method = _choose_method(last_gv_cost, last_wc_cost)
+            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_method = method
+            return last_size, method, cost_time, True
 
-            if proc.is_alive():
-                proc.terminate()
-                proc.join()
-                size = state.get("size", size_to_reach)
-                gv_cost = state.get("gv_cost")
-                wc_cost = state.get("wc_cost")
-                if gv_cost is not None and wc_cost is not None:
-                    method = "GV" if gv_cost <= wc_cost else "WC"
-                else:
-                    method = "GV"
-                self._qose_cost_search_output_size = size
-                self._qose_cost_search_method = method
-                return size, method, cost_time, True
+        if not result.get("ok"):
+            method = _choose_method(last_gv_cost, last_wc_cost)
+            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_method = method
+            return last_size, method, cost_time, True
 
-            if queue.empty():
-                size = state.get("size", size_to_reach)
-                gv_cost = state.get("gv_cost")
-                wc_cost = state.get("wc_cost")
-                if gv_cost is not None and wc_cost is not None:
-                    method = "GV" if gv_cost <= wc_cost else "WC"
-                else:
-                    method = "GV"
-                self._qose_cost_search_output_size = size
-                self._qose_cost_search_method = method
-                return size, method, cost_time, True
-
-            result = queue.get()
-            if not result.get("ok"):
-                size = state.get("size", size_to_reach)
-                gv_cost = state.get("gv_cost")
-                wc_cost = state.get("wc_cost")
-                if gv_cost is not None and wc_cost is not None:
-                    method = "GV" if gv_cost <= wc_cost else "WC"
-                else:
-                    method = "GV"
-                self._qose_cost_search_output_size = size
-                self._qose_cost_search_method = method
-                return size, method, cost_time, True
-
-            for name, value in result.get("attrs", {}).items():
-                if name in {
-                    "_qose_gv_cost_trace",
-                    "_qose_wc_cost_trace",
-                    "_qose_gv_time_trace",
-                    "_qose_wc_time_trace",
-                }:
-                    if value is None:
-                        continue
-                    try:
-                        setattr(self, name, list(value))
-                    except TypeError:
-                        setattr(self, name, value)
-                    continue
-                setattr(self, name, value)
-            return result["size"], result["method"], cost_time, False
-        finally:
-            try:
-                manager.shutdown()
-            except Exception:
-                pass
+        method = result["method"]
+        size = result["size"]
+        self._qose_cost_search_output_size = size
+        self._qose_cost_search_method = method
+        return size, method, cost_time, False
     
     def applyGV(self, q: Qernel, size_to_reach: int):
         if self.methods["GV"]:

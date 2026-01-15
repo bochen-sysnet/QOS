@@ -58,6 +58,9 @@ prompt:
       - Outputs:
           * size_to_reach: the chosen target size to use for the cutting/virtualization of the target circuit.
           * method: "GV" or "WC", which determines which technique is applied at that size.
+      - Cost logging and traces are handled outside this file (in qos/error_mitigator/run.py).
+        The helper functions compute_gv_cost/compute_wc_cost and trace collection live there,
+        so the evolved code only calls the helpers and never touches trace logic.
 
     IMPORTANT PRACTICAL CONSTRAINTS:
     - `budget` is only meaningful for your cost-search logic (i.e., your own GV/WC cost queries).
