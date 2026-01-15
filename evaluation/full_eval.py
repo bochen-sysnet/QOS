@@ -273,6 +273,22 @@ def _parse_methods(value: str, include_qose: bool) -> List[str]:
     return ordered
 
 
+def _append_cost_search_log(path: str, row: Dict[str, object]) -> None:
+    if not path:
+        return
+    needs_header = True
+    if os.path.exists(path):
+        try:
+            needs_header = os.path.getsize(path) == 0
+        except OSError:
+            needs_header = True
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 class SerialPool:
     def map(self, fn, iterable):
         return list(map(fn, iterable))
@@ -288,7 +304,31 @@ class _CountingMitigator(ErrorMitigator):
 
     def computeCuttingCosts(self, q: Qernel, size_to_reach: int):
         self.cost_search_calls += 1
-        return super().computeCuttingCosts(q, size_to_reach)
+        costs = super().computeCuttingCosts(q, size_to_reach)
+        log_path = getattr(self, "_trace_log_path", "")
+        if log_path:
+            row = {
+                "bench": getattr(self, "_trace_bench", ""),
+                "size": getattr(self, "_trace_size", ""),
+                "method": getattr(self, "_trace_method", ""),
+                "cost_search_call": self.cost_search_calls,
+                "size_to_reach": size_to_reach,
+                "budget": self.budget,
+                "gv_cost": costs.get("GV"),
+                "wc_cost": costs.get("WC"),
+                "gv_sec": getattr(self, "_last_gv_sec", 0.0),
+                "wc_sec": getattr(self, "_last_wc_sec", 0.0),
+            }
+            _append_cost_search_log(log_path, row)
+        if getattr(self, "_trace_verbose", False):
+            print(
+                f"[FullEval] cost_search call={self.cost_search_calls} "
+                f"size_to_reach={size_to_reach} budget={self.budget} "
+                f"GV={costs.get('GV')} ({getattr(self, '_last_gv_sec', 0.0):.2f}s) "
+                f"WC={costs.get('WC')} ({getattr(self, '_last_wc_sec', 0.0):.2f}s)",
+                flush=True,
+            )
+        return costs
 
 
 def _ensure_measurements(circuit: QuantumCircuit | VirtualCircuit) -> QuantumCircuit:
@@ -493,6 +533,8 @@ def _run_mitigator(
     methods: List[str],
     args,
     use_cost_search_override: Optional[bool] = None,
+    bench_name: str = "",
+    size_label: str | int | None = None,
 ) -> Tuple[Dict[str, int], Dict[str, float], List[QuantumCircuit]]:
     size_candidates = [args.size_to_reach, qc.num_qubits]
     budget = args.budget
@@ -504,7 +546,7 @@ def _run_mitigator(
         else:
             use_cost_search = bool(methods == [] and use_cost_search_override)
         mitigator_cls = ErrorMitigator
-        if args.collect_timing and methods == [] and use_cost_search:
+        if methods == [] and use_cost_search:
             mitigator_cls = _CountingMitigator
         mitigator = mitigator_cls(
             size_to_reach=size_to_reach,
@@ -514,6 +556,12 @@ def _run_mitigator(
             use_cost_search=use_cost_search,
             collect_timing=args.collect_timing,
         )
+        if isinstance(mitigator, _CountingMitigator):
+            mitigator._trace_log_path = getattr(args, "cost_search_log", "")
+            mitigator._trace_verbose = bool(args.verbose)
+            mitigator._trace_bench = bench_name
+            mitigator._trace_size = size_label if size_label is not None else qc.num_qubits
+            mitigator._trace_method = "QOS"
         try:
             use_alarm = not (methods == [] or "WC" in methods or "GV" in methods)
             if use_alarm:
@@ -1141,7 +1189,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
 
             if run_qos:
                 qos_t0 = time.perf_counter()
-                qos_m, qos_t, qos_circs = _run_mitigator(qc, [], args)
+                qos_m, qos_t, qos_circs = _run_mitigator(
+                    qc, [], args, bench_name=bench, size_label=size
+                )
                 if args.verbose:
                     print(
                         f"  qos depth={qos_m['depth']} cnot={qos_m['num_nonlocal_gates']} "
@@ -1151,7 +1201,12 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
             if run_qosn:
                 qosn_t0 = time.perf_counter()
                 qosn_m, qosn_t, qosn_circs = _run_mitigator(
-                    qc, [], args, use_cost_search_override=False
+                    qc,
+                    [],
+                    args,
+                    use_cost_search_override=False,
+                    bench_name=bench,
+                    size_label=size,
                 )
                 if args.verbose:
                     print(
@@ -1161,7 +1216,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     )
             if run_fq:
                 fq_t0 = time.perf_counter()
-                fq_m, fq_t, fq_circs = _run_mitigator(qc, ["QF"], args)
+                fq_m, fq_t, fq_circs = _run_mitigator(
+                    qc, ["QF"], args, bench_name=bench, size_label=size
+                )
                 if args.verbose:
                     print(
                         f"  frozen depth={fq_m['depth']} cnot={fq_m['num_nonlocal_gates']} "
@@ -1172,7 +1229,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
             if run_cutqc:
                 cutqc_methods = ["GV"] if args.cutqc_method == "gv" else ["WC"]
                 cutqc_t0 = time.perf_counter()
-                cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(qc, cutqc_methods, args)
+                cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(
+                    qc, cutqc_methods, args, bench_name=bench, size_label=size
+                )
                 if args.verbose:
                     print(
                         f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']} "
@@ -1594,6 +1653,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cost-search-log",
+        default="",
+        help="Optional path to write cost-search trace CSV (default: auto in out-dir).",
+    )
+    parser.add_argument(
         "--qose-program",
         default="",
         help=(
@@ -1622,6 +1686,10 @@ def main() -> None:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = args.tag.strip()
     tag_suffix = f"_{tag}" if tag else ""
+    if not args.cost_search_log:
+        args.cost_search_log = str(
+            out_dir / f"cost_search_trace_{timestamp}{tag_suffix}.csv"
+        )
 
     all_rows: List[Dict[str, object]] = []
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
@@ -1718,12 +1786,6 @@ def main() -> None:
             args, benches, sizes, qose_run, selected_methods
         )
 
-    csv_path = out_dir / f"relative_properties_compare_{timestamp}{tag_suffix}.csv"
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=all_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(all_rows)
-
     fidelity_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
     combined_path = _plot_combined(
         rel_by_size,
@@ -1735,7 +1797,6 @@ def main() -> None:
         fidelity_methods=fidelity_methods,
     )
 
-    print(f"Wrote metrics: {csv_path}")
     print(f"Wrote figure: {combined_path}")
     if args.cut_visualization and cut_circuits:
         cut_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]

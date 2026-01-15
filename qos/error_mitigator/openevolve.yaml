@@ -35,8 +35,8 @@ prompt:
     FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
     - Do NOT change the function signature.
       It MUST remain: evolved_cost_search(self, q, size_to_reach, budget)
-    - It MUST return EXACTLY 3 values:
-        (size_to_reach: int, method: str, score: float)
+    - It MUST return EXACTLY 2 values:
+        (size_to_reach: int, method: str)
       where method is "GV" or "WC".
     - If you violate signature/return arity, evaluation will fail.
 
@@ -49,6 +49,15 @@ prompt:
       number_instructions, num_measurements, num_cnot_gates,
       program_communication, liveness, parallelism, measurement,
       entanglement_ratio, critical_depth.
+
+    Inputs/Outputs:
+      - Inputs:
+          * q: the Qernel (quantum circuit container) whose metadata informs the decision.
+          * size_to_reach: the current target circuit size for cutting/virtualization search.
+          * budget: the cost threshold used to decide whether GV/WC is acceptable.
+      - Outputs:
+          * size_to_reach: the chosen target size to use for the cutting/virtualization of the target circuit.
+          * method: "GV" or "WC", which determines which technique is applied at that size.
 
     IMPORTANT PRACTICAL CONSTRAINTS:
     - `budget` is only meaningful for your cost-search logic (i.e., your own GV/WC cost queries).
@@ -80,6 +89,7 @@ prompt:
         qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
       - qose_output_size, qose_method
       - qose_gv_cost_trace, qose_wc_cost_trace
+      - qose_gv_time_trace, qose_wc_time_trace
       Use artifacts to diagnose decisions.
 
     ARTIFACTS PROVIDED BY EVALUATOR (summary):

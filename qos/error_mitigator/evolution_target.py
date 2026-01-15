@@ -1,4 +1,5 @@
 from multiprocessing import Value
+import time
 
 from qos.error_mitigator.optimiser import (
     GVOptimalDecompositionPass,
@@ -25,37 +26,45 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     critical_depth = metadata.get("critical_depth", 0.0)
 
     input_size = size_to_reach
-    
-    # OE_BEGIN
+    gv_cost_trace = []
+    wc_cost_trace = []
+    gv_time_trace = []
+    wc_time_trace = []
+
     def compute_gv_cost(q, size_to_reach):
         gv_pass = GVOptimalDecompositionPass(size_to_reach)
         gv_cost_value = Value("i", 0)
+        t0 = time.perf_counter()
         gv_pass.cost(q, gv_cost_value)
-        return gv_cost_value.value
+        gv_sec = time.perf_counter() - t0
+        gv_cost = gv_cost_value.value
+        gv_cost_trace.append(gv_cost)
+        gv_time_trace.append(gv_sec)
+        return gv_cost
 
     def compute_wc_cost(q, size_to_reach):
         wc_pass = OptimalWireCuttingPass(size_to_reach)
         wc_cost_value = Value("i", 0)
+        t0 = time.perf_counter()
         wc_pass.cost(q, wc_cost_value)
-        return wc_cost_value.value
+        wc_sec = time.perf_counter() - t0
+        wc_cost = wc_cost_value.value
+        wc_cost_trace.append(wc_cost)
+        wc_time_trace.append(wc_sec)
+        return wc_cost
 
+    # OE_BEGIN
     gv_cost = compute_gv_cost(q, size_to_reach)
     wc_cost = compute_wc_cost(q, size_to_reach)
-    gv_cost_trace = [gv_cost]
-    wc_cost_trace = [wc_cost]
     while (gv_cost <= budget or wc_cost <= budget) and size_to_reach > 2:
         size_to_reach = size_to_reach - 1
         gv_cost = compute_gv_cost(q, size_to_reach)
         wc_cost = compute_wc_cost(q, size_to_reach)
-        gv_cost_trace.append(gv_cost)
-        wc_cost_trace.append(wc_cost)
 
     while gv_cost > budget and wc_cost > budget:
         size_to_reach = size_to_reach + 1
         gv_cost = compute_gv_cost(q, size_to_reach)
         wc_cost = compute_wc_cost(q, size_to_reach)
-        gv_cost_trace.append(gv_cost)
-        wc_cost_trace.append(wc_cost)
 
     method = "GV" if gv_cost <= wc_cost else "WC"
     # OE_END
@@ -65,5 +74,7 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     self._qose_cost_search_method = method
     self._qose_gv_cost_trace = gv_cost_trace
     self._qose_wc_cost_trace = wc_cost_trace
+    self._qose_gv_time_trace = gv_time_trace
+    self._qose_wc_time_trace = wc_time_trace
 
     return size_to_reach, method

@@ -63,7 +63,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
         seed = None
         if seed is None:
             if sample_count <= 1:
@@ -172,6 +172,8 @@ def _evaluate_impl(program_path):
             mitigator._qose_cost_search_method = None
             mitigator._qose_gv_cost_trace = None
             mitigator._qose_wc_cost_trace = None
+            mitigator._qose_gv_time_trace = None
+            mitigator._qose_wc_time_trace = None
             orig_cost_search = mitigator.cost_search
             gv_cost_orig = GVOptimalDecompositionPass.cost
             wc_cost_orig = OptimalWireCuttingPass.cost
@@ -263,6 +265,8 @@ def _evaluate_impl(program_path):
                     "qose_method": mitigator._qose_cost_search_method,
                     "qose_gv_cost_trace": mitigator._qose_gv_cost_trace,
                     "qose_wc_cost_trace": mitigator._qose_wc_cost_trace,
+                    "qose_gv_time_trace": mitigator._qose_gv_time_trace,
+                    "qose_wc_time_trace": mitigator._qose_wc_time_trace,
                     "input_features": input_features,
                 }
             )

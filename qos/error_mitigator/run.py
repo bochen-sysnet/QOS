@@ -14,6 +14,8 @@ _COST_SEARCH_ATTRS = (
     "_qose_cost_search_method",
     "_qose_gv_cost_trace",
     "_qose_wc_cost_trace",
+    "_qose_gv_time_trace",
+    "_qose_wc_time_trace",
 )
 
 
@@ -122,6 +124,8 @@ class ErrorMitigator():
                 f"WC={wc_cost} ({wc_sec:.2f}s)",
                 flush=True,
             )
+        self._last_gv_sec = gv_sec
+        self._last_wc_sec = wc_sec
         return {"GV": gv_cost, "WC": wc_cost}
 
     def _cost_search_impl(self, q: Qernel, size_to_reach: int, budget: int):
