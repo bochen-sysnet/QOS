@@ -330,6 +330,40 @@ class _CountingMitigator(ErrorMitigator):
             )
         return costs
 
+    def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
+        size, method, cost_time, timed_out = super().cost_search(
+            q, size_to_reach, budget
+        )
+        if timed_out:
+            log_path = getattr(self, "_trace_log_path", "")
+            if log_path:
+                gv_cost = None
+                wc_cost = None
+                if getattr(self, "_qose_gv_cost_trace", None):
+                    gv_cost = self._qose_gv_cost_trace[-1]
+                if getattr(self, "_qose_wc_cost_trace", None):
+                    wc_cost = self._qose_wc_cost_trace[-1]
+                row = {
+                    "bench": getattr(self, "_trace_bench", ""),
+                    "size": getattr(self, "_trace_size", ""),
+                    "method": getattr(self, "_trace_method", ""),
+                    "cost_search_call": self.cost_search_calls,
+                    "size_to_reach": size,
+                    "budget": self.budget,
+                    "gv_cost": gv_cost,
+                    "wc_cost": wc_cost,
+                    "gv_sec": -1.0,
+                    "wc_sec": -1.0,
+                }
+                _append_cost_search_log(log_path, row)
+            if getattr(self, "_trace_verbose", False):
+                print(
+                    f"[FullEval] cost_search timeout size_to_reach={size} budget={self.budget} "
+                    "GV=-1.00s WC=-1.00s",
+                    flush=True,
+                )
+        return size, method, cost_time, timed_out
+
 
 def _ensure_measurements(circuit: QuantumCircuit | VirtualCircuit) -> QuantumCircuit:
     if isinstance(circuit, VirtualCircuit):

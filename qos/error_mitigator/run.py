@@ -87,6 +87,17 @@ def _parse_trace_events(events, default_size):
     )
 
 
+def _mark_timeout_trace(gv_time_trace, wc_time_trace) -> None:
+    if gv_time_trace:
+        gv_time_trace[-1] = -1.0
+    else:
+        gv_time_trace.append(-1.0)
+    if wc_time_trace:
+        wc_time_trace[-1] = -1.0
+    else:
+        wc_time_trace.append(-1.0)
+
+
 def compute_gv_cost(q: Qernel, size_to_reach: int) -> int:
     gv_pass = GVOptimalDecompositionPass(size_to_reach)
     gv_cost_value = Value("i", 0)
@@ -193,10 +204,12 @@ class ErrorMitigator():
             t0 = time.perf_counter()
             p.start()
             p.join(600)
+            gv_timed_out = False
             if p.is_alive():
                 p.terminate()
                 p.join()
-            gv_sec = time.perf_counter() - t0
+                gv_timed_out = True
+            gv_sec = -1.0 if gv_timed_out else (time.perf_counter() - t0)
             gv_cost = gv_cost.value
         else:
             gv_cost = 1000
@@ -207,10 +220,12 @@ class ErrorMitigator():
             t0 = time.perf_counter()
             p.start()
             p.join(600)
+            wc_timed_out = False
             if p.is_alive():
                 p.terminate()
                 p.join()
-            wc_sec = time.perf_counter() - t0
+                wc_timed_out = True
+            wc_sec = -1.0 if wc_timed_out else (time.perf_counter() - t0)
             wc_cost = wc_cost.value
         else:
             wc_cost = 1000
@@ -344,6 +359,9 @@ class ErrorMitigator():
             proc.terminate()
             proc.join()
             method = _choose_method(last_gv_cost, last_wc_cost)
+            _mark_timeout_trace(gv_time_trace, wc_time_trace)
+            self._qose_gv_time_trace = gv_time_trace
+            self._qose_wc_time_trace = wc_time_trace
             self._qose_cost_search_output_size = last_size
             self._qose_cost_search_method = method
             return last_size, method, cost_time, True
@@ -352,12 +370,18 @@ class ErrorMitigator():
             result = result_queue.get_nowait()
         except queue_mod.Empty:
             method = _choose_method(last_gv_cost, last_wc_cost)
+            _mark_timeout_trace(gv_time_trace, wc_time_trace)
+            self._qose_gv_time_trace = gv_time_trace
+            self._qose_wc_time_trace = wc_time_trace
             self._qose_cost_search_output_size = last_size
             self._qose_cost_search_method = method
             return last_size, method, cost_time, True
 
         if not result.get("ok"):
             method = _choose_method(last_gv_cost, last_wc_cost)
+            _mark_timeout_trace(gv_time_trace, wc_time_trace)
+            self._qose_gv_time_trace = gv_time_trace
+            self._qose_wc_time_trace = wc_time_trace
             self._qose_cost_search_output_size = last_size
             self._qose_cost_search_method = method
             return last_size, method, cost_time, True
