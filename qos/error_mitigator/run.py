@@ -200,32 +200,18 @@ class ErrorMitigator():
 
         if use_gv:
             self._gv_cost_calls += 1
-            p = Process(target=gv_pass.cost, args=(q, gv_cost))
             t0 = time.perf_counter()
-            p.start()
-            p.join(600)
-            gv_timed_out = False
-            if p.is_alive():
-                p.terminate()
-                p.join()
-                gv_timed_out = True
-            gv_sec = -1.0 if gv_timed_out else (time.perf_counter() - t0)
+            gv_pass.cost(q, gv_cost)
+            gv_sec = time.perf_counter() - t0
             gv_cost = gv_cost.value
         else:
             gv_cost = 1000
 
         if use_wc:
             self._wc_cost_calls += 1
-            p = Process(target=wc_pass.cost, args=(q, wc_cost))
             t0 = time.perf_counter()
-            p.start()
-            p.join(600)
-            wc_timed_out = False
-            if p.is_alive():
-                p.terminate()
-                p.join()
-                wc_timed_out = True
-            wc_sec = -1.0 if wc_timed_out else (time.perf_counter() - t0)
+            wc_pass.cost(q, wc_cost)
+            wc_sec = time.perf_counter() - t0
             wc_cost = wc_cost.value
         else:
             wc_cost = 1000

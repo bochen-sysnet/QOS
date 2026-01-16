@@ -3,6 +3,7 @@ import csv
 import datetime as dt
 import importlib.util
 from pathlib import Path
+import multiprocessing as mp
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -295,6 +296,22 @@ class SerialPool:
 
     def starmap(self, fn, iterable):
         return [fn(*args) for args in iterable]
+
+
+def _cleanup_children() -> None:
+    children = mp.active_children()
+    if not children:
+        return
+    for child in children:
+        try:
+            child.terminate()
+        except Exception:
+            pass
+    for child in children:
+        try:
+            child.join(timeout=1)
+        except Exception:
+            pass
 
 
 class _CountingMitigator(ErrorMitigator):
@@ -782,6 +799,7 @@ def _plot_combined(
                 benches,
                 fidelity_methods,
                 "Fidelity",
+                show_avg=True,
             )
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -1867,6 +1885,7 @@ def main() -> None:
         )
         for path in frag_paths:
             print(f"Wrote fragment fidelity figure: {path}")
+    _cleanup_children()
 
 
 if __name__ == "__main__":
