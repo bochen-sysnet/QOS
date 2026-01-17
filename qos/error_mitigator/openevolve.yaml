@@ -59,8 +59,6 @@ prompt:
           * size_to_reach: the chosen target size to use for the cutting/virtualization of the target circuit.
           * method: "GV" or "WC", which determines which technique is applied at that size.
       - Cost logging and traces are handled outside this file (in qos/error_mitigator/run.py).
-        The helper functions compute_gv_cost/compute_wc_cost and trace collection live there,
-        so the evolved code only calls the helpers and never touches trace logic.
 
     IMPORTANT PRACTICAL CONSTRAINTS:
     - `budget` is only meaningful for your cost-search logic (i.e., your own GV/WC cost queries).
@@ -111,12 +109,197 @@ prompt:
     AN EXAMPLE OF EVOLVEMENT without cost search (Not Optimal):
     def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
       metadata = q.get_metadata()
-      pc = metadata["program_communication"]
-      liveness = metadata['liveness']
-      if liveness > pc:
-          return size_to_reach, "WC"
+      depth = metadata.get("depth", 0)
+      num_qubits = metadata.get("num_qubits", 0)
+      num_clbits = metadata.get("num_clbits", 0)
+      num_nonlocal_gates = metadata.get("num_nonlocal_gates", 0)
+      num_connected_components = metadata.get("num_connected_components", 0)
+      number_instructions = metadata.get("number_instructions", 0)
+      num_measurements = metadata.get("num_measurements", 0)
+      num_cnot_gates = metadata.get("num_cnot_gates", 0)
+      program_communication = metadata.get("program_communication", 0.0)
+      liveness = metadata.get("liveness", 0.0)
+      parallelism = metadata.get("parallelism", 0.0)
+      measurement = metadata.get("measurement", 0.0)
+      entanglement_ratio = metadata.get("entanglement_ratio", 0.0)
+      critical_depth = metadata.get("critical_depth", 0.0)
+
+      input_size = size_to_reach
+
+      # OE_BEGIN
+      def _as_int(x, default=0):
+          try:
+              return int(x)
+          except Exception:
+              return default
+
+      def _as_float(x, default=0.0):
+          try:
+              return float(x)
+          except Exception:
+              return default
+
+      b = max(0, _as_int(budget, 0))
+      in_size = max(2, _as_int(size_to_reach, 2))
+      n = _as_int(num_qubits, 0)
+
+      er = _as_float(entanglement_ratio, 0.0)
+      pc = _as_float(program_communication, 0.0)
+      par = _as_float(parallelism, 0.0)
+      cd = _as_float(critical_depth, 0.0)
+      comps = _as_int(num_connected_components, 0)
+      nnlg = _as_int(num_nonlocal_gates, 0)
+
+      # If num_qubits is known, keep sizes < num_qubits for meaningful decomposition.
+      # Fallback to input size when metadata is missing.
+      if n > 2:
+          max_meaningful = n - 1
+      elif n > 0:
+          max_meaningful = n
       else:
-          return size_to_reach, "GV"
+          max_meaningful = max(2, in_size + 8)
+
+      in_size = min(max_meaningful, max(2, in_size))
+
+      # Circuit-family heuristics (must generalize; no per-benchmark branching).
+      connected = (comps <= 2) if comps > 0 else True
+      bv_like = (comps >= 4) and (er <= 0.30)
+      ghz_like = connected and (er >= 0.85) and (par <= 0.20)
+
+      dense_entangling = connected and (er >= 0.28) and (
+          (n > 0 and nnlg >= n) or (nnlg >= 18 and pc >= 0.15)
+      )
+
+      high_risk = dense_entangling and (cd >= 0.9 or er >= 0.33 or pc >= 0.18)
+      very_high_risk = high_risk and (
+          (pc >= 0.25)
+          or (n > 0 and nnlg >= 2 * n)
+          or (er >= 0.55 and par <= 0.55)
+      )
+
+      # Risk-aware lower bound: prevent aggressive shrinking on dense, highly entangling circuits.
+      floor_size = 3
+      if high_risk:
+          floor_size = max(floor_size, 5)
+      if very_high_risk:
+          floor_size = max(floor_size, 6)
+      if ghz_like:
+          floor_size = min(floor_size, 4)
+      if bv_like:
+          floor_size = 3
+
+      # Risk-aware upper bound: allow backing off toward a near-no-op size for dense circuits.
+      hi = in_size
+      if (very_high_risk or high_risk) and (n > 0) and (not bv_like):
+          # Bias toward keeping more qubits to avoid depth/CNOT blowups.
+          target_hi = int(0.85 * float(n) + 0.5)
+          hi = max(hi, min(max_meaningful, max(2, target_hi)))
+
+      lo = min(hi, max(2, min(max_meaningful, floor_size)))
+      if lo > hi:
+          lo = hi
+
+      # Cost probes with per-call caching to minimize pass invocations.
+      _gv_cache = {}
+      _wc_cache = {}
+
+      def _compute_gv_cost(s):
+          gv_pass = GVOptimalDecompositionPass(s)
+          gv_cost_value = Value("i", 0)
+          gv_pass.cost(q, gv_cost_value)
+          return gv_cost_value.value
+
+      def _compute_wc_cost(s):
+          wc_pass = OptimalWireCuttingPass(s)
+          wc_cost_value = Value("i", 0)
+          wc_pass.cost(q, wc_cost_value)
+          return wc_cost_value.value
+
+      def get_costs(s):
+          s = min(max_meaningful, max(2, _as_int(s, 2)))
+          if s not in _gv_cache:
+              _gv_cache[s] = _compute_gv_cost(s)
+          if s not in _wc_cache:
+              _wc_cache[s] = _compute_wc_cost(s)
+          return _gv_cache[s], _wc_cache[s]
+
+      gv_cost_trace = []
+      wc_cost_trace = []
+
+      def probe(s):
+          gv, wc = get_costs(s)
+          gv_cost_trace.append(gv)
+          wc_cost_trace.append(wc)
+          return gv, wc
+
+      def feasible(gv, wc):
+          return (gv <= b) or (wc <= b)
+
+      # Ensure we have a feasible upper bound; if not, expand once (bounded).
+      gv_hi, wc_hi = probe(hi)
+      if (not feasible(gv_hi, wc_hi)) and (hi < max_meaningful):
+          hi2 = min(max_meaningful, hi + 6)
+          if hi2 != hi:
+              hi = hi2
+              gv_hi, wc_hi = probe(hi)
+
+      if feasible(gv_hi, wc_hi):
+          # Binary search for the smallest feasible size in [lo, hi].
+          left, right = lo, hi
+          while left < right:
+              mid = (left + right) // 2
+              gv_m, wc_m = probe(mid)
+              if feasible(gv_m, wc_m):
+                  right = mid
+              else:
+                  left = mid + 1
+          min_feasible = left
+
+          # Safety bump for dense circuits to reduce depth/CNOT regressions.
+          bump = 0
+          if high_risk:
+              bump = 2
+          if very_high_risk:
+              bump = 4
+          final_size = min(hi, min_feasible + bump)
+      else:
+          # No feasible size found in bounded range; fall back to the largest meaningful size.
+          final_size = hi
+
+      gv_cost, wc_cost = probe(final_size)
+
+      # Method choice: use strict budget first; otherwise choose conservative preference.
+      gv_ok = gv_cost <= b
+      wc_ok = wc_cost <= b
+
+      prefer_wc = bv_like or dense_entangling
+      prefer_gv = ghz_like or ((not dense_entangling) and (er <= 0.22) and (comps >= 3))
+
+      if gv_ok and wc_ok:
+          if prefer_wc and not prefer_gv:
+              method = "WC"
+          elif prefer_gv and not prefer_wc:
+              method = "GV"
+          else:
+              method = "GV" if gv_cost <= wc_cost else "WC"
+      elif wc_ok:
+          method = "WC"
+      elif gv_ok:
+          method = "GV"
+      else:
+          # Budget is only a heuristic; pick the lower-cost method at the chosen size.
+          method = "GV" if gv_cost <= wc_cost else "WC"
+
+      size_to_reach = int(final_size)
+      # OE_END
+      self._qose_cost_search_input_size = input_size
+      self._qose_cost_search_budget = budget
+      self._qose_cost_search_output_size = size_to_reach
+      self._qose_cost_search_method = method
+      self._qose_gv_cost_trace = gv_cost_trace
+      self._qose_wc_cost_trace = wc_cost_trace
+
+      return size_to_reach, method
 
     POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
@@ -160,7 +343,7 @@ database:
   diversity_reference_size: 30
 
 evaluator:
-  timeout: 100
+  timeout: 300
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1

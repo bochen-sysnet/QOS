@@ -1,7 +1,9 @@
 import importlib.util
 import logging
+import multiprocessing as mp
 import numbers
 import os
+import queue as queue_mod
 import random
 import time
 from types import SimpleNamespace
@@ -49,7 +51,7 @@ def _evaluate_impl(program_path):
         return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
 
     args = SimpleNamespace(
-        size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "7")),
+        size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "12")),
         ideal_size_to_reach=int(os.getenv("QOSE_IDEAL_SIZE_TO_REACH", "2")),
         budget=int(os.getenv("QOSE_BUDGET", "3")),
         qos_cost_search=True,
@@ -305,11 +307,36 @@ def _evaluate_impl(program_path):
 
 
 def evaluate(program_path):
-    try:
-        metrics, artifacts = _evaluate_impl(program_path)
-    except Exception as exc:
-        metrics = {"combined_score": -1000.0}
-        artifacts = {"info": f"Evaluation failed: {exc}"}
+    timeout_sec = int(os.getenv("QOSE_EVAL_TIMEOUT_SEC", "0"))
+    if timeout_sec > 0:
+        result_queue = mp.Queue()
+
+        def _worker(path, out_q):
+            try:
+                out_q.put(_evaluate_impl(path))
+            except Exception as exc:
+                out_q.put(({"combined_score": -1000.0}, {"info": f"Evaluation failed: {exc}"}))
+
+        proc = mp.Process(target=_worker, args=(program_path, result_queue))
+        proc.start()
+        proc.join(timeout_sec)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            metrics = {"combined_score": -1000.0}
+            artifacts = {"info": f"Evaluation timed out after {timeout_sec}s"}
+        else:
+            try:
+                metrics, artifacts = result_queue.get_nowait()
+            except queue_mod.Empty:
+                metrics = {"combined_score": -1000.0}
+                artifacts = {"info": "Evaluation failed: no result"}
+    else:
+        try:
+            metrics, artifacts = _evaluate_impl(program_path)
+        except Exception as exc:
+            metrics = {"combined_score": -1000.0}
+            artifacts = {"info": f"Evaluation failed: {exc}"}
     return EvaluationResult(
         metrics=_round_float_values(metrics),
         artifacts=_round_float_values(artifacts),
