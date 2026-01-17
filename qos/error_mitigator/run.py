@@ -87,6 +87,10 @@ def _parse_trace_events(events, default_size):
     )
 
 
+def _is_verbose() -> bool:
+    return os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}
+
+
 def _mark_timeout_trace(gv_time_trace, wc_time_trace) -> None:
     if gv_time_trace:
         gv_time_trace[-1] = -1.0
@@ -385,7 +389,16 @@ class ErrorMitigator():
             #cost = gv_pass.cost(q)
 
             #if cost <= self.budget:
+            if _is_verbose():
+                print(f"[QOS] applyGV start size_to_reach={size_to_reach}", flush=True)
+            t0 = time.perf_counter()
             q = gv_pass.run(q, self.budget)
+            if _is_verbose():
+                print(
+                    f"[QOS] applyGV done size_to_reach={size_to_reach} "
+                    f"sec={time.perf_counter() - t0:.2f}",
+                    flush=True,
+                )
         
         return q
 
@@ -402,7 +415,16 @@ class ErrorMitigator():
             #cost = wc_pass.cost(q)
 
             #if cost <= self.budget:
+            if _is_verbose():
+                print(f"[QOS] applyWC start size_to_reach={size_to_reach}", flush=True)
+            t0 = time.perf_counter()
             q = wc_pass.run(q, self.budget)
+            if _is_verbose():
+                print(
+                    f"[QOS] applyWC done size_to_reach={size_to_reach} "
+                    f"sec={time.perf_counter() - t0:.2f}",
+                    flush=True,
+                )
         
         return q
     
@@ -482,9 +504,21 @@ class ErrorMitigator():
                         q = self.applyBestCut(q, self.size_to_reach)
                 else:
                     size_to_reach = self.size_to_reach
+                    if _is_verbose():
+                        print(
+                            f"[QOS] cost_search start size_to_reach={size_to_reach} "
+                            f"budget={budget}",
+                            flush=True,
+                        )
                     size_to_reach, method, cost_time, timed_out = self.cost_search(
                         q, size_to_reach, budget
                     )
+                    if _is_verbose():
+                        print(
+                            f"[QOS] cost_search done size_to_reach={size_to_reach} "
+                            f"method={method} sec={cost_time:.2f} timed_out={timed_out}",
+                            flush=True,
+                        )
                     if self.collect_timing:
                         self.timings["cost_search"] = cost_time
 
@@ -528,9 +562,21 @@ class ErrorMitigator():
                     q = self.applyBestCut(q, self.size_to_reach)
             else:
                 size_to_reach = self.size_to_reach
+                if _is_verbose():
+                    print(
+                        f"[QOS] cost_search start size_to_reach={size_to_reach} "
+                        f"budget={self.budget}",
+                        flush=True,
+                    )
                 size_to_reach, method, cost_time, timed_out = self.cost_search(
                     q, size_to_reach, self.budget
                 )
+                if _is_verbose():
+                    print(
+                        f"[QOS] cost_search done size_to_reach={size_to_reach} "
+                        f"method={method} sec={cost_time:.2f} timed_out={timed_out}",
+                        flush=True,
+                    )
                 if self.collect_timing:
                     self.timings["cost_search"] = cost_time
 

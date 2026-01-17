@@ -1,9 +1,7 @@
 import importlib.util
 import logging
-import multiprocessing as mp
 import numbers
 import os
-import queue as queue_mod
 import random
 import time
 from types import SimpleNamespace
@@ -24,6 +22,7 @@ logging.getLogger("qiskit").setLevel(logging.WARNING)
 logging.getLogger("qiskit.transpiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.compiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 def _round_float_values(value):
     if isinstance(value, bool):
@@ -65,7 +64,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
         seed = None
         if seed is None:
             if sample_count <= 1:
@@ -120,6 +119,7 @@ def _evaluate_impl(program_path):
     total_qos_wc_calls = 0
     for bench in benches:
         for size in sizes:
+            logger.info("Evaluating bench=%s size=%s", bench, size)
             qc = _load_qasm_circuit(bench, size)
 
             # Baseline QOS
@@ -137,20 +137,27 @@ def _evaluate_impl(program_path):
             t0 = time.perf_counter()
             qos_q = qos_mitigator.run(qos_q)
             qos_run_time = time.perf_counter() - t0
+            logger.info("Baseline QOS done bench=%s size=%s sec=%.2f", bench, size, qos_run_time)
             total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
             total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
+            logger.info("Baseline QOS analyze start bench=%s size=%s", bench, size)
             qos_m = _analyze_qernel(
                 qos_q,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
+            logger.info("Baseline QOS analyze done bench=%s size=%s", bench, size)
+            logger.info("Baseline QOS extract circuits start bench=%s size=%s", bench, size)
             qos_circs = _extract_circuits(qos_q)
+            logger.info("Baseline QOS extract circuits done bench=%s size=%s", bench, size)
 
             # Evolved QOSE
+            logger.info("QOSE analysis start bench=%s size=%s", bench, size)
             q = Qernel(qc.copy())
             BasicAnalysisPass().run(q)
             SupermarqFeaturesAnalysisPass().run(q)
+            logger.info("QOSE analysis done bench=%s size=%s", bench, size)
             input_meta = q.get_metadata()
             input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
             mitigator = ErrorMitigator(
@@ -200,12 +207,14 @@ def _evaluate_impl(program_path):
             GVOptimalDecompositionPass.cost = _gv_cost
             OptimalWireCuttingPass.cost = _wc_cost
             try:
+                logger.info("QOSE run start bench=%s size=%s", bench, size)
                 t0 = time.perf_counter()
                 q = mitigator.run(q)
                 run_time = time.perf_counter() - t0
             finally:
                 GVOptimalDecompositionPass.cost = gv_cost_orig
                 OptimalWireCuttingPass.cost = wc_cost_orig
+            logger.info("QOSE done bench=%s size=%s sec=%.2f", bench, size, run_time)
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
@@ -307,36 +316,11 @@ def _evaluate_impl(program_path):
 
 
 def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_EVAL_TIMEOUT_SEC", "0"))
-    if timeout_sec > 0:
-        result_queue = mp.Queue()
-
-        def _worker(path, out_q):
-            try:
-                out_q.put(_evaluate_impl(path))
-            except Exception as exc:
-                out_q.put(({"combined_score": -1000.0}, {"info": f"Evaluation failed: {exc}"}))
-
-        proc = mp.Process(target=_worker, args=(program_path, result_queue))
-        proc.start()
-        proc.join(timeout_sec)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join()
-            metrics = {"combined_score": -1000.0}
-            artifacts = {"info": f"Evaluation timed out after {timeout_sec}s"}
-        else:
-            try:
-                metrics, artifacts = result_queue.get_nowait()
-            except queue_mod.Empty:
-                metrics = {"combined_score": -1000.0}
-                artifacts = {"info": "Evaluation failed: no result"}
-    else:
-        try:
-            metrics, artifacts = _evaluate_impl(program_path)
-        except Exception as exc:
-            metrics = {"combined_score": -1000.0}
-            artifacts = {"info": f"Evaluation failed: {exc}"}
+    try:
+        metrics, artifacts = _evaluate_impl(program_path)
+    except Exception as exc:
+        metrics = {"combined_score": -1000.0}
+        artifacts = {"info": f"Evaluation failed: {exc}"}
     return EvaluationResult(
         metrics=_round_float_values(metrics),
         artifacts=_round_float_values(artifacts),

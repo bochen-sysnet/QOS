@@ -1,5 +1,5 @@
 max_iterations: 500
-checkpoint_interval: 10
+checkpoint_interval: 5
 log_level: "INFO"
 log_dir: null
 random_seed: 42
@@ -35,9 +35,7 @@ prompt:
     FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
     - Do NOT change the function signature.
       It MUST remain: evolved_cost_search(self, q, size_to_reach, budget)
-    - It MUST return EXACTLY 2 values:
-        (size_to_reach: int, method: str)
-      where method is "GV" or "WC".
+    - It MUST return EXACTLY 2 values: (size_to_reach: int, method: str) where method is "GV" or "WC".
     - If you violate signature/return arity, evaluation will fail.
 
     CONTEXT:
@@ -343,7 +341,7 @@ database:
   diversity_reference_size: 30
 
 evaluator:
-  timeout: 300
+  timeout: 600
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1

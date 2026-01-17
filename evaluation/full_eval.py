@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 from pathlib import Path
 import multiprocessing as mp
+import logging
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -46,6 +47,13 @@ BENCHES = [
     ("vqe_1", "VQE-1"),
     ("wstate", "W-STATE"),
 ]
+
+_EVAL_LOGGER = logging.getLogger(__name__)
+
+
+def _is_eval_verbose() -> bool:
+    raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
+    return raw.lower() in {"1", "true", "yes", "y"}
 
 TARGET_REL = {
     "depth": {
@@ -160,6 +168,22 @@ def _apply_metrics_baseline(
     if baseline == "raw":
         return circuit
     backend = _get_metrics_backend(baseline)
+    if _is_eval_verbose():
+        t0 = time.perf_counter()
+        _EVAL_LOGGER.info(
+            "Metrics transpile start baseline=%s opt=%s ops=%s",
+            baseline,
+            opt_level,
+            len(circuit.data),
+        )
+        out = transpile(circuit, backend=backend, optimization_level=opt_level)
+        _EVAL_LOGGER.info(
+            "Metrics transpile done baseline=%s opt=%s sec=%.2f",
+            baseline,
+            opt_level,
+            time.perf_counter() - t0,
+        )
+        return out
     return transpile(circuit, backend=backend, optimization_level=opt_level)
 
 
@@ -502,6 +526,13 @@ def _analyze_circuit(
     metrics_opt_level: int,
 ) -> Dict[str, int]:
     if _has_virtual_ops(circuit):
+        if _is_eval_verbose():
+            _EVAL_LOGGER.info(
+                "Analyze circuit virtual ops mode=%s baseline=%s opt=%s",
+                metric_mode,
+                metrics_baseline,
+                metrics_opt_level,
+            )
         if metric_mode == "virtual" or metric_mode == "cutqc":
             effective = _replace_virtual_ops(_normalize_circuit(circuit), metric_mode)
             effective = _apply_metrics_baseline(effective, metrics_baseline, metrics_opt_level)
@@ -515,6 +546,14 @@ def _analyze_circuit(
             }
 
         vc = VirtualCircuit(_normalize_circuit(circuit))
+        if _is_eval_verbose():
+            _EVAL_LOGGER.info(
+                "Analyze circuit fragments=%s mode=%s baseline=%s opt=%s",
+                len(vc.fragment_circuits),
+                metric_mode,
+                metrics_baseline,
+                metrics_opt_level,
+            )
         depths = []
         nonlocals = []
         for frag_circ in vc.fragment_circuits.values():
@@ -529,6 +568,14 @@ def _analyze_circuit(
             "depth": max(depths) if depths else 0,
             "num_nonlocal_gates": _max_metric(nonlocals),
         }
+    if _is_eval_verbose():
+        _EVAL_LOGGER.info(
+            "Analyze circuit mode=%s baseline=%s opt=%s ops=%s",
+            metric_mode,
+            metrics_baseline,
+            metrics_opt_level,
+            len(_normalize_circuit(circuit).data),
+        )
     effective = _replace_virtual_ops(circuit, metric_mode)
     effective = _apply_metrics_baseline(effective, metrics_baseline, metrics_opt_level)
     q = Qernel(effective)
@@ -560,16 +607,32 @@ def _analyze_qernel(
         circuits = [_normalize_circuit(vsq.get_circuit()) for vsq in vsqs]
     else:
         circuits = [_normalize_circuit(q.get_circuit())]
+    if _is_eval_verbose():
+        _EVAL_LOGGER.info(
+            "Analyze qernel circuits=%s mode=%s baseline=%s opt=%s",
+            len(circuits),
+            metric_mode,
+            metrics_baseline,
+            metrics_opt_level,
+        )
 
     depths = []
     nonlocals = []
-    for c in circuits:
+    for idx, c in enumerate(circuits, start=1):
+        t0 = time.perf_counter() if _is_eval_verbose() else 0.0
         m = _analyze_circuit(
             c,
             metric_mode,
             metrics_baseline,
             metrics_opt_level,
         )
+        if _is_eval_verbose():
+            _EVAL_LOGGER.info(
+                "Analyze qernel circuit %s/%s sec=%.2f",
+                idx,
+                len(circuits),
+                time.perf_counter() - t0,
+            )
         depths.append(m["depth"])
         nonlocals.append(m["num_nonlocal_gates"])
 
