@@ -1,7 +1,7 @@
-max_iterations: 500
-checkpoint_interval: 20
+max_iterations: 20
+checkpoint_interval: 5
 log_level: "INFO"
-log_dir: null
+log_dir: "openevolve_output_gemini25flashlite_eg/logs"
 random_seed: 42
 max_tasks_per_child: 1
 
@@ -14,8 +14,16 @@ convergence_threshold: 0.0005
 early_stopping_metric: "combined_score"
 
 llm:
-  api_base: "http://localhost:8000/v1"
-  primary_model: "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ"
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: "${GEMINI_API_KEY}"
+  models:
+    # Edit this before run, e.g. "gemini-3-flash"
+    # gemini-2.5-flash-lite
+    # gemini-2.5-flash 
+    # gemini-3-flash-preview 
+    # gemini-3-pro-preview 
+    - name: "gemini-2.5-flash-lite"
+      weight: 1.0
   temperature: 0.75
   top_p: 0.92
   max_tokens: 4096
@@ -25,8 +33,12 @@ llm:
 
 prompt:
   system_message: |
-   You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget)
+    You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget)
     in qos/error_mitigator/evolution_target.py.
+
+    OUTPUT FORMAT (CRITICAL):
+    - Return the full file contents of qos/error_mitigator/evolution_target.py.
+    - Output code only: no explanations, no markdown fences, no extra text.
 
     GENERALIZATION REQUIREMENT (CRITICAL):
     - The evaluation will use a set of 9 circuits.
@@ -302,15 +314,12 @@ prompt:
 
     POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
-
       B) Explore size_to_reach efficiently instead of using two while loops iteratively.
-
       C) Explore early stopping rules for WC and GV.
-
       D) Skip certain size_to_reach values based on heuristics.
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
-  num_top_programs: 3
+  num_top_programs: 2
   num_diverse_programs: 2
   use_template_stochasticity: true
 
@@ -320,7 +329,7 @@ prompt:
   artifact_security_filter: true
 
 database:
-  db_path: openevolve_output/db
+  db_path: openevolve_output_gemini25flashlite_eg/db
   in_memory: false
   log_prompts: true
 
@@ -354,6 +363,6 @@ evolution_trace:
   format: "jsonl"
   include_code: false
   include_prompts: false
-  output_path: openevolve_output/evolution_trace.jsonl
+  output_path: openevolve_output_gemini25flashlite_eg/evolution_trace.jsonl
   buffer_size: 10
   compress: false

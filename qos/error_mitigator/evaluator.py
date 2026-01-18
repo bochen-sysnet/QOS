@@ -214,6 +214,11 @@ def _evaluate_impl(program_path):
             finally:
                 GVOptimalDecompositionPass.cost = gv_cost_orig
                 OptimalWireCuttingPass.cost = wc_cost_orig
+            if getattr(mitigator, "_qose_cost_search_error", None):
+                return (
+                    {"combined_score": -1000.0},
+                    {"info": f"Cost search failed: {mitigator._qose_cost_search_error}"},
+                )
             logger.info("QOSE done bench=%s size=%s sec=%.2f", bench, size, run_time)
             qose_m = _analyze_qernel(
                 q,
@@ -322,6 +327,8 @@ def evaluate(program_path):
         metrics = {"combined_score": -1000.0}
         artifacts = {"info": f"Evaluation failed: {exc}"}
     if float(metrics.get("combined_score", 0.0)) <= -999.0 and "info" in artifacts:
+        metrics = dict(metrics)
+        metrics["failure_reason"] = artifacts.get("info")
         logging.getLogger(__name__).warning(
             "Evaluation returned low score: %s", artifacts.get("info")
         )
