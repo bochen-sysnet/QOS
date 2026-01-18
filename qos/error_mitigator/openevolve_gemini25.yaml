@@ -1,0 +1,167 @@
+max_iterations: 20
+checkpoint_interval: 5
+log_level: "INFO"
+log_dir: "openevolve_output_gemini25/logs"
+random_seed: 42
+max_tasks_per_child: 1
+
+# Rewrite mode: output full file each iteration (stable with OE markers)
+diff_based_evolution: false
+max_code_length: 30000
+
+early_stopping_patience: null
+convergence_threshold: 0.0005
+early_stopping_metric: "combined_score"
+
+llm:
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: "${GEMINI_API_KEY}"
+  models:
+    - name: "gemini-2.5-flash"
+      weight: 1.0
+  temperature: 0.75
+  top_p: 0.92
+  max_tokens: 1800
+  timeout: 450
+  retries: 3
+  retry_delay: 1
+
+prompt:
+  system_message: |
+   You are optimizing ONLY the function evolved_cost_search(self, q, size_to_reach, budget)
+    in qos/error_mitigator/evolution_target.py.
+
+    GENERALIZATION REQUIREMENT (CRITICAL):
+    - The evaluation will use a set of 9 circuits.
+    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.).
+    - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
+
+    FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
+    - Do NOT change the function signature.
+      It MUST remain: evolved_cost_search(self, q, size_to_reach, budget)
+    - It MUST return EXACTLY 2 values: (size_to_reach: int, method: str) where method is "GV" or "WC".
+    - If you violate signature/return arity, evaluation will fail.
+
+    CONTEXT:
+    The input q is a Qernel. It contains metadata computed elsewhere, accessible via:
+      input_meta = q.get_metadata()
+
+    Useful fields may include:
+      depth, num_qubits, num_clbits, num_nonlocal_gates, num_connected_components,
+      number_instructions, num_measurements, num_cnot_gates,
+      program_communication, liveness, parallelism, measurement,
+      entanglement_ratio, critical_depth.
+
+    Inputs/Outputs:
+      - Inputs:
+          * q: the Qernel (quantum circuit container) whose metadata informs the decision.
+          * size_to_reach: the current target circuit size for cutting/virtualization search.
+          * budget: the cost threshold used to decide whether GV/WC is acceptable.
+      - Outputs:
+          * size_to_reach: the chosen target size to use for the cutting/virtualization of the target circuit.
+          * method: "GV" or "WC", which determines which technique is applied at that size.
+      - Cost logging and traces are handled outside this file (in qos/error_mitigator/run.py).
+
+    IMPORTANT PRACTICAL CONSTRAINTS:
+    - `budget` is only meaningful for your cost-search logic (i.e., your own GV/WC cost queries).
+      Do not assume downstream will enforce budget.
+    - If size_to_reach >= num_qubits, the decomposition can become a no-op.
+      Use that ONLY as an explicit fallback when costs indicate everything else is too expensive.
+      Prefer to clamp sizes into a meaningful range (e.g., [2, num_qubits-1]) for real action.
+
+    EFFICIENCY / GENERALIZATION GUIDELINES (HIGH IMPACT):
+    - Minimize gv/wc cost calls. Avoid long +/-1 stepping loops.
+      Prefer a small number of probes + bounded search (e.g., check a few candidate sizes,
+      or use a short binary/ternary-style search on a clamped interval).
+    - Use cheap metadata heuristics first; only call compute_*_cost when needed.
+    - Keep behavior monotone and stable: similar circuits should yield similar decisions.
+
+    METRICS:
+      - qose_depth: average depth ratio (QOSE/QOS)
+      - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
+      - qose_overhead: average number of circuits to run ratio (QOSE/QOS)
+      - avg_run_time: average runtime ratio (QOSE/QOS)
+      - combined_score (maximize):
+          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
+
+    ARTIFACTS PROVIDED BY EVALUATOR (per case):
+      - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
+        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
+        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
+      - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
+        qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
+      - qose_output_size, qose_method
+      - qose_gv_cost_trace, qose_wc_cost_trace
+      - qose_gv_time_trace, qose_wc_time_trace
+      Use artifacts to diagnose decisions.
+
+    ARTIFACTS PROVIDED BY EVALUATOR (summary):
+      - qose_input_size: input size_to_reach for all cases
+      - qose_budget: budget used for all cases
+      - qose_run_sec_avg: average runtime of evolved mitigator
+      - qos_run_sec_avg: average runtime of baseline QOS
+      - gv_cost_calls_total: total GV cost calls
+      - wc_cost_calls_total: total WC cost calls
+      - qos_gv_cost_calls_total: total GV cost calls for baseline QOS
+      - qos_wc_cost_calls_total: total WC cost calls for baseline QOS
+      - qos_depth_avg: average absolute depth of QOS
+      - qos_cnot_avg: average absolute nonlocal gate count of QOS
+      - qos_overhead_avg: average absolute number of QOS circuits
+
+    POSSIBLE LEVERS TO EXPLORE:
+      A) Decide to use WC or GV selectively instead of always using both.
+
+      B) Explore size_to_reach efficiently instead of using two while loops iteratively.
+
+      C) Explore early stopping rules for WC and GV.
+
+      D) Skip certain size_to_reach values based on heuristics.
+
+  evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
+  num_top_programs: 2
+  num_diverse_programs: 2
+  use_template_stochasticity: true
+
+  # Make sure OpenEvolve passes artifacts back into the model prompt each iteration.
+  include_artifacts: true
+  max_artifact_bytes: 65536
+  artifact_security_filter: true
+
+database:
+  db_path: openevolve_output_gemini25/db
+  in_memory: false
+  log_prompts: true
+
+  population_size: 24
+  archive_size: 16
+  num_islands: 4
+
+  migration_interval: 30
+  migration_rate: 0.12
+
+  elite_selection_ratio: 0.05
+  exploration_ratio: 0.65
+  exploitation_ratio: 0.30
+
+  feature_dimensions:
+    - "complexity"
+    - "diversity"
+  feature_bins: 12
+  diversity_reference_size: 30
+
+evaluator:
+  timeout: 600
+  max_retries: 1
+  cascade_evaluation: false
+  parallel_evaluations: 1
+  use_llm_feedback: false
+  llm_feedback_weight: 0.0
+
+evolution_trace:
+  enabled: false
+  format: "jsonl"
+  include_code: false
+  include_prompts: false
+  output_path: openevolve_output_gemini25/evolution_trace.jsonl
+  buffer_size: 10
+  compress: false

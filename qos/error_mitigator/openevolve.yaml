@@ -3,6 +3,7 @@ checkpoint_interval: 5
 log_level: "INFO"
 log_dir: null
 random_seed: 42
+max_tasks_per_child: 1
 
 # Rewrite mode: output full file each iteration (stable with OE markers)
 diff_based_evolution: false

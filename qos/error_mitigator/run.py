@@ -317,9 +317,10 @@ class ErrorMitigator():
             self._qose_cost_search_method = method
             return size_to_reach, method, cost_time, False
 
-        result_queue = Queue()
-        trace_queue = Queue()
-        proc = Process(
+        mp_ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+        result_queue = mp_ctx.Queue()
+        trace_queue = mp_ctx.Queue()
+        proc = mp_ctx.Process(
             target=_cost_search_worker,
             args=(self, q, size_to_reach, budget, result_queue, trace_queue),
         )

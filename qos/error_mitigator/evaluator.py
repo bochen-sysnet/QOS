@@ -64,7 +64,7 @@ def _evaluate_impl(program_path):
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
+        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
         seed = None
         if seed is None:
             if sample_count <= 1:
@@ -321,6 +321,10 @@ def evaluate(program_path):
     except Exception as exc:
         metrics = {"combined_score": -1000.0}
         artifacts = {"info": f"Evaluation failed: {exc}"}
+    if float(metrics.get("combined_score", 0.0)) <= -999.0 and "info" in artifacts:
+        logging.getLogger(__name__).warning(
+            "Evaluation returned low score: %s", artifacts.get("info")
+        )
     return EvaluationResult(
         metrics=_round_float_values(metrics),
         artifacts=_round_float_values(artifacts),
