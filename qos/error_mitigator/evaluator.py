@@ -24,6 +24,12 @@ logging.getLogger("qiskit.compiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+def _is_eval_verbose() -> bool:
+    raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
+    return raw.lower() in {"1", "true", "yes", "y"}
+
+logger.setLevel(logging.INFO if _is_eval_verbose() else logging.WARNING)
+
 def _round_float_values(value):
     if isinstance(value, bool):
         return value
