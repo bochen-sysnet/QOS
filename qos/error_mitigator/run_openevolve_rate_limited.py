@@ -9,6 +9,7 @@ from openevolve.llm.openai import OpenAILLM
 
 
 _GEMINI_API_PREFIX = "https://generativelanguage.googleapis.com/"
+_OPENAI_API_PREFIX = "https://api.openai.com/"
 
 
 def _install_rate_limit(rpm: float) -> None:
@@ -56,6 +57,10 @@ def _install_gemini_overrides() -> None:
         if str(self.api_base).startswith(_GEMINI_API_PREFIX):
             if "max_tokens" in params and "max_output_tokens" not in params:
                 params["max_output_tokens"] = params["max_tokens"]
+        if str(self.api_base).startswith(_OPENAI_API_PREFIX):
+            service_tier = os.getenv("OPENAI_SERVICE_TIER", "").strip()
+            if service_tier and "service_tier" not in params:
+                params["service_tier"] = service_tier
         return await original_call(self, params)
 
     async def wrapped_generate(self, system_message, messages, **kwargs):
