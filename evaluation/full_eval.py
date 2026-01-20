@@ -492,6 +492,92 @@ def _simulate_virtual_counts(
     return quasi.to_counts(vc._circuit.num_clbits, shots)
 
 
+_REAL_BACKEND_CACHE: Dict[str, object] = {}
+
+
+def _get_real_backend(backend_name: str):
+    if backend_name in _REAL_BACKEND_CACHE:
+        return _REAL_BACKEND_CACHE[backend_name]
+    token = (
+        os.getenv("IBM_TOKEN")
+        or os.getenv("QISKIT_IBM_TOKEN")
+        or os.getenv("IBMQ_TOKEN")
+    )
+    if not token:
+        token_path = Path("IBM_token.key")
+        if token_path.exists():
+            token = token_path.read_text().strip()
+    if not token:
+        raise RuntimeError("IBM_TOKEN (or QISKIT_IBM_TOKEN/IBMQ_TOKEN) is not set.")
+    try:
+        from qiskit_ibm_runtime import QiskitRuntimeService  # type: ignore
+
+        service = QiskitRuntimeService(channel="ibm_quantum", token=token)
+        backend = service.backend(backend_name)
+    except Exception:
+        from qiskit_ibm_provider import IBMProvider  # type: ignore
+
+        provider = IBMProvider(token=token)
+        backend = provider.get_backend(backend_name)
+    _REAL_BACKEND_CACHE[backend_name] = backend
+    return backend
+
+
+def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict[str, int]:
+    backend = _get_real_backend(backend_name)
+    circ = _ensure_measurements(circuit)
+    tcirc = transpile(circ, backend=backend, optimization_level=0)
+    job = backend.run(tcirc, shots=shots)
+    result = job.result()
+    return result.get_counts()
+
+
+def _real_virtual_counts(
+    circuit: QuantumCircuit | VirtualCircuit,
+    shots: int,
+    backend_name: str,
+) -> Dict[str, int]:
+    vc = circuit if isinstance(circuit, VirtualCircuit) else VirtualCircuit(circuit)
+    results: Dict = {}
+    for frag, frag_circ in vc.fragment_circuits.items():
+        inst_labels = vc.get_instance_labels(frag)
+        instantiations = generate_instantiations(frag_circ, inst_labels)
+        distrs = []
+        for inst in instantiations:
+            counts = _real_counts(inst, shots, backend_name)
+            distrs.append(QuasiDistr.from_counts(counts))
+        results[frag] = distrs
+    quasi = vc.knit(results, SerialPool())
+    return quasi.to_counts(vc._circuit.num_clbits, shots)
+
+
+def _real_fidelity_for_circuit(
+    circuit: QuantumCircuit,
+    shots: int,
+    backend_name: str,
+    seed: int,
+) -> float:
+    if _has_virtual_ops(circuit):
+        ideal = _simulate_virtual_counts(circuit, shots, None, seed)
+        noisy = _real_virtual_counts(circuit, shots, backend_name)
+    else:
+        ideal = _simulate_counts(circuit, shots, None, seed)
+        noisy = _real_counts(circuit, shots, backend_name)
+    if not ideal or not noisy:
+        return 0.0
+    return _hellinger_fidelity_from_counts(ideal, noisy)
+
+
+def _average_real_fidelity(
+    circuits: List[QuantumCircuit],
+    shots: int,
+    backend_name: str,
+    seed: int,
+) -> float:
+    vals = [_real_fidelity_for_circuit(c, shots, backend_name, seed) for c in circuits]
+    return float(sum(vals) / max(1, len(vals)))
+
+
 def _fidelity_for_circuit(
     circuit: QuantumCircuit,
     shots: int,
@@ -818,6 +904,7 @@ def _plot_combined(
     out_dir: Path,
     timestamp: str,
     fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    real_fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
     methods: Optional[List[str]] = None,
     fidelity_methods: Optional[List[str]] = None,
 ) -> Path:
@@ -828,7 +915,7 @@ def _plot_combined(
         fidelity_methods = _fidelity_methods(False)
     sizes = sorted(rel_by_size.keys())
     rows = max(1, len(sizes))
-    cols = 3 if fidelity_by_size else 2
+    cols = 2 + (1 if fidelity_by_size else 0) + (1 if real_fidelity_by_size else 0)
     fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 3.6 * rows))
     if rows == 1:
         axes = np.array([axes])
@@ -858,6 +945,18 @@ def _plot_combined(
             _plot_panel(
                 axes[row, 2],
                 f"Hellinger fidelity - {size} qubits (higher is better)",
+                fidelity,
+                benches,
+                fidelity_methods,
+                "Fidelity",
+                show_avg=True,
+            )
+        if real_fidelity_by_size:
+            col = 3 if fidelity_by_size else 2
+            fidelity = real_fidelity_by_size.get(size, {})
+            _plot_panel(
+                axes[row, col],
+                f"Real Hellinger fidelity - {size} qubits (higher is better)",
                 fidelity,
                 benches,
                 fidelity_methods,
@@ -1260,6 +1359,7 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
     timing_rows = []
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
     fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
     include_qose = qose_run is not None and "QOSE" in methods
@@ -1277,6 +1377,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
         rel_nonlocal: Dict[str, Dict[str, float]] = {bench: {} for bench, _ in BENCHES}
         if args.with_fidelity:
             fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
+        if args.with_real_fidelity:
+            real_fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
 
         for bench, _label in benches:
             if args.verbose:
@@ -1491,6 +1593,50 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                 rel_fidelity_cutqc = ""
                 rel_fidelity_qose = ""
 
+            if args.with_real_fidelity:
+                real_base = _average_real_fidelity(
+                    [qc],
+                    args.real_fidelity_shots,
+                    args.real_backend,
+                    args.fidelity_seed,
+                )
+                real_fidelity_by_size[size][bench]["Qiskit"] = real_base
+                if run_qos and qos_circs is not None:
+                    real_fidelity_by_size[size][bench]["QOS"] = _average_real_fidelity(
+                        qos_circs,
+                        args.real_fidelity_shots,
+                        args.real_backend,
+                        args.fidelity_seed,
+                    )
+                if run_qosn and qosn_circs is not None:
+                    real_fidelity_by_size[size][bench]["QOSN"] = _average_real_fidelity(
+                        qosn_circs,
+                        args.real_fidelity_shots,
+                        args.real_backend,
+                        args.fidelity_seed,
+                    )
+                if run_fq and fq_circs is not None:
+                    real_fidelity_by_size[size][bench]["FrozenQubits"] = _average_real_fidelity(
+                        fq_circs,
+                        args.real_fidelity_shots,
+                        args.real_backend,
+                        args.fidelity_seed,
+                    )
+                if run_cutqc and cutqc_circs is not None:
+                    real_fidelity_by_size[size][bench]["CutQC"] = _average_real_fidelity(
+                        cutqc_circs,
+                        args.real_fidelity_shots,
+                        args.real_backend,
+                        args.fidelity_seed,
+                    )
+                if include_qose and qose_circs is not None:
+                    real_fidelity_by_size[size][bench]["QOSE"] = _average_real_fidelity(
+                        qose_circs,
+                        args.real_fidelity_shots,
+                        args.real_backend,
+                        args.fidelity_seed,
+                    )
+
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
 
             row = {
@@ -1624,7 +1770,15 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
 
         rel_by_size[size] = (rel_depth, rel_nonlocal)
 
-    return all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity
+    return (
+        all_rows,
+        rel_by_size,
+        timing_rows,
+        fidelity_by_size,
+        real_fidelity_by_size,
+        cut_circuits,
+        fragment_fidelity,
+    )
 
 
 def _load_qose_run_from_args(args) -> Tuple[Optional[Callable], Optional[Path]]:
@@ -1722,6 +1876,9 @@ def main() -> None:
     parser.add_argument("--fidelity-seed", type=int, default=7)
     parser.add_argument("--fidelity-p1", type=float, default=0.001, help="1-qubit depolarizing error.")
     parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")
+    parser.add_argument("--with-real-fidelity", action="store_true")
+    parser.add_argument("--real-fidelity-shots", type=int, default=1000)
+    parser.add_argument("--real-backend", default="ibm_kolkata")
     parser.add_argument("--fragment-fidelity-sweep", action="store_true")
     parser.add_argument(
         "--fragment-fidelity-shots",
@@ -1886,9 +2043,15 @@ def main() -> None:
         os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
         os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
-            args, benches, sizes, qose_run, selected_methods
-        )
+        (
+            all_rows,
+            rel_by_size,
+            timing_rows,
+            fidelity_by_size,
+            real_fidelity_by_size,
+            cut_circuits,
+            fragment_fidelity,
+        ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
         print(f"Wrote sweep: {sweep_path}")
         print(
             "Best config:"
@@ -1897,9 +2060,15 @@ def main() -> None:
             f" cost_iters={best_cost_iter}"
         )
     else:
-        all_rows, rel_by_size, timing_rows, fidelity_by_size, cut_circuits, fragment_fidelity = _run_eval(
-            args, benches, sizes, qose_run, selected_methods
-        )
+        (
+            all_rows,
+            rel_by_size,
+            timing_rows,
+            fidelity_by_size,
+            real_fidelity_by_size,
+            cut_circuits,
+            fragment_fidelity,
+        ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
 
     fidelity_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
     combined_path = _plot_combined(
@@ -1908,6 +2077,7 @@ def main() -> None:
         out_dir,
         f"{timestamp}{tag_suffix}",
         fidelity_by_size if args.with_fidelity else None,
+        real_fidelity_by_size if args.with_real_fidelity else None,
         methods=selected_methods,
         fidelity_methods=fidelity_methods,
     )
