@@ -287,7 +287,7 @@ class ErrorMitigator():
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
         t0 = time.perf_counter()
-        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "60"))
+        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
         self._qose_cost_search_error = None
         if timeout_sec <= 0:
             trace_queue = queue_mod.Queue()

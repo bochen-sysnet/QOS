@@ -1,5 +1,5 @@
-max_iterations: 20
-checkpoint_interval: 5
+max_iterations: 100
+checkpoint_interval: 20
 log_level: "INFO"
 log_dir: null
 random_seed: 42
@@ -16,20 +16,14 @@ early_stopping_metric: "combined_score"
 llm:
   api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
   api_key: "${GEMINI_API_KEY}"
-  models:
-    # Edit this before run, e.g. "gemini-3-flash"
-    # gemini-2.5-flash-lite
-    # gemini-2.5-flash 
-    # gemini-3-flash-preview 
-    # gemini-3-pro-preview 
-    - name: "gemini-2.5-flash-lite"
-      weight: 1.0
-  temperature: 0.75
-  top_p: 0.92
+  # available models: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview
+  primary_model: "gemini-2.5-flash-lite"
+  temperature: 0.7
+  top_p: 0.9
   max_tokens: 4096
   timeout: 450
   retries: 3
-  retry_delay: 1
+  retry_delay: 5
 
 prompt:
   system_message: |
@@ -41,8 +35,9 @@ prompt:
     - Output code only: no explanations, no markdown fences, no extra text.
 
     GENERALIZATION REQUIREMENT (CRITICAL):
-    - The evaluation will use a set of 9 circuits.
-    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.).
+    - The evaluator samples 10 random (circuit_type, num_qubits) pairs each run.
+    - Qubit counts are constrained to 12–24 and must exist in the benchmark set.
+    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.) and sizes.
     - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
 
     FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
@@ -116,7 +111,6 @@ prompt:
       - qos_depth_avg: average absolute depth of QOS
       - qos_cnot_avg: average absolute nonlocal gate count of QOS
       - qos_overhead_avg: average absolute number of QOS circuits
-
 
     POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
