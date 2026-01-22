@@ -447,19 +447,19 @@ def _ensure_measurements(circuit: QuantumCircuit | VirtualCircuit) -> QuantumCir
 def _import_aer():
     try:
         from qiskit_aer import AerSimulator  # type: ignore
-        from qiskit_aer.noise import NoiseModel, depolarizing_error  # type: ignore
-        return AerSimulator, NoiseModel, depolarizing_error
+        from qiskit_aer.noise import NoiseModel, depolarizing_error, ReadoutError  # type: ignore
+        return AerSimulator, NoiseModel, depolarizing_error, ReadoutError
     except ModuleNotFoundError:
         user_site = site.getusersitepackages()
         if user_site and user_site not in sys.path:
             sys.path.append(user_site)
         from qiskit_aer import AerSimulator  # type: ignore
-        from qiskit_aer.noise import NoiseModel, depolarizing_error  # type: ignore
-        return AerSimulator, NoiseModel, depolarizing_error
+        from qiskit_aer.noise import NoiseModel, depolarizing_error, ReadoutError  # type: ignore
+        return AerSimulator, NoiseModel, depolarizing_error, ReadoutError
 
 
-def _noise_model(p1: float, p2: float):
-    AerSimulator, NoiseModel, depolarizing_error = _import_aer()
+def _noise_model(p1: float, p2: float, readout: float):
+    AerSimulator, NoiseModel, depolarizing_error, ReadoutError = _import_aer()
     noise = NoiseModel()
     err1 = depolarizing_error(p1, 1)
     err2 = depolarizing_error(p2, 2)
@@ -467,6 +467,9 @@ def _noise_model(p1: float, p2: float):
     two_q = ["cx", "cz", "swap", "rzz", "cp", "ecr"]
     noise.add_all_qubit_quantum_error(err1, one_q)
     noise.add_all_qubit_quantum_error(err2, two_q)
+    if readout > 0:
+        ro = ReadoutError([[1 - readout, readout], [readout, 1 - readout]])
+        noise.add_all_qubit_readout_error(ro)
     return noise
 
 
@@ -488,7 +491,7 @@ def _hellinger_fidelity_from_counts(ideal: Dict[str, int], noisy: Dict[str, int]
 
 
 def _simulate_counts(circuit: QuantumCircuit, shots: int, noise, seed: int) -> Dict[str, int]:
-    AerSimulator, _, _ = _import_aer()
+    AerSimulator, _, _, _ = _import_aer()
     sim = AerSimulator(noise_model=noise) if noise else AerSimulator()
     circ = _ensure_measurements(circuit)
     result = sim.run(circ, shots=shots, seed_simulator=seed, seed_transpiler=seed).result()
@@ -651,6 +654,18 @@ def _real_virtual_counts(
     return quasi.to_counts(vc._circuit.num_clbits, shots)
 
 
+def _count_real_jobs(circuit: QuantumCircuit) -> int:
+    if _has_virtual_ops(circuit):
+        vc = VirtualCircuit(_normalize_circuit(circuit))
+        total = 0
+        for frag, frag_circ in vc.fragment_circuits.items():
+            inst_labels = vc.get_instance_labels(frag)
+            instantiations = generate_instantiations(frag_circ, inst_labels)
+            total += len(instantiations)
+        return total
+    return 1
+
+
 def _real_fidelity_for_circuit(
     circuit: QuantumCircuit,
     shots: int,
@@ -677,11 +692,13 @@ def _average_real_fidelity(
     total = len(circuits)
     vals = []
     for idx, circuit in enumerate(circuits, start=1):
+        job_count = _count_real_jobs(circuit)
         _EVAL_LOGGER.warning(
-            "Real QPU progress %s/%s backend=%s",
+            "Real QPU progress %s/%s backend=%s jobs=%s",
             idx,
             total,
             backend_name,
+            job_count,
         )
         vals.append(_real_fidelity_for_circuit(circuit, shots, backend_name, seed))
     return float(sum(vals) / max(1, len(vals)))
@@ -1483,7 +1500,19 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
 
     noise = None
     if args.with_fidelity or args.fragment_fidelity_sweep:
-        noise = _noise_model(args.fidelity_p1, args.fidelity_p2)
+        if args.metrics_baseline == "torino":
+            p1 = args.fidelity_p1 or 2.59e-3
+            p2 = args.fidelity_p2 or 7.91e-3
+            ro = args.fidelity_readout or 3.113e-2
+        elif args.metrics_baseline == "marrakesh":
+            p1 = args.fidelity_p1 or 2.67e-3
+            p2 = args.fidelity_p2 or 5.57e-3
+            ro = args.fidelity_readout or 1.172e-2
+        else:
+            p1 = args.fidelity_p1
+            p2 = args.fidelity_p2
+            ro = args.fidelity_readout
+        noise = _noise_model(p1, p2, ro)
 
     for size in sizes:
         rel_depth: Dict[str, Dict[str, float]] = {bench: {} for bench, _ in BENCHES}
@@ -1987,8 +2016,9 @@ def main() -> None:
     parser.add_argument("--with-fidelity", action="store_true")
     parser.add_argument("--fidelity-shots", type=int, default=200)
     parser.add_argument("--fidelity-seed", type=int, default=7)
-    parser.add_argument("--fidelity-p1", type=float, default=0.001, help="1-qubit depolarizing error.")
-    parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")
+    parser.add_argument("--fidelity-p1", type=float, default=0.0, help="1-qubit depolarizing error.")
+    parser.add_argument("--fidelity-p2", type=float, default=0.0, help="2-qubit depolarizing error.")
+    parser.add_argument("--fidelity-readout", type=float, default=0.0, help="Readout error.")
     parser.add_argument("--with-real-fidelity", action="store_true")
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
     parser.add_argument("--real-backend", default="ibm_torino")
