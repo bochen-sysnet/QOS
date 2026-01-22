@@ -5,6 +5,7 @@ import os
 import random
 import time
 import traceback
+import multiprocessing as mp
 from types import SimpleNamespace
 from openevolve.evaluation_result import EvaluationResult
 
@@ -158,6 +159,7 @@ def _evaluate_impl(program_path):
 
             # Baseline QOS
             current_stage = "baseline_qos_run"
+            logger.warning("Baseline QOS run start bench=%s size=%s", bench, size)
             qos_q = Qernel(qc.copy())
             qos_mitigator = ErrorMitigator(
                 size_to_reach=args.size_to_reach,
@@ -172,8 +174,8 @@ def _evaluate_impl(program_path):
             t0 = time.perf_counter()
             qos_q = qos_mitigator.run(qos_q)
             qos_run_time = time.perf_counter() - t0
-            logger.debug(
-                "Baseline QOS done bench=%s size=%s sec=%.2f",
+            logger.warning(
+                "Baseline QOS run done bench=%s size=%s sec=%.2f",
                 bench,
                 size,
                 qos_run_time,
@@ -181,26 +183,26 @@ def _evaluate_impl(program_path):
             total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
             total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
             current_stage = "baseline_qos_analyze"
-            logger.debug("Baseline QOS analyze start bench=%s size=%s", bench, size)
+            logger.warning("Baseline QOS analyze start bench=%s size=%s", bench, size)
             qos_m = _analyze_qernel(
                 qos_q,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
-            logger.debug("Baseline QOS analyze done bench=%s size=%s", bench, size)
+            logger.warning("Baseline QOS analyze done bench=%s size=%s", bench, size)
             current_stage = "baseline_qos_extract"
-            logger.debug("Baseline QOS extract circuits start bench=%s size=%s", bench, size)
+            logger.warning("Baseline QOS extract start bench=%s size=%s", bench, size)
             qos_circs = _extract_circuits(qos_q)
-            logger.debug("Baseline QOS extract circuits done bench=%s size=%s", bench, size)
+            logger.warning("Baseline QOS extract done bench=%s size=%s", bench, size)
 
             # Evolved QOSE
             current_stage = "qose_analysis"
-            logger.debug("QOSE analysis start bench=%s size=%s", bench, size)
+            logger.warning("QOSE analysis start bench=%s size=%s", bench, size)
             q = Qernel(qc.copy())
             BasicAnalysisPass().run(q)
             SupermarqFeaturesAnalysisPass().run(q)
-            logger.debug("QOSE analysis done bench=%s size=%s", bench, size)
+            logger.warning("QOSE analysis done bench=%s size=%s", bench, size)
             input_meta = q.get_metadata()
             input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
             mitigator = ErrorMitigator(
@@ -209,7 +211,7 @@ def _evaluate_impl(program_path):
                 budget=args.budget,
                 methods=[],
                 use_cost_search=args.qos_cost_search,
-                collect_timing=False,
+                collect_timing=True,
             )
             mitigator._cost_search_impl = evolved_cost_search.__get__(
                 mitigator, ErrorMitigator
@@ -252,7 +254,7 @@ def _evaluate_impl(program_path):
             OptimalWireCuttingPass.cost = _wc_cost
             try:
                 current_stage = "qose_run"
-                logger.debug("QOSE run start bench=%s size=%s", bench, size)
+                logger.warning("QOSE run start bench=%s size=%s", bench, size)
                 t0 = time.perf_counter()
                 q = mitigator.run(q)
                 run_time = time.perf_counter() - t0
@@ -264,14 +266,53 @@ def _evaluate_impl(program_path):
                     {"combined_score": -1000.0},
                     {"info": f"Cost search failed: {mitigator._qose_cost_search_error}"},
                 )
-            logger.debug("QOSE done bench=%s size=%s sec=%.2f", bench, size, run_time)
+            logger.warning("QOSE run done bench=%s size=%s sec=%.2f", bench, size, run_time)
+            timings = getattr(mitigator, "timings", {}) or {}
+            total_time = float(timings.get("total", run_time))
+            analysis_time = float(timings.get("analysis", 0.0))
+            qaoa_analysis_time = float(timings.get("qaoa_analysis", 0.0))
+            qf_time = float(timings.get("qf", 0.0))
+            cut_select_time = float(timings.get("cut_select", 0.0))
+            cost_search_time = float(timings.get("cost_search", 0.0))
+            gv_time = float(timings.get("gv", 0.0))
+            wc_time = float(timings.get("wc", 0.0))
+            qr_time = float(timings.get("qr", 0.0))
+            accounted = (
+                analysis_time
+                + qaoa_analysis_time
+                + qf_time
+                + cut_select_time
+                + cost_search_time
+                + gv_time
+                + wc_time
+                + qr_time
+            )
+            other_time = max(0.0, total_time - accounted)
+            logger.warning(
+                "QOSE timing bench=%s size=%s total=%.2f analysis=%.2f qaoa=%.2f "
+                "qf=%.2f cut_select=%.2f cost_search=%.2f gv=%.2f wc=%.2f qr=%.2f other=%.2f",
+                bench,
+                size,
+                total_time,
+                analysis_time,
+                qaoa_analysis_time,
+                qf_time,
+                cut_select_time,
+                cost_search_time,
+                gv_time,
+                wc_time,
+                qr_time,
+                other_time,
+            )
             current_stage = "qose_analyze"
+            logger.warning("QOSE analyze start bench=%s size=%s", bench, size)
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
+            logger.warning("QOSE analyze done bench=%s size=%s", bench, size)
             qose_circs = _extract_circuits(q)
         except Exception as exc:
             trace = traceback.format_exc()
@@ -390,13 +431,47 @@ def _evaluate_impl(program_path):
 
 
 def evaluate(program_path):
-    try:
-        metrics, artifacts = _evaluate_impl(program_path)
-    except Exception as exc:
-        trace = traceback.format_exc()
-        metrics = {"combined_score": -1000.0}
-        artifacts = {"info": f"Evaluation failed: {exc}\n{trace}"}
-        logger.error("Evaluation failed with traceback:\n%s", trace)
+    timeout_sec = int(os.getenv("QOSE_EVAL_TIMEOUT_SEC", "2400"))
+    if timeout_sec <= 0:
+        try:
+            metrics, artifacts = _evaluate_impl(program_path)
+        except Exception as exc:
+            trace = traceback.format_exc()
+            metrics = {"combined_score": -1000.0}
+            artifacts = {"info": f"Evaluation failed: {exc}\n{trace}"}
+            logger.error("Evaluation failed with traceback:\n%s", trace)
+    else:
+        mp_ctx = (
+            mp.get_context("fork")
+            if "fork" in mp.get_all_start_methods()
+            else mp.get_context()
+        )
+        result_queue = mp_ctx.Queue()
+        proc = mp_ctx.Process(
+            target=_evaluate_worker, args=(program_path, result_queue)
+        )
+        proc.start()
+        proc.join(timeout_sec)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join()
+            metrics = {"combined_score": -1000.0}
+            artifacts = {"info": f"Evaluation timed out after {timeout_sec}s"}
+        else:
+            try:
+                result = result_queue.get_nowait()
+            except Exception:
+                metrics = {"combined_score": -1000.0}
+                artifacts = {"info": "Evaluation failed: no result returned"}
+            else:
+                if result.get("ok"):
+                    metrics = result.get("metrics", {"combined_score": -1000.0})
+                    artifacts = result.get("artifacts", {})
+                else:
+                    info = result.get("error", "Evaluation failed")
+                    trace = result.get("trace", "")
+                    metrics = {"combined_score": -1000.0}
+                    artifacts = {"info": f"{info}\n{trace}"}
     if float(metrics.get("combined_score", 0.0)) <= -999.0 and "info" in artifacts:
         metrics = dict(metrics)
         metrics["failure_reason"] = artifacts.get("info")
@@ -407,3 +482,17 @@ def evaluate(program_path):
         metrics=_round_float_values(metrics),
         artifacts=_round_float_values(artifacts),
     )
+
+
+def _evaluate_worker(program_path, result_queue):
+    try:
+        metrics, artifacts = _evaluate_impl(program_path)
+        result_queue.put({"ok": True, "metrics": metrics, "artifacts": artifacts})
+    except Exception as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "error": f"Evaluation failed: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
