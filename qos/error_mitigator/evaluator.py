@@ -4,6 +4,7 @@ import numbers
 import os
 import random
 import time
+import traceback
 from types import SimpleNamespace
 from openevolve.evaluation_result import EvaluationResult
 
@@ -107,7 +108,7 @@ def _evaluate_impl(program_path):
             candidate_pairs.append((bench, size))
     if not candidate_pairs:
         return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
-    pair_count = int(os.getenv("QOSE_NUM_SAMPLES", "3"))
+    pair_count = int(os.getenv("QOSE_NUM_SAMPLES", "10"))
     if seed is None:
         rng = random.Random()
     else:
@@ -146,116 +147,146 @@ def _evaluate_impl(program_path):
     total_wc_calls = 0
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
+    failure_traces = []
     for bench, size in bench_size_pairs:
-        logger.debug("Evaluating bench=%s size=%s", bench, size)
-        qc = _load_qasm_circuit(bench, size)
-
-        # Baseline QOS
-        qos_q = Qernel(qc.copy())
-        qos_mitigator = ErrorMitigator(
-            size_to_reach=args.size_to_reach,
-            ideal_size_to_reach=args.ideal_size_to_reach,
-            budget=args.budget,
-            methods=[],
-            use_cost_search=args.qos_cost_search,
-            collect_timing=False,
-        )
-        qos_mitigator._gv_cost_calls = 0
-        qos_mitigator._wc_cost_calls = 0
-        t0 = time.perf_counter()
-        qos_q = qos_mitigator.run(qos_q)
-        qos_run_time = time.perf_counter() - t0
-        logger.debug("Baseline QOS done bench=%s size=%s sec=%.2f", bench, size, qos_run_time)
-        total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
-        total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
-        logger.debug("Baseline QOS analyze start bench=%s size=%s", bench, size)
-        qos_m = _analyze_qernel(
-            qos_q,
-            args.metric_mode,
-            args.metrics_baseline,
-            args.metrics_optimization_level,
-        )
-        logger.debug("Baseline QOS analyze done bench=%s size=%s", bench, size)
-        logger.debug("Baseline QOS extract circuits start bench=%s size=%s", bench, size)
-        qos_circs = _extract_circuits(qos_q)
-        logger.debug("Baseline QOS extract circuits done bench=%s size=%s", bench, size)
-
-        # Evolved QOSE
-        logger.debug("QOSE analysis start bench=%s size=%s", bench, size)
-        q = Qernel(qc.copy())
-        BasicAnalysisPass().run(q)
-        SupermarqFeaturesAnalysisPass().run(q)
-        logger.debug("QOSE analysis done bench=%s size=%s", bench, size)
-        input_meta = q.get_metadata()
-        input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
-        mitigator = ErrorMitigator(
-            size_to_reach=args.size_to_reach,
-            ideal_size_to_reach=args.ideal_size_to_reach,
-            budget=args.budget,
-            methods=[],
-            use_cost_search=args.qos_cost_search,
-            collect_timing=False,
-        )
-        mitigator._cost_search_impl = evolved_cost_search.__get__(
-            mitigator, ErrorMitigator
-        )
-        mitigator._gv_cost_calls = 0
-        mitigator._wc_cost_calls = 0
-        mitigator._cost_search_calls = 0
-        mitigator._cost_search_time = 0.0
-        mitigator._qose_cost_search_input_size = None
-        mitigator._qose_cost_search_budget = None
-        mitigator._qose_cost_search_output_size = None
-        mitigator._qose_cost_search_method = None
-        mitigator._qose_gv_cost_trace = None
-        mitigator._qose_wc_cost_trace = None
-        mitigator._qose_gv_time_trace = None
-        mitigator._qose_wc_time_trace = None
-        orig_cost_search = mitigator.cost_search
-        gv_cost_orig = GVOptimalDecompositionPass.cost
-        wc_cost_orig = OptimalWireCuttingPass.cost
-
-        def _wrap_cost_search(*args, **kwargs):
-            t0 = time.perf_counter()
-            size, method, cost_time, timed_out = orig_cost_search(*args, **kwargs)
-            dt = time.perf_counter() - t0
-            mitigator._cost_search_calls += 1
-            mitigator._cost_search_time += dt
-            return size, method, cost_time, timed_out
-
-        mitigator.cost_search = _wrap_cost_search
-
-        def _gv_cost(self, *args, **kwargs):
-            mitigator._gv_cost_calls += 1
-            return gv_cost_orig(self, *args, **kwargs)
-
-        def _wc_cost(self, *args, **kwargs):
-            mitigator._wc_cost_calls += 1
-            return wc_cost_orig(self, *args, **kwargs)
-
-        GVOptimalDecompositionPass.cost = _gv_cost
-        OptimalWireCuttingPass.cost = _wc_cost
+        if count >= pair_count:
+            break
+        logger.warning("Evaluating bench=%s size=%s", bench, size)
+        current_stage = "load_qasm"
         try:
-            logger.debug("QOSE run start bench=%s size=%s", bench, size)
-            t0 = time.perf_counter()
-            q = mitigator.run(q)
-            run_time = time.perf_counter() - t0
-        finally:
-            GVOptimalDecompositionPass.cost = gv_cost_orig
-            OptimalWireCuttingPass.cost = wc_cost_orig
-        if getattr(mitigator, "_qose_cost_search_error", None):
-            return (
-                {"combined_score": -1000.0},
-                {"info": f"Cost search failed: {mitigator._qose_cost_search_error}"},
+            qc = _load_qasm_circuit(bench, size)
+
+            # Baseline QOS
+            current_stage = "baseline_qos_run"
+            qos_q = Qernel(qc.copy())
+            qos_mitigator = ErrorMitigator(
+                size_to_reach=args.size_to_reach,
+                ideal_size_to_reach=args.ideal_size_to_reach,
+                budget=args.budget,
+                methods=[],
+                use_cost_search=args.qos_cost_search,
+                collect_timing=False,
             )
-        logger.debug("QOSE done bench=%s size=%s sec=%.2f", bench, size, run_time)
-        qose_m = _analyze_qernel(
-            q,
-            args.metric_mode,
-            args.metrics_baseline,
-            args.metrics_optimization_level,
-        )
-        qose_circs = _extract_circuits(q)
+            qos_mitigator._gv_cost_calls = 0
+            qos_mitigator._wc_cost_calls = 0
+            t0 = time.perf_counter()
+            qos_q = qos_mitigator.run(qos_q)
+            qos_run_time = time.perf_counter() - t0
+            logger.debug(
+                "Baseline QOS done bench=%s size=%s sec=%.2f",
+                bench,
+                size,
+                qos_run_time,
+            )
+            total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
+            total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
+            current_stage = "baseline_qos_analyze"
+            logger.debug("Baseline QOS analyze start bench=%s size=%s", bench, size)
+            qos_m = _analyze_qernel(
+                qos_q,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            )
+            logger.debug("Baseline QOS analyze done bench=%s size=%s", bench, size)
+            current_stage = "baseline_qos_extract"
+            logger.debug("Baseline QOS extract circuits start bench=%s size=%s", bench, size)
+            qos_circs = _extract_circuits(qos_q)
+            logger.debug("Baseline QOS extract circuits done bench=%s size=%s", bench, size)
+
+            # Evolved QOSE
+            current_stage = "qose_analysis"
+            logger.debug("QOSE analysis start bench=%s size=%s", bench, size)
+            q = Qernel(qc.copy())
+            BasicAnalysisPass().run(q)
+            SupermarqFeaturesAnalysisPass().run(q)
+            logger.debug("QOSE analysis done bench=%s size=%s", bench, size)
+            input_meta = q.get_metadata()
+            input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
+            mitigator = ErrorMitigator(
+                size_to_reach=args.size_to_reach,
+                ideal_size_to_reach=args.ideal_size_to_reach,
+                budget=args.budget,
+                methods=[],
+                use_cost_search=args.qos_cost_search,
+                collect_timing=False,
+            )
+            mitigator._cost_search_impl = evolved_cost_search.__get__(
+                mitigator, ErrorMitigator
+            )
+            mitigator._gv_cost_calls = 0
+            mitigator._wc_cost_calls = 0
+            mitigator._cost_search_calls = 0
+            mitigator._cost_search_time = 0.0
+            mitigator._qose_cost_search_input_size = None
+            mitigator._qose_cost_search_budget = None
+            mitigator._qose_cost_search_output_size = None
+            mitigator._qose_cost_search_method = None
+            mitigator._qose_gv_cost_trace = None
+            mitigator._qose_wc_cost_trace = None
+            mitigator._qose_gv_time_trace = None
+            mitigator._qose_wc_time_trace = None
+            orig_cost_search = mitigator.cost_search
+            gv_cost_orig = GVOptimalDecompositionPass.cost
+            wc_cost_orig = OptimalWireCuttingPass.cost
+
+            def _wrap_cost_search(*args, **kwargs):
+                t0 = time.perf_counter()
+                size, method, cost_time, timed_out = orig_cost_search(*args, **kwargs)
+                dt = time.perf_counter() - t0
+                mitigator._cost_search_calls += 1
+                mitigator._cost_search_time += dt
+                return size, method, cost_time, timed_out
+
+            mitigator.cost_search = _wrap_cost_search
+
+            def _gv_cost(self, *args, **kwargs):
+                mitigator._gv_cost_calls += 1
+                return gv_cost_orig(self, *args, **kwargs)
+
+            def _wc_cost(self, *args, **kwargs):
+                mitigator._wc_cost_calls += 1
+                return wc_cost_orig(self, *args, **kwargs)
+
+            GVOptimalDecompositionPass.cost = _gv_cost
+            OptimalWireCuttingPass.cost = _wc_cost
+            try:
+                current_stage = "qose_run"
+                logger.debug("QOSE run start bench=%s size=%s", bench, size)
+                t0 = time.perf_counter()
+                q = mitigator.run(q)
+                run_time = time.perf_counter() - t0
+            finally:
+                GVOptimalDecompositionPass.cost = gv_cost_orig
+                OptimalWireCuttingPass.cost = wc_cost_orig
+            if getattr(mitigator, "_qose_cost_search_error", None):
+                return (
+                    {"combined_score": -1000.0},
+                    {"info": f"Cost search failed: {mitigator._qose_cost_search_error}"},
+                )
+            logger.debug("QOSE done bench=%s size=%s sec=%.2f", bench, size, run_time)
+            current_stage = "qose_analyze"
+            qose_m = _analyze_qernel(
+                q,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            )
+            qose_circs = _extract_circuits(q)
+        except Exception as exc:
+            trace = traceback.format_exc()
+            failure_traces.append(
+                f"Stage={current_stage} bench={bench} size={size}\n{trace}"
+            )
+            logger.error(
+                "Evaluation failed bench=%s size=%s stage=%s: %s\n%s",
+                bench,
+                size,
+                current_stage,
+                exc,
+                trace,
+            )
+            continue
         total_run_time += run_time
         total_qos_run_time += qos_run_time
 
@@ -317,8 +348,17 @@ def _evaluate_impl(program_path):
         )
         count += 1
 
-    if count == 0:
-        return {"combined_score": -1000.0}, {"info": "No benches/sizes"}
+    if count < pair_count:
+        trace_blob = "\n\n".join(failure_traces)
+        return (
+            {"combined_score": -1000.0},
+            {
+                "info": (
+                    "Evaluation failed: "
+                    f"only {count}/{pair_count} successful runs.\n{trace_blob}"
+                )
+            },
+        )
 
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
@@ -353,8 +393,10 @@ def evaluate(program_path):
     try:
         metrics, artifacts = _evaluate_impl(program_path)
     except Exception as exc:
+        trace = traceback.format_exc()
         metrics = {"combined_score": -1000.0}
-        artifacts = {"info": f"Evaluation failed: {exc}"}
+        artifacts = {"info": f"Evaluation failed: {exc}\n{trace}"}
+        logger.error("Evaluation failed with traceback:\n%s", trace)
     if float(metrics.get("combined_score", 0.0)) <= -999.0 and "info" in artifacts:
         metrics = dict(metrics)
         metrics["failure_reason"] = artifacts.get("info")

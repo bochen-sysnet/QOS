@@ -287,7 +287,7 @@ class ErrorMitigator():
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
         t0 = time.perf_counter()
-        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
+        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "60"))
         self._qose_cost_search_error = None
         if timeout_sec <= 0:
             trace_queue = queue_mod.Queue()
@@ -421,7 +421,16 @@ class ErrorMitigator():
             if _is_verbose():
                 print(f"[QOS] applyWC start size_to_reach={size_to_reach}", flush=True)
             t0 = time.perf_counter()
-            q = wc_pass.run(q, self.budget)
+            try:
+                q = wc_pass.run(q, self.budget)
+            except ValueError as exc:
+                if _is_verbose():
+                    print(
+                        f"[QOS] applyWC failed size_to_reach={size_to_reach} "
+                        f"error={exc}",
+                        flush=True,
+                    )
+                return q
             if _is_verbose():
                 print(
                     f"[QOS] applyWC done size_to_reach={size_to_reach} "

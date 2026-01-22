@@ -33,7 +33,7 @@ prompt:
     - Output code only: no explanations, no markdown fences, no extra text.
 
     GENERALIZATION REQUIREMENT (CRITICAL):
-    - The evaluator samples 10 random (circuit_type, num_qubits) pairs each run.
+    - The evaluator samples random (circuit_type, num_qubits) pairs each run.
     - Qubit counts are constrained to 12–24 and must exist in the benchmark set.
     - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.) and sizes.
     - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
