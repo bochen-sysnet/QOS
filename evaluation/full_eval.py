@@ -571,6 +571,46 @@ def _quasi_to_counts(quasi, shots: int, num_bits: int) -> Dict[str, int]:
     return counts
 
 
+def _sampler_result_to_counts(result, shots: int, num_bits: int) -> Dict[str, int]:
+    quasi_dists = getattr(result, "quasi_dists", None)
+    if quasi_dists is not None:
+        return _quasi_to_counts(quasi_dists[0], shots, num_bits)
+
+    pub = None
+    try:
+        pub = result[0]
+    except Exception:
+        pub = None
+
+    if pub is not None:
+        if hasattr(pub, "join_data"):
+            try:
+                bitarray = pub.join_data()
+                if hasattr(bitarray, "get_counts"):
+                    return bitarray.get_counts()
+            except Exception:
+                pass
+
+        data = getattr(pub, "data", None)
+        if data is not None:
+            try:
+                for name in data:
+                    val = data[name]
+                    if hasattr(val, "get_counts"):
+                        return val.get_counts()
+            except Exception:
+                pass
+            if hasattr(data, "meas"):
+                val = data.meas
+                if hasattr(val, "get_counts"):
+                    return val.get_counts()
+
+    if hasattr(result, "items"):
+        return _quasi_to_counts(result, shots, num_bits)
+
+    raise RuntimeError("Unsupported sampler result type for counts extraction.")
+
+
 def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict[str, int]:
     backend = _get_real_backend(backend_name)
     circ = _ensure_measurements(circuit)
@@ -584,11 +624,7 @@ def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict
         sampler = Sampler(mode=backend)
         job = sampler.run([tcirc], shots=shots)
         result = job.result()
-        quasi_dists = getattr(result, "quasi_dists", None)
-        if quasi_dists is None:
-            quasi_dists = result
-        quasi = quasi_dists[0]
-        return _quasi_to_counts(quasi, shots, tcirc.num_clbits)
+        return _sampler_result_to_counts(result, shots, tcirc.num_clbits)
     except Exception as exc:
         raise RuntimeError(
             "Real-backend execution failed. "
@@ -638,7 +674,16 @@ def _average_real_fidelity(
     backend_name: str,
     seed: int,
 ) -> float:
-    vals = [_real_fidelity_for_circuit(c, shots, backend_name, seed) for c in circuits]
+    total = len(circuits)
+    vals = []
+    for idx, circuit in enumerate(circuits, start=1):
+        _EVAL_LOGGER.warning(
+            "Real QPU progress %s/%s backend=%s",
+            idx,
+            total,
+            backend_name,
+        )
+        vals.append(_real_fidelity_for_circuit(circuit, shots, backend_name, seed))
     return float(sum(vals) / max(1, len(vals)))
 
 
