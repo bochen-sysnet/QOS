@@ -58,13 +58,13 @@ def _evaluate_impl(program_path):
         return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
 
     args = SimpleNamespace(
-        size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "12")),
+        size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "0")),
         ideal_size_to_reach=int(os.getenv("QOSE_IDEAL_SIZE_TO_REACH", "2")),
         budget=int(os.getenv("QOSE_BUDGET", "3")),
         qos_cost_search=True,
         collect_timing=False,
         metric_mode="fragment",
-        metrics_baseline="kolkata",
+        metrics_baseline="torino",
         metrics_optimization_level=3,
     )
     bench_env = os.getenv("QOSE_BENCHES", "").strip()
@@ -156,13 +156,16 @@ def _evaluate_impl(program_path):
         current_stage = "load_qasm"
         try:
             qc = _load_qasm_circuit(bench, size)
+            effective_size_to_reach = (
+                size if args.size_to_reach <= 0 else args.size_to_reach
+            )
 
             # Baseline QOS
             current_stage = "baseline_qos_run"
             logger.warning("Baseline QOS run start bench=%s size=%s", bench, size)
             qos_q = Qernel(qc.copy())
             qos_mitigator = ErrorMitigator(
-                size_to_reach=args.size_to_reach,
+                size_to_reach=effective_size_to_reach,
                 ideal_size_to_reach=args.ideal_size_to_reach,
                 budget=args.budget,
                 methods=[],
@@ -206,7 +209,7 @@ def _evaluate_impl(program_path):
             input_meta = q.get_metadata()
             input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
             mitigator = ErrorMitigator(
-                size_to_reach=args.size_to_reach,
+                size_to_reach=effective_size_to_reach,
                 ideal_size_to_reach=args.ideal_size_to_reach,
                 budget=args.budget,
                 methods=[],
@@ -370,6 +373,7 @@ def _evaluate_impl(program_path):
             {
                 "bench": bench,
                 "size": size,
+                "qose_input_size": effective_size_to_reach,
                 "qose_depth": qose_depth,
                 "qos_depth": qos_depth,
                 "qose_cnot": qose_cnot,
@@ -414,7 +418,6 @@ def _evaluate_impl(program_path):
         "combined_score": combined_score,
     }
     artifacts = {
-        "qose_input_size": args.size_to_reach,
         "qose_budget": args.budget,
         "qose_run_sec_avg": (total_run_time / count) if count else 0.0,
         "qos_run_sec_avg": (total_qos_run_time / count) if count else 0.0,

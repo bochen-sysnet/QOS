@@ -52,6 +52,7 @@ Thumbs.db
 
 # evolved codes
 openaievolve/
-openevolve_output/
-openevolve_output_gemini25/
-openevolve_output_gemini3/
+openevolve_output*/
+
+# account files
+evaluation/save_ibm_account.py

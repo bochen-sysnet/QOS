@@ -137,29 +137,52 @@ def _max_metric(vals: List[int]) -> int:
     return int(max(vals))
 
 
-_METRICS_BACKEND = None
+_METRICS_BACKENDS: Dict[str, object] = {}
 
 
 def _get_metrics_backend(baseline: str):
-    global _METRICS_BACKEND
-    if baseline != "kolkata":
+    if baseline == "raw":
         return None
-    if _METRICS_BACKEND is not None:
-        return _METRICS_BACKEND
-    try:
-        from qiskit.providers.fake_provider import FakeKolkataV2
+    if baseline in _METRICS_BACKENDS:
+        return _METRICS_BACKENDS[baseline]
 
-        _METRICS_BACKEND = FakeKolkataV2()
-    except Exception:
+    if baseline == "kolkata":
         try:
-            from qiskit_ibm_runtime.fake_provider import FakeKolkataV2
+            from qiskit.providers.fake_provider import FakeKolkataV2
 
-            _METRICS_BACKEND = FakeKolkataV2()
+            backend = FakeKolkataV2()
+        except Exception:
+            try:
+                from qiskit_ibm_runtime.fake_provider import FakeKolkataV2
+
+                backend = FakeKolkataV2()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Kolkata metrics baseline requested but FakeKolkataV2 is unavailable."
+                ) from exc
+    elif baseline == "torino":
+        try:
+            from qiskit_ibm_runtime.fake_provider import FakeTorino
+
+            backend = FakeTorino()
         except Exception as exc:
             raise RuntimeError(
-                "Kolkata metrics baseline requested but FakeKolkataV2 is unavailable."
+                "Torino metrics baseline requested but FakeTorino is unavailable."
             ) from exc
-    return _METRICS_BACKEND
+    elif baseline == "marrakesh":
+        try:
+            from qiskit_ibm_runtime.fake_provider import FakeMarrakesh
+
+            backend = FakeMarrakesh()
+        except Exception as exc:
+            raise RuntimeError(
+                "Marrakesh metrics baseline requested but FakeMarrakesh is unavailable."
+            ) from exc
+    else:
+        raise ValueError(f"Unknown metrics baseline: {baseline}")
+
+    _METRICS_BACKENDS[baseline] = backend
+    return backend
 
 
 def _apply_metrics_baseline(
@@ -512,24 +535,65 @@ def _get_real_backend(backend_name: str):
     try:
         from qiskit_ibm_runtime import QiskitRuntimeService  # type: ignore
 
-        service = QiskitRuntimeService(channel="ibm_quantum", token=token)
+        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
         backend = service.backend(backend_name)
-    except Exception:
-        from qiskit_ibm_provider import IBMProvider  # type: ignore
+    except Exception as exc:
+        try:
+            from qiskit_ibm_provider import IBMProvider  # type: ignore
 
-        provider = IBMProvider(token=token)
-        backend = provider.get_backend(backend_name)
+            provider = IBMProvider(token=token)
+            backend = provider.get_backend(backend_name)
+        except Exception as provider_exc:
+            raise RuntimeError(
+                "Failed to initialize IBM backend. Install qiskit-ibm-provider "
+                "or verify QiskitRuntimeService credentials."
+            ) from provider_exc
     _REAL_BACKEND_CACHE[backend_name] = backend
     return backend
+
+
+def _quasi_to_counts(quasi, shots: int, num_bits: int) -> Dict[str, int]:
+    if hasattr(quasi, "binary_probabilities"):
+        probs = quasi.binary_probabilities(num_bits=num_bits)
+    else:
+        probs = {}
+        for key, val in quasi.items():
+            if isinstance(key, int):
+                bitstr = format(key, f"0{num_bits}b")
+            else:
+                bitstr = str(key)
+            probs[bitstr] = float(val)
+    counts = {bitstr: int(round(prob * shots)) for bitstr, prob in probs.items()}
+    total = sum(counts.values())
+    if counts and total != shots:
+        max_key = max(counts, key=counts.get)
+        counts[max_key] += shots - total
+    return counts
 
 
 def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict[str, int]:
     backend = _get_real_backend(backend_name)
     circ = _ensure_measurements(circuit)
     tcirc = transpile(circ, backend=backend, optimization_level=0)
-    job = backend.run(tcirc, shots=shots)
-    result = job.result()
-    return result.get_counts()
+    try:
+        try:
+            from qiskit_ibm_runtime import Sampler  # type: ignore
+        except ImportError:
+            from qiskit_ibm_runtime import SamplerV2 as Sampler  # type: ignore
+
+        sampler = Sampler(mode=backend)
+        job = sampler.run([tcirc], shots=shots)
+        result = job.result()
+        quasi_dists = getattr(result, "quasi_dists", None)
+        if quasi_dists is None:
+            quasi_dists = result
+        quasi = quasi_dists[0]
+        return _quasi_to_counts(quasi, shots, tcirc.num_clbits)
+    except Exception as exc:
+        raise RuntimeError(
+            "Real-backend execution failed. "
+            "Ensure your plan supports job execution with primitives."
+        ) from exc
 
 
 def _real_virtual_counts(
@@ -736,7 +800,10 @@ def _run_mitigator(
     bench_name: str = "",
     size_label: str | int | None = None,
 ) -> Tuple[Dict[str, int], Dict[str, float], List[QuantumCircuit]]:
-    size_candidates = [args.size_to_reach, qc.num_qubits]
+    base_size = qc.num_qubits if args.size_to_reach <= 0 else args.size_to_reach
+    size_candidates = [base_size, qc.num_qubits]
+    if size_candidates[0] == size_candidates[1]:
+        size_candidates = [size_candidates[0]]
     budget = args.budget
 
     for size_to_reach in size_candidates:
@@ -808,8 +875,9 @@ def _run_qose(
     q = Qernel(qc.copy())
     BasicAnalysisPass().run(q)
     SupermarqFeaturesAnalysisPass().run(q)
+    base_size = qc.num_qubits if args.size_to_reach <= 0 else args.size_to_reach
     mitigator = ErrorMitigator(
-        size_to_reach=args.size_to_reach,
+        size_to_reach=base_size,
         ideal_size_to_reach=args.ideal_size_to_reach,
         budget=args.budget,
         methods=[],
@@ -1846,7 +1914,7 @@ def main() -> None:
     )
     parser.add_argument("--sizes", default="12,24", help="Comma-separated qubit sizes.")
     parser.add_argument("--budget", type=int, default=3)
-    parser.add_argument("--size-to-reach", type=int, default=7)
+    parser.add_argument("--size-to-reach", type=int, default=0)
     parser.add_argument("--ideal-size-to-reach", type=int, default=2)
     parser.add_argument("--timeout-sec", type=int, default=45)
     parser.add_argument("--clingo-timeout-sec", type=int, default=0, help="0 disables clingo timeout.")
@@ -1878,7 +1946,7 @@ def main() -> None:
     parser.add_argument("--fidelity-p2", type=float, default=0.01, help="2-qubit depolarizing error.")
     parser.add_argument("--with-real-fidelity", action="store_true")
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
-    parser.add_argument("--real-backend", default="ibm_kolkata")
+    parser.add_argument("--real-backend", default="ibm_torino")
     parser.add_argument("--fragment-fidelity-sweep", action="store_true")
     parser.add_argument(
         "--fragment-fidelity-shots",
@@ -1894,9 +1962,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--metrics-baseline",
-        choices=["raw", "kolkata"],
-        default="kolkata",
-        help="Baseline for metrics: raw circuit or transpiled to IBM Kolkata.",
+        choices=["raw", "kolkata", "torino", "marrakesh"],
+        default="torino",
+        help="Baseline for metrics: raw circuit or transpiled to a fake backend.",
     )
     parser.add_argument("--metrics-optimization-level", type=int, default=3)
     parser.add_argument(

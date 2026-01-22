@@ -90,6 +90,7 @@ prompt:
       - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
         num_connected_components, number_instructions, num_measurements, num_cnot_gates,
         program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
+      - qose_input_size
       - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
         qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
       - qose_output_size, qose_method
@@ -98,7 +99,6 @@ prompt:
       Use artifacts to diagnose decisions.
 
     ARTIFACTS PROVIDED BY EVALUATOR (summary):
-      - qose_input_size: input size_to_reach for all cases
       - qose_budget: budget used for all cases
       - qose_run_sec_avg: average runtime of evolved mitigator
       - qos_run_sec_avg: average runtime of baseline QOS
