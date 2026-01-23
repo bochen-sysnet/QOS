@@ -103,15 +103,14 @@ def _expand_group(raw_group: str) -> List[Path]:
 def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
-    metrics_keys = [
-        "combined_score",
-        "qose_depth",
-        "qose_cnot",
-        "qose_overhead",
-        "avg_run_time",
-    ]
+    metrics_keys = ["combined_score"]
 
-    fig, axes = plt.subplots(1, len(metrics_keys), figsize=(4.6 * len(metrics_keys), 4.2), sharex=False)
+    fig, axes = plt.subplots(
+        1,
+        len(metrics_keys),
+        figsize=(4.6 * len(metrics_keys), 4.2),
+        sharex=False,
+    )
     if len(metrics_keys) == 1:
         axes = [axes]
 
@@ -137,7 +136,7 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Plot raw and best-program metrics over time-ordered iterations."
+        description="Plot best combined_score over time-ordered iterations."
     )
     parser.add_argument(
         "--logs",
@@ -194,12 +193,42 @@ def main() -> int:
             auto_labels.append(base[len(prefix):] if base.startswith(prefix) else base)
         labels = auto_labels
 
+    def _split_groups(
+        groups: List[List[Path]], labels: List[str]
+    ) -> tuple[list[list[Path]], list[str], list[list[Path]], list[str]]:
+        general_groups: list[list[Path]] = []
+        general_labels: list[str] = []
+        overfit_groups: list[list[Path]] = []
+        overfit_labels: list[str] = []
+        for group, label in zip(groups, labels):
+            label_lower = label.lower()
+            if "general" in label_lower:
+                general_groups.append(group)
+                general_labels.append(label)
+            if "overfit" in label_lower:
+                overfit_groups.append(group)
+                overfit_labels.append(label)
+        return general_groups, general_labels, overfit_groups, overfit_labels
+
     out_path = Path(args.out)
     if out_path.suffix.lower() != ".pdf":
         out_path = out_path.with_suffix(".pdf")
 
-    _plot(groups, labels, out_path)
-    print(f"Wrote plot: {out_path}")
+    general_groups, general_labels, overfit_groups, overfit_labels = _split_groups(
+        groups, labels
+    )
+    if general_groups or overfit_groups:
+        if general_groups:
+            general_out = out_path.with_name(f"{out_path.stem}_general{out_path.suffix}")
+            _plot(general_groups, general_labels, general_out)
+            print(f"Wrote plot: {general_out}")
+        if overfit_groups:
+            overfit_out = out_path.with_name(f"{out_path.stem}_overfit{out_path.suffix}")
+            _plot(overfit_groups, overfit_labels, overfit_out)
+            print(f"Wrote plot: {overfit_out}")
+    else:
+        _plot(groups, labels, out_path)
+        print(f"Wrote plot: {out_path}")
     return 0
 
 
