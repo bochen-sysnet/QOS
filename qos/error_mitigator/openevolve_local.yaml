@@ -85,6 +85,9 @@ prompt:
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
           combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
+    NOTE:
+      - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
+        reduce circuit count (overhead), and reduce cost-search time.
 
     ARTIFACTS PROVIDED BY EVALUATOR (per case):
       - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
@@ -110,6 +113,143 @@ prompt:
       - qos_cnot_avg: average absolute nonlocal gate count of QOS
       - qos_overhead_avg: average absolute number of QOS circuits
 
+    One example of an evolution:
+    ```
+    from qos.error_mitigator.run import compute_gv_cost, compute_wc_cost
+    from qos.types.types import Qernel
+
+
+    def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
+        metadata = q.get_metadata()
+        depth = metadata.get("depth", 0)
+        num_qubits = metadata.get("num_qubits", 0)
+        num_clbits = metadata.get("num_clbits", 0)
+        num_nonlocal_gates = metadata.get("num_nonlocal_gates", 0)
+        num_connected_components = metadata.get("num_connected_components", 0)
+        number_instructions = metadata.get("number_instructions", 0)
+        num_measurements = metadata.get("num_measurements", 0)
+        num_cnot_gates = metadata.get("num_cnot_gates", 0)
+        program_communication = metadata.get("program_communication", 0.0)
+        liveness = metadata.get("liveness", 0.0)
+        parallelism = metadata.get("parallelism", 0.0)
+        measurement = metadata.get("measurement", 0.0)
+        entanglement_ratio = metadata.get("entanglement_ratio", 0.0)
+        critical_depth = metadata.get("critical_depth", 0.0)
+
+        # OE_BEGIN
+        # ---- Robust bounds ----
+        try:
+            budget_i = int(budget)
+        except Exception:
+            budget_i = budget
+
+        try:
+            s_in = int(size_to_reach)
+        except Exception:
+            s_in = 2
+
+        try:
+            nq = int(num_qubits) if num_qubits is not None else 0
+        except Exception:
+            nq = 0
+        if nq <= 0:
+            nq = max(s_in, 2)
+
+        # Lower bound: avoid pathological tiny targets for complex/entangling circuits
+        lb = 2
+        if nq >= 6:
+            if (
+                (num_nonlocal_gates >= max(8, nq // 2))
+                or (entanglement_ratio >= 0.30)
+                or (num_connected_components <= 2)
+                or (depth >= 18)
+            ):
+                lb = 3
+
+        meaningful_ub = max(2, nq - 1)
+        ub = max(lb, min(s_in, meaningful_ub))
+        noop_fallback = max(s_in, nq)
+
+        # ---- Cached cost probes ----
+        _cache = {}
+
+        def _cost(method: str, s: int):
+            key = (method, s)
+            if key in _cache:
+                return _cache[key]
+            if method == "GV":
+                c = compute_gv_cost(q, s)
+            else:
+                c = compute_wc_cost(q, s)
+            _cache[key] = c
+            return c
+
+        def _both_costs(s: int):
+            return _cost("GV", s), _cost("WC", s)
+
+        def _feasible(gv_c, wc_c) -> bool:
+            return (gv_c <= budget_i) or (wc_c <= budget_i)
+
+        # ---- Search minimal size in [lb, ub] such that GV or WC is within budget ----
+        gv_lb, wc_lb = _both_costs(lb)
+        if _feasible(gv_lb, wc_lb):
+            chosen_s = lb
+            gv_cost, wc_cost = gv_lb, wc_lb
+        else:
+            # If even ub is not feasible, fall back to a no-op size (>= num_qubits).
+            gv_ub, wc_ub = _both_costs(ub)
+            if not _feasible(gv_ub, wc_ub):
+                chosen_s = noop_fallback
+                gv_cost, wc_cost = gv_ub, wc_ub
+            else:
+                # Exponential search to bracket feasibility, then binary search.
+                prev = lb
+                hi = lb
+                while hi < ub:
+                    nxt = min(ub, max(hi + 1, hi * 2))
+                    gv_n, wc_n = _both_costs(nxt)
+                    if _feasible(gv_n, wc_n):
+                        lo = hi + 1
+                        hi = nxt
+                        break
+                    hi = nxt
+                    prev = hi
+
+                # Binary search in the bracket [lo, hi]
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    gv_m, wc_m = _both_costs(mid)
+                    if _feasible(gv_m, wc_m):
+                        hi = mid
+                    else:
+                        lo = mid + 1
+
+                chosen_s = lo
+                gv_cost, wc_cost = _both_costs(chosen_s)
+
+        size_to_reach = int(chosen_s)
+
+        # ---- Method selection: prefer feasible + lower cost; stable tie-break ----
+        gv_ok = gv_cost <= budget_i
+        wc_ok = wc_cost <= budget_i
+
+        if gv_ok and wc_ok:
+            if gv_cost != wc_cost:
+                method = "GV" if gv_cost < wc_cost else "WC"
+            else:
+                # Stable tie-breaker (bias toward GV for more entangling circuits)
+                method = "GV" if entanglement_ratio >= 0.5 else "WC"
+        elif gv_ok:
+            method = "GV"
+        elif wc_ok:
+            method = "WC"
+        else:
+            # Should only happen in fallback paths; choose the cheaper cost.
+            method = "GV" if gv_cost <= wc_cost else "WC"
+        # OE_END
+        return size_to_reach, method
+    ```
+    
     POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
       B) Explore size_to_reach efficiently instead of using two while loops iteratively.
