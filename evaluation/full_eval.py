@@ -50,6 +50,73 @@ BENCHES = [
 
 _EVAL_LOGGER = logging.getLogger(__name__)
 _REAL_DRY_RUN = False
+_REAL_DRY_RUN_CALLS = 0
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+except Exception:
+    _tqdm = None
+
+
+def _dry_run_submit(ctx: Dict[str, int], method_ctx: Dict[str, int | str]) -> None:
+    global _REAL_DRY_RUN_CALLS
+    _REAL_DRY_RUN_CALLS += 1
+    method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
+    _update_progress_bar(method_ctx, 1)
+
+
+def _start_progress_bar(method_ctx: Dict[str, int | str]) -> None:
+    if _tqdm is None:
+        return
+    total = int(method_ctx.get("expected_total", 0))
+    if total <= 0:
+        return
+    desc = f"{method_ctx.get('method')} {method_ctx.get('bench')} size={method_ctx.get('size')}"
+    method_ctx["pbar"] = _tqdm(total=total, desc=desc, unit="job", leave=True)
+
+
+def _update_progress_bar(method_ctx: Dict[str, int | str], n: int) -> None:
+    pbar = method_ctx.get("pbar")
+    if pbar is None:
+        return
+    try:
+        pbar.update(n)
+    except Exception:
+        return
+
+
+def _close_progress_bar(method_ctx: Dict[str, int | str]) -> None:
+    pbar = method_ctx.get("pbar")
+    if pbar is None:
+        return
+    try:
+        pbar.close()
+    except Exception:
+        return
+
+
+def _dry_run_traverse(
+    circuit: QuantumCircuit, ctx: Dict[str, int], method_ctx: Dict[str, int | str]
+) -> None:
+    vc = circuit if isinstance(circuit, VirtualCircuit) else None
+    if vc is None and not _has_virtual_ops(circuit):
+        _dry_run_submit(ctx, method_ctx)
+        return
+    if vc is None:
+        vc = VirtualCircuit(_normalize_circuit(circuit))
+    frag_total = len(vc.fragment_circuits)
+    for frag_idx, (frag, frag_circ) in enumerate(vc.fragment_circuits.items(), start=1):
+        inst_labels = vc.get_instance_labels(frag)
+        instantiations = generate_instantiations(frag_circ, inst_labels)
+        inst_total = len(instantiations)
+        for inst_idx in range(1, inst_total + 1):
+            inst_ctx = {
+                **ctx,
+                "fragment_idx": frag_idx,
+                "fragment_total": frag_total,
+                "inst_idx": inst_idx,
+                "inst_total": inst_total,
+            }
+            _dry_run_submit(inst_ctx, method_ctx)
 
 
 def _is_eval_verbose() -> bool:
@@ -615,7 +682,13 @@ def _sampler_result_to_counts(result, shots: int, num_bits: int) -> Dict[str, in
     raise RuntimeError("Unsupported sampler result type for counts extraction.")
 
 
-def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict[str, int]:
+def _real_counts(
+    circuit: QuantumCircuit,
+    shots: int,
+    backend_name: str,
+    ctx: Dict[str, int],
+    method_ctx: Dict[str, int | str],
+) -> Dict[str, int]:
     backend = _get_real_backend(backend_name)
     circ = _ensure_measurements(circuit)
     tcirc = transpile(circ, backend=backend, optimization_level=0)
@@ -627,6 +700,45 @@ def _real_counts(circuit: QuantumCircuit, shots: int, backend_name: str) -> Dict
 
         sampler = Sampler(mode=backend)
         job = sampler.run([tcirc], shots=shots)
+        job_id = None
+        try:
+            job_id = job.job_id()
+        except Exception:
+            pass
+        method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
+        _update_progress_bar(method_ctx, 1)
+        if _is_eval_verbose():
+            _EVAL_LOGGER.info(
+                "Real QPU job submitted method=%s bench=%s size=%s circuit=%s/%s fragment=%s/%s inst=%s/%s job_id=%s submitted=%s/%s",
+                method_ctx.get("method"),
+                method_ctx.get("bench"),
+                method_ctx.get("size"),
+                ctx.get("circuit_idx", 1),
+                ctx.get("circuit_total", 1),
+                ctx.get("fragment_idx", 1),
+                ctx.get("fragment_total", 1),
+                ctx.get("inst_idx", 1),
+                ctx.get("inst_total", 1),
+                job_id,
+                method_ctx.get("submitted"),
+                method_ctx.get("expected_total"),
+            )
+        method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
+        _EVAL_LOGGER.warning(
+            "Real QPU job submitted method=%s bench=%s size=%s circuit=%s/%s fragment=%s/%s inst=%s/%s job_id=%s submitted=%s/%s",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            ctx.get("circuit_idx", 1),
+            ctx.get("circuit_total", 1),
+            ctx.get("fragment_idx", 1),
+            ctx.get("fragment_total", 1),
+            ctx.get("inst_idx", 1),
+            ctx.get("inst_total", 1),
+            job_id,
+            method_ctx.get("submitted"),
+            method_ctx.get("expected_total"),
+        )
         result = job.result()
         return _sampler_result_to_counts(result, shots, tcirc.num_clbits)
     except Exception as exc:
@@ -640,15 +752,26 @@ def _real_virtual_counts(
     circuit: QuantumCircuit | VirtualCircuit,
     shots: int,
     backend_name: str,
+    ctx: Dict[str, int],
+    method_ctx: Dict[str, int | str],
 ) -> Dict[str, int]:
     vc = circuit if isinstance(circuit, VirtualCircuit) else VirtualCircuit(circuit)
     results: Dict = {}
-    for frag, frag_circ in vc.fragment_circuits.items():
+    frag_total = len(vc.fragment_circuits)
+    for frag_idx, (frag, frag_circ) in enumerate(vc.fragment_circuits.items(), start=1):
         inst_labels = vc.get_instance_labels(frag)
         instantiations = generate_instantiations(frag_circ, inst_labels)
         distrs = []
-        for inst in instantiations:
-            counts = _real_counts(inst, shots, backend_name)
+        inst_total = len(instantiations)
+        for inst_idx, inst in enumerate(instantiations, start=1):
+            inst_ctx = {
+                **ctx,
+                "fragment_idx": frag_idx,
+                "fragment_total": frag_total,
+                "inst_idx": inst_idx,
+                "inst_total": inst_total,
+            }
+            counts = _real_counts(inst, shots, backend_name, inst_ctx, method_ctx)
             distrs.append(QuasiDistr.from_counts(counts))
         results[frag] = distrs
     quasi = vc.knit(results, SerialPool())
@@ -656,21 +779,25 @@ def _real_virtual_counts(
 
 
 def _count_real_jobs(circuit: QuantumCircuit) -> int:
-    if _has_virtual_ops(circuit):
+    vc = circuit if isinstance(circuit, VirtualCircuit) else None
+    if vc is None and _has_virtual_ops(circuit):
         vc = VirtualCircuit(_normalize_circuit(circuit))
-        total = 0
-        for frag, frag_circ in vc.fragment_circuits.items():
-            inst_labels = vc.get_instance_labels(frag)
-            instantiations = generate_instantiations(frag_circ, inst_labels)
-            total += len(instantiations)
-        return total
-    return 1
+    if vc is None:
+        return 1
+    total = 0
+    for frag, frag_circ in vc.fragment_circuits.items():
+        inst_labels = vc.get_instance_labels(frag)
+        instantiations = generate_instantiations(frag_circ, inst_labels)
+        total += len(instantiations)
+    return total
 
 
 def _real_job_breakdown(circuit: QuantumCircuit) -> Dict[str, object]:
-    if not _has_virtual_ops(circuit):
+    vc = circuit if isinstance(circuit, VirtualCircuit) else None
+    if vc is None and _has_virtual_ops(circuit):
+        vc = VirtualCircuit(_normalize_circuit(circuit))
+    if vc is None:
         return {"fragments": 1, "instantiations": [1], "jobs_total": 1}
-    vc = VirtualCircuit(_normalize_circuit(circuit))
     inst_counts = []
     for frag, frag_circ in vc.fragment_circuits.items():
         inst_labels = vc.get_instance_labels(frag)
@@ -688,13 +815,18 @@ def _real_fidelity_for_circuit(
     shots: int,
     backend_name: str,
     seed: int,
+    ctx: Dict[str, int],
+    method_ctx: Dict[str, int | str],
 ) -> float:
+    if _REAL_DRY_RUN:
+        _dry_run_traverse(circuit, ctx, method_ctx)
+        return 0.0
     if _has_virtual_ops(circuit):
         ideal = _simulate_virtual_counts(circuit, shots, None, seed)
-        noisy = _real_virtual_counts(circuit, shots, backend_name)
+        noisy = _real_virtual_counts(circuit, shots, backend_name, ctx, method_ctx)
     else:
         ideal = _simulate_counts(circuit, shots, None, seed)
-        noisy = _real_counts(circuit, shots, backend_name)
+        noisy = _real_counts(circuit, shots, backend_name, ctx, method_ctx)
     if not ideal or not noisy:
         return 0.0
     return _hellinger_fidelity_from_counts(ideal, noisy)
@@ -711,19 +843,27 @@ def _average_real_fidelity(
 ) -> float:
     total = len(circuits)
     jobs_total = sum(_count_real_jobs(c) for c in circuits)
+    global _REAL_DRY_RUN_CALLS
     _EVAL_LOGGER.warning(
-        "Real QPU jobs method=%s bench=%s size=%s circuits_total=%s jobs_total=%s backend=%s dry_run=%s",
+        "Real QPU jobs method=%s bench=%s size=%s circuits_total=%s jobs_total=%s",
         method,
         bench,
         size,
         total,
         jobs_total,
-        backend_name,
-        int(_REAL_DRY_RUN),
     )
+    method_ctx: Dict[str, int | str] = {
+        "method": method,
+        "bench": bench,
+        "size": size,
+        "expected_total": jobs_total,
+        "submitted": 0,
+        "progress_step": max(1, jobs_total // 10),
+    }
+    _start_progress_bar(method_ctx)
     if _REAL_DRY_RUN:
         breakdown = [_real_job_breakdown(c) for c in circuits]
-        _EVAL_LOGGER.warning(
+        _EVAL_LOGGER.info(
             "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
             method,
             bench,
@@ -731,9 +871,32 @@ def _average_real_fidelity(
             [b["fragments"] for b in breakdown],
             [b["instantiations"] for b in breakdown],
         )
+    vals = []
+    for idx, circuit in enumerate(circuits, start=1):
+        ctx = {
+            "circuit_idx": idx,
+            "circuit_total": total,
+            "fragment_idx": 1,
+            "fragment_total": 1,
+            "inst_idx": 1,
+            "inst_total": 1,
+        }
+        vals.append(
+            _real_fidelity_for_circuit(circuit, shots, backend_name, seed, ctx, method_ctx)
+        )
+    if int(method_ctx.get("submitted", 0)) != jobs_total:
+        _EVAL_LOGGER.warning(
+            "Real QPU jobs mismatch method=%s bench=%s size=%s expected=%s submitted=%s",
+            method,
+            bench,
+            size,
+            jobs_total,
+            method_ctx.get("submitted"),
+        )
     if _REAL_DRY_RUN:
+        _close_progress_bar(method_ctx)
         return 0.0
-    vals = [_real_fidelity_for_circuit(c, shots, backend_name, seed) for c in circuits]
+    _close_progress_bar(method_ctx)
     return float(sum(vals) / max(1, len(vals)))
 
 
@@ -2319,6 +2482,8 @@ def main() -> None:
         )
         for path in frag_paths:
             print(f"Wrote fragment fidelity figure: {path}")
+    if args.real_fidelity_dry_run:
+        print(f"Real QPU dry-run sampler_run_calls_total={_REAL_DRY_RUN_CALLS}")
     _cleanup_children()
 
 
