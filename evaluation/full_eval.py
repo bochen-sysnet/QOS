@@ -862,15 +862,16 @@ def _average_real_fidelity(
     }
     _start_progress_bar(method_ctx)
     if _REAL_DRY_RUN:
-        breakdown = [_real_job_breakdown(c) for c in circuits]
-        _EVAL_LOGGER.info(
-            "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
-            method,
-            bench,
-            size,
-            [b["fragments"] for b in breakdown],
-            [b["instantiations"] for b in breakdown],
-        )
+        if _is_eval_verbose():
+            breakdown = [_real_job_breakdown(c) for c in circuits]
+            _EVAL_LOGGER.info(
+                "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
+                method,
+                bench,
+                size,
+                [b["fragments"] for b in breakdown],
+                [b["instantiations"] for b in breakdown],
+            )
     vals = []
     for idx, circuit in enumerate(circuits, start=1):
         ctx = {
@@ -1290,10 +1291,51 @@ def _plot_combined(
                 show_avg=True,
             )
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if axes.ndim == 1:
+        handles, labels = axes[0].get_legend_handles_labels()
+    else:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, ncol=3, fontsize=8, loc="upper center")
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     out_path = out_dir / f"relative_properties_compare_{timestamp}.pdf"
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_job_counts(
+    job_counts_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    benches: List[Tuple[str, str]],
+    out_dir: Path,
+    timestamp: str,
+    methods: List[str],
+) -> Path:
+    plt = _import_matplotlib()
+    sizes = sorted(job_counts_by_size.keys())
+    rows = max(1, len(sizes))
+    fig, axes = plt.subplots(rows, 1, figsize=(6.2, 3.6 * rows))
+    if rows == 1:
+        axes = np.array([axes])
+
+    for row, size in enumerate(sizes):
+        counts = job_counts_by_size.get(size, {})
+        _plot_panel(
+            axes[row],
+            f"Real-QPU jobs (estimated) - {size} qubits",
+            counts,
+            benches,
+            methods,
+            "Jobs",
+            show_avg=True,
+        )
+
+    if axes.ndim == 1:
+        handles, labels = axes[0].get_legend_handles_labels()
+    else:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=3, fontsize=8, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    out_path = out_dir / f"real_job_counts_compare_{timestamp}.pdf"
     fig.savefig(out_path)
     plt.close(fig)
     return out_path
@@ -1686,6 +1728,7 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
     timing_rows = []
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    real_job_counts_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
     fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
     include_qose = qose_run is not None and "QOSE" in methods
@@ -1717,6 +1760,11 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
             fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
         if args.with_real_fidelity:
             real_fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
+        if args.with_real_fidelity or _REAL_DRY_RUN:
+            job_methods = ["Qiskit"] + [m for m in methods if m != "Qiskit"]
+            real_job_counts_by_size[size] = {
+                bench: {m: 0.0 for m in job_methods} for bench, _ in BENCHES
+            }
 
         for bench, _label in benches:
             if args.verbose:
@@ -1992,6 +2040,30 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+            if args.with_real_fidelity or _REAL_DRY_RUN:
+                real_job_counts_by_size[size][bench]["Qiskit"] = float(
+                    sum(_count_real_jobs(c) for c in [qc])
+                )
+                if run_qos and qos_circs is not None:
+                    real_job_counts_by_size[size][bench]["QOS"] = float(
+                        sum(_count_real_jobs(c) for c in qos_circs)
+                    )
+                if run_qosn and qosn_circs is not None:
+                    real_job_counts_by_size[size][bench]["QOSN"] = float(
+                        sum(_count_real_jobs(c) for c in qosn_circs)
+                    )
+                if run_fq and fq_circs is not None:
+                    real_job_counts_by_size[size][bench]["FrozenQubits"] = float(
+                        sum(_count_real_jobs(c) for c in fq_circs)
+                    )
+                if run_cutqc and cutqc_circs is not None:
+                    real_job_counts_by_size[size][bench]["CutQC"] = float(
+                        sum(_count_real_jobs(c) for c in cutqc_circs)
+                    )
+                if include_qose and qose_circs is not None:
+                    real_job_counts_by_size[size][bench]["QOSE"] = float(
+                        sum(_count_real_jobs(c) for c in qose_circs)
+                    )
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
 
@@ -2134,6 +2206,7 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
         real_fidelity_by_size,
         cut_circuits,
         fragment_fidelity,
+        real_job_counts_by_size,
     )
 
 
@@ -2289,7 +2362,7 @@ def main() -> None:
     parser.add_argument(
         "--cost-search-log",
         default="",
-        help="Optional path to write cost-search trace CSV (default: auto in out-dir).",
+        help="Optional path to write cost-search trace CSV.",
     )
     parser.add_argument(
         "--qose-program",
@@ -2306,7 +2379,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     global _REAL_DRY_RUN
-    _REAL_DRY_RUN = bool(args.real_fidelity_dry_run)
+    _REAL_DRY_RUN = bool(args.real_fidelity_dry_run or not args.with_real_fidelity)
     os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
     os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
     os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
@@ -2322,11 +2395,6 @@ def main() -> None:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = args.tag.strip()
     tag_suffix = f"_{tag}" if tag else ""
-    if not args.cost_search_log:
-        args.cost_search_log = str(
-            out_dir / f"cost_search_trace_{timestamp}{tag_suffix}.csv"
-        )
-
     all_rows: List[Dict[str, object]] = []
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
 
@@ -2369,7 +2437,7 @@ def main() -> None:
                             os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
                             os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-                            rows, _rel, _timing, _fid, _cuts, _frag = _run_eval(
+                            rows, _rel, _timing, _fid, _real_fid, _cuts, _frag, _real_jobs = _run_eval(
                                 args, benches, sizes, qose_run, selected_methods
                             )
                             summary = _summarize(rows, selected_methods)
@@ -2415,6 +2483,7 @@ def main() -> None:
             real_fidelity_by_size,
             cut_circuits,
             fragment_fidelity,
+            real_job_counts_by_size,
         ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
         print(f"Wrote sweep: {sweep_path}")
         print(
@@ -2432,6 +2501,7 @@ def main() -> None:
             real_fidelity_by_size,
             cut_circuits,
             fragment_fidelity,
+            real_job_counts_by_size,
         ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
 
     fidelity_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
@@ -2447,6 +2517,12 @@ def main() -> None:
     )
 
     print(f"Wrote figure: {combined_path}")
+    if real_job_counts_by_size:
+        job_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
+        job_counts_fig = _plot_job_counts(
+            real_job_counts_by_size, benches, out_dir, f"{timestamp}{tag_suffix}", job_methods
+        )
+        print(f"Wrote job counts figure: {job_counts_fig}")
     if args.cut_visualization and cut_circuits:
         cut_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
         cut_fig = _plot_cut_visualization(
@@ -2482,7 +2558,7 @@ def main() -> None:
         )
         for path in frag_paths:
             print(f"Wrote fragment fidelity figure: {path}")
-    if args.real_fidelity_dry_run:
+    if _REAL_DRY_RUN and _REAL_DRY_RUN_CALLS:
         print(f"Real QPU dry-run sampler_run_calls_total={_REAL_DRY_RUN_CALLS}")
     _cleanup_children()
 
