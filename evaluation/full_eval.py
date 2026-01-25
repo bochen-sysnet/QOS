@@ -49,6 +49,7 @@ BENCHES = [
 ]
 
 _EVAL_LOGGER = logging.getLogger(__name__)
+_REAL_DRY_RUN = False
 
 
 def _is_eval_verbose() -> bool:
@@ -666,6 +667,22 @@ def _count_real_jobs(circuit: QuantumCircuit) -> int:
     return 1
 
 
+def _real_job_breakdown(circuit: QuantumCircuit) -> Dict[str, object]:
+    if not _has_virtual_ops(circuit):
+        return {"fragments": 1, "instantiations": [1], "jobs_total": 1}
+    vc = VirtualCircuit(_normalize_circuit(circuit))
+    inst_counts = []
+    for frag, frag_circ in vc.fragment_circuits.items():
+        inst_labels = vc.get_instance_labels(frag)
+        instantiations = generate_instantiations(frag_circ, inst_labels)
+        inst_counts.append(len(instantiations))
+    return {
+        "fragments": len(vc.fragment_circuits),
+        "instantiations": inst_counts,
+        "jobs_total": int(sum(inst_counts)),
+    }
+
+
 def _real_fidelity_for_circuit(
     circuit: QuantumCircuit,
     shots: int,
@@ -688,19 +705,35 @@ def _average_real_fidelity(
     shots: int,
     backend_name: str,
     seed: int,
+    method: str,
+    bench: str,
+    size: int,
 ) -> float:
     total = len(circuits)
-    vals = []
-    for idx, circuit in enumerate(circuits, start=1):
-        job_count = _count_real_jobs(circuit)
+    jobs_total = sum(_count_real_jobs(c) for c in circuits)
+    _EVAL_LOGGER.warning(
+        "Real QPU jobs method=%s bench=%s size=%s circuits_total=%s jobs_total=%s backend=%s dry_run=%s",
+        method,
+        bench,
+        size,
+        total,
+        jobs_total,
+        backend_name,
+        int(_REAL_DRY_RUN),
+    )
+    if _REAL_DRY_RUN:
+        breakdown = [_real_job_breakdown(c) for c in circuits]
         _EVAL_LOGGER.warning(
-            "Real QPU progress %s/%s backend=%s jobs=%s",
-            idx,
-            total,
-            backend_name,
-            job_count,
+            "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
+            method,
+            bench,
+            size,
+            [b["fragments"] for b in breakdown],
+            [b["instantiations"] for b in breakdown],
         )
-        vals.append(_real_fidelity_for_circuit(circuit, shots, backend_name, seed))
+    if _REAL_DRY_RUN:
+        return 0.0
+    vals = [_real_fidelity_for_circuit(c, shots, backend_name, seed) for c in circuits]
     return float(sum(vals) / max(1, len(vals)))
 
 
@@ -1741,6 +1774,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     args.real_fidelity_shots,
                     args.real_backend,
                     args.fidelity_seed,
+                    "Qiskit",
+                    bench,
+                    size,
                 )
                 real_fidelity_by_size[size][bench]["Qiskit"] = real_base
                 if run_qos and qos_circs is not None:
@@ -1749,6 +1785,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
+                        "QOS",
+                        bench,
+                        size,
                     )
                 if run_qosn and qosn_circs is not None:
                     real_fidelity_by_size[size][bench]["QOSN"] = _average_real_fidelity(
@@ -1756,6 +1795,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
+                        "QOSN",
+                        bench,
+                        size,
                     )
                 if run_fq and fq_circs is not None:
                     real_fidelity_by_size[size][bench]["FrozenQubits"] = _average_real_fidelity(
@@ -1763,6 +1805,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
+                        "FrozenQubits",
+                        bench,
+                        size,
                     )
                 if run_cutqc and cutqc_circs is not None:
                     real_fidelity_by_size[size][bench]["CutQC"] = _average_real_fidelity(
@@ -1770,6 +1815,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
+                        "CutQC",
+                        bench,
+                        size,
                     )
                 if include_qose and qose_circs is not None:
                     real_fidelity_by_size[size][bench]["QOSE"] = _average_real_fidelity(
@@ -1777,6 +1825,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
+                        "QOSE",
+                        bench,
+                        size,
                     )
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
@@ -2020,6 +2071,11 @@ def main() -> None:
     parser.add_argument("--fidelity-p2", type=float, default=0.0, help="2-qubit depolarizing error.")
     parser.add_argument("--fidelity-readout", type=float, default=0.0, help="Readout error.")
     parser.add_argument("--with-real-fidelity", action="store_true")
+    parser.add_argument(
+        "--real-fidelity-dry-run",
+        action="store_true",
+        help="Log real-QPU job counts without submitting jobs.",
+    )
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
     parser.add_argument("--real-backend", default="ibm_torino")
     parser.add_argument("--fragment-fidelity-sweep", action="store_true")
@@ -2086,6 +2142,8 @@ def main() -> None:
         help="Output directory for figures and CSV.",
     )
     args = parser.parse_args()
+    global _REAL_DRY_RUN
+    _REAL_DRY_RUN = bool(args.real_fidelity_dry_run)
     os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
     os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
     os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
