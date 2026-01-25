@@ -100,6 +100,8 @@ prompt:
       - qose_gv_cost_trace, qose_wc_cost_trace
       - qose_gv_time_trace, qose_wc_time_trace
       Use artifacts to diagnose decisions.
+    NOTE:
+      - Artifacts may also include summaries for top/diverse programs.
 
     ARTIFACTS PROVIDED BY EVALUATOR (summary):
       - qose_budget: budget used for all cases
