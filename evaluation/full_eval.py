@@ -51,47 +51,12 @@ BENCHES = [
 _EVAL_LOGGER = logging.getLogger(__name__)
 _REAL_DRY_RUN = False
 _REAL_DRY_RUN_CALLS = 0
-try:
-    from tqdm import tqdm as _tqdm  # type: ignore
-except Exception:
-    _tqdm = None
 
 
 def _dry_run_submit(ctx: Dict[str, int], method_ctx: Dict[str, int | str]) -> None:
     global _REAL_DRY_RUN_CALLS
     _REAL_DRY_RUN_CALLS += 1
     method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
-    _update_progress_bar(method_ctx, 1)
-
-
-def _start_progress_bar(method_ctx: Dict[str, int | str]) -> None:
-    if _tqdm is None:
-        return
-    total = int(method_ctx.get("expected_total", 0))
-    if total <= 0:
-        return
-    desc = f"{method_ctx.get('method')} {method_ctx.get('bench')} size={method_ctx.get('size')}"
-    method_ctx["pbar"] = _tqdm(total=total, desc=desc, unit="job", leave=True)
-
-
-def _update_progress_bar(method_ctx: Dict[str, int | str], n: int) -> None:
-    pbar = method_ctx.get("pbar")
-    if pbar is None:
-        return
-    try:
-        pbar.update(n)
-    except Exception:
-        return
-
-
-def _close_progress_bar(method_ctx: Dict[str, int | str]) -> None:
-    pbar = method_ctx.get("pbar")
-    if pbar is None:
-        return
-    try:
-        pbar.close()
-    except Exception:
-        return
 
 
 def _dry_run_traverse(
@@ -706,24 +671,6 @@ def _real_counts(
         except Exception:
             pass
         method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
-        _update_progress_bar(method_ctx, 1)
-        if _is_eval_verbose():
-            _EVAL_LOGGER.info(
-                "Real QPU job submitted method=%s bench=%s size=%s circuit=%s/%s fragment=%s/%s inst=%s/%s job_id=%s submitted=%s/%s",
-                method_ctx.get("method"),
-                method_ctx.get("bench"),
-                method_ctx.get("size"),
-                ctx.get("circuit_idx", 1),
-                ctx.get("circuit_total", 1),
-                ctx.get("fragment_idx", 1),
-                ctx.get("fragment_total", 1),
-                ctx.get("inst_idx", 1),
-                ctx.get("inst_total", 1),
-                job_id,
-                method_ctx.get("submitted"),
-                method_ctx.get("expected_total"),
-            )
-        method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
         _EVAL_LOGGER.warning(
             "Real QPU job submitted method=%s bench=%s size=%s circuit=%s/%s fragment=%s/%s inst=%s/%s job_id=%s submitted=%s/%s",
             method_ctx.get("method"),
@@ -860,7 +807,6 @@ def _average_real_fidelity(
         "submitted": 0,
         "progress_step": max(1, jobs_total // 10),
     }
-    _start_progress_bar(method_ctx)
     if _REAL_DRY_RUN:
         if _is_eval_verbose():
             breakdown = [_real_job_breakdown(c) for c in circuits]
@@ -895,9 +841,7 @@ def _average_real_fidelity(
             method_ctx.get("submitted"),
         )
     if _REAL_DRY_RUN:
-        _close_progress_bar(method_ctx)
         return 0.0
-    _close_progress_bar(method_ctx)
     return float(sum(vals) / max(1, len(vals)))
 
 
@@ -1380,11 +1324,13 @@ def _plot_timing(
 
     sizes = sorted({int(r["size"]) for r in timing_rows})
     methods = list(methods)
+    has_cost_calls = any("cost_search_calls" in r for r in timing_rows)
+    ncols = 4 if has_cost_calls else 3
 
-    fig, axes = plt.subplots(len(sizes), 4, figsize=(22.0, 3.8 * len(sizes)))
+    fig, axes = plt.subplots(len(sizes), ncols, figsize=(5.5 * ncols, 3.8 * len(sizes)))
     axes = np.array(axes)
     if axes.ndim == 1:
-        axes = axes.reshape(1, 4)
+        axes = axes.reshape(1, ncols)
 
     for row_idx, size in enumerate(sizes):
         ax = axes[row_idx, 0]
@@ -1415,80 +1361,77 @@ def _plot_timing(
                 bench_labels.append((bench, label))
         if not bench_labels:
             ax.set_visible(False)
-            continue
-        x = np.arange(len(bench_labels))
-        vals = []
-        for bench, _label in bench_labels:
-            bench_rows = [
-                r
-                for r in timing_rows
-                if int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
-            ]
-            totals = [_row_total(r) for r in bench_rows]
-            vals.append(sum(totals) / max(1, len(totals)))
-        ax.bar(x, vals)
-        ax.set_title(f"QOS Timing by Circuit (Total) - {size} qubits")
-        ax.set_ylabel("Seconds")
-        ax.set_xticks(x)
-        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-
-        ax = axes[row_idx, 2]
-        bench_labels = []
-        for bench, label in BENCHES:
-            if any(
-                int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
-                for r in timing_rows
-            ):
-                bench_labels.append((bench, label))
-        if not bench_labels:
-            ax.set_visible(False)
-            continue
-        x = np.arange(len(bench_labels))
-        bottom = np.zeros(len(bench_labels))
-        for stage in stages:
+        else:
+            x = np.arange(len(bench_labels))
             vals = []
             for bench, _label in bench_labels:
-                stage_vals = [
-                    float(r.get(stage, 0.0))
+                bench_rows = [
+                    r
                     for r in timing_rows
-                    if int(r["size"]) == size
-                    and r["method"] == "QOS"
-                    and r["bench"] == bench
-                    and stage in r
+                    if int(r["size"]) == size and r["method"] == "QOS" and r["bench"] == bench
                 ]
-                vals.append(sum(stage_vals) / max(1, len(stage_vals)))
-            ax.bar(x, vals, bottom=bottom, label=stage)
-            bottom = bottom + np.array(vals)
-        ax.set_title(f"QOS Timing Breakdown by Circuit - {size} qubits")
-        ax.set_ylabel("Seconds")
-        ax.set_xticks(x)
-        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
-        ax.legend(fontsize=7)
+                totals = [_row_total(r) for r in bench_rows]
+                vals.append(sum(totals) / max(1, len(totals)))
+            ax.bar(x, vals)
+            ax.set_title(f"QOS Timing by Circuit (Total) - {size} qubits")
+            ax.set_ylabel("Seconds")
+            ax.set_xticks(x)
+            ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-        ax = axes[row_idx, 3]
-        call_vals = []
-        for bench, _label in bench_labels:
-            vals = [
-                float(r.get("cost_search_calls", 0.0))
-                for r in timing_rows
-                if int(r["size"]) == size
-                and r["method"] == "QOS"
-                and r["bench"] == bench
-                and "cost_search_calls" in r
-            ]
-            call_vals.append(sum(vals) / max(1, len(vals)))
-        if not any(call_vals):
+        ax = axes[row_idx, 2]
+        if not bench_labels:
             ax.set_visible(False)
-            continue
-        x = np.arange(len(bench_labels))
-        ax.bar(x, call_vals)
-        ax.set_title(f"Cost Search Calls by Circuit - {size} qubits")
-        ax.set_ylabel("Calls")
-        ax.set_xticks(x)
-        ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        else:
+            x = np.arange(len(bench_labels))
+            bottom = np.zeros(len(bench_labels))
+            for stage in stages:
+                vals = []
+                for bench, _label in bench_labels:
+                    stage_vals = [
+                        float(r.get(stage, 0.0))
+                        for r in timing_rows
+                        if int(r["size"]) == size
+                        and r["method"] == "QOS"
+                        and r["bench"] == bench
+                        and stage in r
+                    ]
+                    vals.append(sum(stage_vals) / max(1, len(stage_vals)))
+                ax.bar(x, vals, bottom=bottom, label=stage)
+                bottom = bottom + np.array(vals)
+            ax.set_title(f"QOS Timing Breakdown by Circuit - {size} qubits")
+            ax.set_ylabel("Seconds")
+            ax.set_xticks(x)
+            ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
+            ax.legend(fontsize=7)
+
+        if has_cost_calls:
+            ax = axes[row_idx, 3]
+            if not bench_labels:
+                ax.set_visible(False)
+            else:
+                call_vals = []
+                for bench, _label in bench_labels:
+                    vals = [
+                        float(r.get("cost_search_calls", 0.0))
+                        for r in timing_rows
+                        if int(r["size"]) == size
+                        and r["method"] == "QOS"
+                        and r["bench"] == bench
+                        and "cost_search_calls" in r
+                    ]
+                    call_vals.append(sum(vals) / max(1, len(vals)))
+                if not any(call_vals):
+                    ax.set_visible(False)
+                else:
+                    x = np.arange(len(bench_labels))
+                    ax.bar(x, call_vals)
+                    ax.set_title(f"Cost Search Calls by Circuit - {size} qubits")
+                    ax.set_ylabel("Calls")
+                    ax.set_xticks(x)
+                    ax.set_xticklabels([label for _bench, label in bench_labels], rotation=45, ha="right")
+                    ax.grid(axis="y", linestyle="--", alpha=0.4)
 
     fig.tight_layout()
     out_path = out_dir / f"timing_breakdown_{timestamp}.pdf"
