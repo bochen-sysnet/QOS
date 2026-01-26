@@ -171,6 +171,10 @@ def main() -> int:
             group_paths = sorted(base.glob("*.log"))
             if group_paths:
                 groups.append(group_paths)
+        for base in sorted(Path("openevolve_output").glob("*/logs")):
+            group_paths = sorted(base.glob("*.log"))
+            if group_paths:
+                groups.append(group_paths)
     else:
         for group in args.logs.split(";"):
             group_paths = _expand_group(group)
@@ -188,9 +192,13 @@ def main() -> int:
             if not group:
                 auto_labels.append("group")
                 continue
-            base = group[0].parent.parent.name
+            base = group[0].parent.parent
+            if base.name == "logs" and base.parent.name == "openevolve_output":
+                label = base.parent.name
+            else:
+                label = base.name
             prefix = "openevolve_output_"
-            auto_labels.append(base[len(prefix):] if base.startswith(prefix) else base)
+            auto_labels.append(label[len(prefix):] if label.startswith(prefix) else label)
         labels = auto_labels
 
     def _split_groups(
