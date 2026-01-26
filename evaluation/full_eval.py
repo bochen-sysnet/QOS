@@ -788,6 +788,21 @@ def _average_real_fidelity(
     bench: str,
     size: int,
 ) -> float:
+    mean, _std = _real_fidelity_stats(
+        circuits, shots, backend_name, seed, method, bench, size
+    )
+    return mean
+
+
+def _real_fidelity_stats(
+    circuits: List[QuantumCircuit],
+    shots: int,
+    backend_name: str,
+    seed: int,
+    method: str,
+    bench: str,
+    size: int,
+) -> Tuple[float, float]:
     total = len(circuits)
     jobs_total = sum(_count_real_jobs(c) for c in circuits)
     global _REAL_DRY_RUN_CALLS
@@ -807,17 +822,16 @@ def _average_real_fidelity(
         "submitted": 0,
         "progress_step": max(1, jobs_total // 10),
     }
-    if _REAL_DRY_RUN:
-        if _is_eval_verbose():
-            breakdown = [_real_job_breakdown(c) for c in circuits]
-            _EVAL_LOGGER.info(
-                "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
-                method,
-                bench,
-                size,
-                [b["fragments"] for b in breakdown],
-                [b["instantiations"] for b in breakdown],
-            )
+    if _REAL_DRY_RUN and _is_eval_verbose():
+        breakdown = [_real_job_breakdown(c) for c in circuits]
+        _EVAL_LOGGER.info(
+            "Real QPU jobs breakdown method=%s bench=%s size=%s fragments=%s instantiations=%s",
+            method,
+            bench,
+            size,
+            [b["fragments"] for b in breakdown],
+            [b["instantiations"] for b in breakdown],
+        )
     vals = []
     for idx, circuit in enumerate(circuits, start=1):
         ctx = {
@@ -841,8 +855,10 @@ def _average_real_fidelity(
             method_ctx.get("submitted"),
         )
     if _REAL_DRY_RUN:
-        return 0.0
-    return float(sum(vals) / max(1, len(vals)))
+        return 0.0, 0.0
+    mean = float(sum(vals) / max(1, len(vals)))
+    std = float(np.std(vals)) if len(vals) > 1 else 0.0
+    return mean, std
 
 
 def _fidelity_for_circuit(
@@ -870,6 +886,18 @@ def _average_fidelity(
 ) -> float:
     vals = [_fidelity_for_circuit(c, shots, noise, seed) for c in circuits]
     return float(sum(vals) / max(1, len(vals)))
+
+
+def _fidelity_stats(
+    circuits: List[QuantumCircuit],
+    shots: int,
+    noise,
+    seed: int,
+) -> Tuple[float, float]:
+    vals = [_fidelity_for_circuit(c, shots, noise, seed) for c in circuits]
+    mean = float(sum(vals) / max(1, len(vals)))
+    std = float(np.std(vals)) if len(vals) > 1 else 0.0
+    return mean, std
 
 
 def _analyze_circuit(
@@ -1132,6 +1160,7 @@ def _plot_panel(
     benches: List[Tuple[str, str]],
     methods: List[str],
     ylabel: str,
+    err_data: Optional[Dict[str, Dict[str, float]]] = None,
     show_avg: bool = False,
 ) -> None:
     x = np.arange(len(methods))
@@ -1140,7 +1169,22 @@ def _plot_panel(
     for i, (bench, label) in enumerate(benches):
         vals = [rel_data[bench].get(m, 1.0) for m in methods]
         all_vals.extend(vals)
-        ax.bar(x + (i - len(benches) / 2) * width, vals, width, label=label)
+        errs = None
+        if err_data is not None:
+            errs = [err_data.get(bench, {}).get(m, 0.0) for m in methods]
+        if errs and any(e > 0 for e in errs):
+            ax.bar(
+                x + (i - len(benches) / 2) * width,
+                vals,
+                width,
+                label=label,
+                yerr=errs,
+                capsize=2,
+                ecolor="black",
+                linewidth=0.5,
+            )
+        else:
+            ax.bar(x + (i - len(benches) / 2) * width, vals, width, label=label)
 
     if show_avg:
         max_val = max(all_vals) if all_vals else 0.0
@@ -1175,7 +1219,9 @@ def _plot_combined(
     out_dir: Path,
     timestamp: str,
     fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    fidelity_err_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
     real_fidelity_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    real_fidelity_err_by_size: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
     methods: Optional[List[str]] = None,
     fidelity_methods: Optional[List[str]] = None,
 ) -> Path:
@@ -1213,6 +1259,7 @@ def _plot_combined(
         )
         if fidelity_by_size:
             fidelity = fidelity_by_size.get(size, {})
+            fidelity_err = fidelity_err_by_size.get(size, {}) if fidelity_err_by_size else None
             _plot_panel(
                 axes[row, 2],
                 f"Hellinger fidelity - {size} qubits (higher is better)",
@@ -1220,11 +1267,15 @@ def _plot_combined(
                 benches,
                 fidelity_methods,
                 "Fidelity",
+                err_data=fidelity_err,
                 show_avg=True,
             )
         if real_fidelity_by_size:
             col = 3 if fidelity_by_size else 2
             fidelity = real_fidelity_by_size.get(size, {})
+            fidelity_err = (
+                real_fidelity_err_by_size.get(size, {}) if real_fidelity_err_by_size else None
+            )
             _plot_panel(
                 axes[row, col],
                 f"Real Hellinger fidelity - {size} qubits (higher is better)",
@@ -1232,6 +1283,7 @@ def _plot_combined(
                 benches,
                 fidelity_methods,
                 "Fidelity",
+                err_data=fidelity_err,
                 show_avg=True,
             )
 
@@ -1670,7 +1722,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
     timing_rows = []
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    real_fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     real_job_counts_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
     fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
@@ -1701,8 +1755,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
         rel_nonlocal: Dict[str, Dict[str, float]] = {bench: {} for bench, _ in BENCHES}
         if args.with_fidelity:
             fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
+            fidelity_err_by_size[size] = {bench: {} for bench, _ in BENCHES}
         if args.with_real_fidelity:
             real_fidelity_by_size[size] = {bench: {} for bench, _ in BENCHES}
+            real_fidelity_err_by_size[size] = {bench: {} for bench, _ in BENCHES}
         if args.with_real_fidelity or _REAL_DRY_RUN:
             job_methods = ["Qiskit"] + [m for m in methods if m != "Qiskit"]
             real_job_counts_by_size[size] = {
@@ -1848,9 +1904,12 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     print("  fidelity sim start", flush=True)
                 sim_times = {}
                 t0 = time.perf_counter()
-                base_fidelity = _average_fidelity([qc], args.fidelity_shots, noise, args.fidelity_seed)
+                base_fidelity, base_std = _fidelity_stats(
+                    [qc], args.fidelity_shots, noise, args.fidelity_seed
+                )
                 sim_times["Qiskit"] = time.perf_counter() - t0
                 fidelity_by_size[size][bench] = {"Qiskit": base_fidelity}
+                fidelity_err_by_size[size][bench]["Qiskit"] = base_std
                 rel_fidelity = {}
 
                 qos_fidelity = ""
@@ -1861,43 +1920,48 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
 
                 if run_qos and qos_circs is not None:
                     t0 = time.perf_counter()
-                    qos_fidelity = _average_fidelity(
+                    qos_fidelity, qos_std = _fidelity_stats(
                         qos_circs, args.fidelity_shots, noise, args.fidelity_seed
                     )
                     sim_times["QOS"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["QOS"] = qos_fidelity
+                    fidelity_err_by_size[size][bench]["QOS"] = qos_std
                     rel_fidelity["QOS"] = _relative(qos_fidelity, base_fidelity)
                 if run_qosn and qosn_circs is not None:
                     t0 = time.perf_counter()
-                    qosn_fidelity = _average_fidelity(
+                    qosn_fidelity, qosn_std = _fidelity_stats(
                         qosn_circs, args.fidelity_shots, noise, args.fidelity_seed
                     )
                     sim_times["QOSN"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["QOSN"] = qosn_fidelity
+                    fidelity_err_by_size[size][bench]["QOSN"] = qosn_std
                     rel_fidelity["QOSN"] = _relative(qosn_fidelity, base_fidelity)
                 if run_fq and fq_circs is not None:
                     t0 = time.perf_counter()
-                    fq_fidelity = _average_fidelity(
+                    fq_fidelity, fq_std = _fidelity_stats(
                         fq_circs, args.fidelity_shots, noise, args.fidelity_seed
                     )
                     sim_times["FrozenQubits"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["FrozenQubits"] = fq_fidelity
+                    fidelity_err_by_size[size][bench]["FrozenQubits"] = fq_std
                     rel_fidelity["FrozenQubits"] = _relative(fq_fidelity, base_fidelity)
                 if run_cutqc and cutqc_circs is not None:
                     t0 = time.perf_counter()
-                    cutqc_fidelity = _average_fidelity(
+                    cutqc_fidelity, cutqc_std = _fidelity_stats(
                         cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed
                     )
                     sim_times["CutQC"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["CutQC"] = cutqc_fidelity
+                    fidelity_err_by_size[size][bench]["CutQC"] = cutqc_std
                     rel_fidelity["CutQC"] = _relative(cutqc_fidelity, base_fidelity)
                 if include_qose and qose_circs is not None:
                     t0 = time.perf_counter()
-                    qose_fidelity = _average_fidelity(
+                    qose_fidelity, qose_std = _fidelity_stats(
                         qose_circs, args.fidelity_shots, noise, args.fidelity_seed
                     )
                     sim_times["QOSE"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["QOSE"] = qose_fidelity
+                    fidelity_err_by_size[size][bench]["QOSE"] = qose_std
                     rel_fidelity["QOSE"] = _relative(qose_fidelity, base_fidelity)
 
                 if args.verbose:
@@ -1923,7 +1987,7 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                 rel_fidelity_qose = ""
 
             if args.with_real_fidelity:
-                real_base = _average_real_fidelity(
+                real_base, real_base_std = _real_fidelity_stats(
                     [qc],
                     args.real_fidelity_shots,
                     args.real_backend,
@@ -1933,8 +1997,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     size,
                 )
                 real_fidelity_by_size[size][bench]["Qiskit"] = real_base
+                real_fidelity_err_by_size[size][bench]["Qiskit"] = real_base_std
                 if run_qos and qos_circs is not None:
-                    real_fidelity_by_size[size][bench]["QOS"] = _average_real_fidelity(
+                    real_qos, real_qos_std = _real_fidelity_stats(
                         qos_circs,
                         args.real_fidelity_shots,
                         args.real_backend,
@@ -1943,8 +2008,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+                    real_fidelity_by_size[size][bench]["QOS"] = real_qos
+                    real_fidelity_err_by_size[size][bench]["QOS"] = real_qos_std
                 if run_qosn and qosn_circs is not None:
-                    real_fidelity_by_size[size][bench]["QOSN"] = _average_real_fidelity(
+                    real_qosn, real_qosn_std = _real_fidelity_stats(
                         qosn_circs,
                         args.real_fidelity_shots,
                         args.real_backend,
@@ -1953,8 +2020,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+                    real_fidelity_by_size[size][bench]["QOSN"] = real_qosn
+                    real_fidelity_err_by_size[size][bench]["QOSN"] = real_qosn_std
                 if run_fq and fq_circs is not None:
-                    real_fidelity_by_size[size][bench]["FrozenQubits"] = _average_real_fidelity(
+                    real_fq, real_fq_std = _real_fidelity_stats(
                         fq_circs,
                         args.real_fidelity_shots,
                         args.real_backend,
@@ -1963,8 +2032,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+                    real_fidelity_by_size[size][bench]["FrozenQubits"] = real_fq
+                    real_fidelity_err_by_size[size][bench]["FrozenQubits"] = real_fq_std
                 if run_cutqc and cutqc_circs is not None:
-                    real_fidelity_by_size[size][bench]["CutQC"] = _average_real_fidelity(
+                    real_cut, real_cut_std = _real_fidelity_stats(
                         cutqc_circs,
                         args.real_fidelity_shots,
                         args.real_backend,
@@ -1973,8 +2044,10 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+                    real_fidelity_by_size[size][bench]["CutQC"] = real_cut
+                    real_fidelity_err_by_size[size][bench]["CutQC"] = real_cut_std
                 if include_qose and qose_circs is not None:
-                    real_fidelity_by_size[size][bench]["QOSE"] = _average_real_fidelity(
+                    real_qose, real_qose_std = _real_fidelity_stats(
                         qose_circs,
                         args.real_fidelity_shots,
                         args.real_backend,
@@ -1983,6 +2056,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         bench,
                         size,
                     )
+                    real_fidelity_by_size[size][bench]["QOSE"] = real_qose
+                    real_fidelity_err_by_size[size][bench]["QOSE"] = real_qose_std
             if args.with_real_fidelity or _REAL_DRY_RUN:
                 real_job_counts_by_size[size][bench]["Qiskit"] = float(
                     sum(_count_real_jobs(c) for c in [qc])
@@ -2146,7 +2221,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
         rel_by_size,
         timing_rows,
         fidelity_by_size,
+        fidelity_err_by_size,
         real_fidelity_by_size,
+        real_fidelity_err_by_size,
         cut_circuits,
         fragment_fidelity,
         real_job_counts_by_size,
@@ -2380,7 +2457,18 @@ def main() -> None:
                             os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
                             os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
 
-                            rows, _rel, _timing, _fid, _real_fid, _cuts, _frag, _real_jobs = _run_eval(
+                            (
+                                rows,
+                                _rel,
+                                _timing,
+                                _fid,
+                                _fid_err,
+                                _real_fid,
+                                _real_fid_err,
+                                _cuts,
+                                _frag,
+                                _real_jobs,
+                            ) = _run_eval(
                                 args, benches, sizes, qose_run, selected_methods
                             )
                             summary = _summarize(rows, selected_methods)
@@ -2423,7 +2511,9 @@ def main() -> None:
             rel_by_size,
             timing_rows,
             fidelity_by_size,
+            fidelity_err_by_size,
             real_fidelity_by_size,
+            real_fidelity_err_by_size,
             cut_circuits,
             fragment_fidelity,
             real_job_counts_by_size,
@@ -2441,7 +2531,9 @@ def main() -> None:
             rel_by_size,
             timing_rows,
             fidelity_by_size,
+            fidelity_err_by_size,
             real_fidelity_by_size,
+            real_fidelity_err_by_size,
             cut_circuits,
             fragment_fidelity,
             real_job_counts_by_size,
@@ -2454,7 +2546,9 @@ def main() -> None:
         out_dir,
         f"{timestamp}{tag_suffix}",
         fidelity_by_size if args.with_fidelity else None,
+        fidelity_err_by_size if args.with_fidelity else None,
         real_fidelity_by_size if args.with_real_fidelity else None,
+        real_fidelity_err_by_size if args.with_real_fidelity else None,
         methods=selected_methods,
         fidelity_methods=fidelity_methods,
     )
