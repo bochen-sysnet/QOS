@@ -172,7 +172,7 @@ def _select_diverse_programs(
         return remaining[:diverse_count]
 
 
-def _format_program_artifacts_block(program: dict) -> str:
+def _format_program_artifacts_block(program: dict, label: str) -> str:
     artifacts_json = program.get("artifacts_json")
     if artifacts_json:
         content = artifacts_json
@@ -182,7 +182,7 @@ def _format_program_artifacts_block(program: dict) -> str:
             content = json.dumps(artifacts, sort_keys=True)
         else:
             return ""
-    return f"Artifacts:\n```\n{content}\n```"
+    return f"Execution Output:\n```\n{content}\n```"
 
 
 def _install_prompt_history_overrides() -> None:
@@ -273,7 +273,7 @@ def _install_prompt_history_overrides() -> None:
                         key_features.append(f"Performs well on {name} ({value})")
 
             key_features_str = ", ".join(key_features)
-            artifacts_block = _format_program_artifacts_block(program)
+            artifacts_block = _format_program_artifacts_block(program, "Top")
             if artifacts_block:
                 key_features_str = f"{key_features_str}\n{artifacts_block}"
 
@@ -287,6 +287,8 @@ def _install_prompt_history_overrides() -> None:
                 )
                 + "\n\n"
             )
+        if not top_programs_str.strip():
+            top_programs_str = "None"
 
         diverse_programs_str = ""
         diverse_programs = []
@@ -310,7 +312,7 @@ def _install_prompt_history_overrides() -> None:
                             for name in list(program.get("metrics", {}).keys())[:2]
                         ]
                     key_features_str = ", ".join(key_features)
-                    artifacts_block = _format_program_artifacts_block(program)
+                    artifacts_block = _format_program_artifacts_block(program, "Diverse")
                     if artifacts_block:
                         key_features_str = f"{key_features_str}\n{artifacts_block}"
 
@@ -324,6 +326,8 @@ def _install_prompt_history_overrides() -> None:
                         )
                         + "\n\n"
                     )
+        if not diverse_programs_str.strip():
+            diverse_programs_str = "\n\n## Diverse Programs\n\nNone\n\n"
 
         logger.info(
             "OE prompt selection diverse_programs count=%s ids=%s",
@@ -348,7 +352,7 @@ def _install_prompt_history_overrides() -> None:
 
     def wrapped_inspirations(self, inspirations, language, feature_dimensions=None):
         if not inspirations:
-            return ""
+            return "## Inspiration Programs\n\nNone"
 
         inspirations_section_template = self.template_manager.get_template("inspirations_section")
         inspiration_program_template = self.template_manager.get_template("inspiration_program")
@@ -359,7 +363,7 @@ def _install_prompt_history_overrides() -> None:
             score = get_fitness_score(program.get("metrics", {}), feature_dimensions or [])
             program_type = self._determine_program_type(program, feature_dimensions or [])
             unique_features = self._extract_unique_features(program)
-            artifacts_block = _format_program_artifacts_block(program)
+            artifacts_block = _format_program_artifacts_block(program, "Inspiration")
             if artifacts_block:
                 unique_features = f"{unique_features}\n{artifacts_block}"
 
@@ -399,19 +403,29 @@ def _install_prompt_artifact_overrides() -> None:
                 program_artifacts = {"current_artifacts": program_artifacts}
 
             top_programs = list(kwargs.get("top_programs") or [])
+            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False):
+                kwargs["top_programs"] = top_programs
             num_top = min(self.config.num_top_programs, len(top_programs))
             selected_top = top_programs[:num_top]
-            peer_payload = {}
-            if selected_top:
-                peer_payload.update(_format_peer_artifacts(selected_top, "top"))
-
             diverse = _select_diverse_programs(
                 top_programs, num_top, self.config.num_diverse_programs
             )
-            if diverse:
-                peer_payload.update(_format_peer_artifacts(diverse, "diverse"))
 
             inspirations = list(kwargs.get("inspirations") or [])
+            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False) and inspirations:
+                used_ids = {
+                    p.get("id", "unknown")
+                    for p in selected_top
+                } | {
+                    p.get("id", "unknown")
+                    for p in diverse
+                }
+                inspirations = [
+                    p
+                    for p in inspirations
+                    if p.get("id", "unknown") not in used_ids
+                ]
+                kwargs["inspirations"] = inspirations
             logger.info(
                 "OE prompt selection top_programs count=%s ids=%s",
                 len(selected_top),
@@ -427,10 +441,6 @@ def _install_prompt_artifact_overrides() -> None:
                 len(inspirations),
                 [p.get("id", "unknown") for p in inspirations],
             )
-
-            if peer_payload:
-                program_artifacts = {**program_artifacts, **peer_payload}
-                kwargs["program_artifacts"] = program_artifacts
 
         prompt = original_build_prompt(self, *args, **kwargs)
         try:
@@ -467,20 +477,23 @@ def _install_prompt_logging_overrides() -> None:
     def wrapped_log_prompt(self, program_id, template_key, prompt, responses=None):
         try:
             user = prompt.get("user", "")
-            selection = prompt.get("oe_selection") or {}
+            selection = prompt.pop("oe_selection", None) or {}
             if selection:
                 logger.info(
-                    "OE prompt selection top_programs count=%s ids=%s",
+                    "OE prompt selection program_id=%s top_programs count=%s ids=%s",
+                    program_id,
                     len(selection.get("top_ids", [])),
                     selection.get("top_ids", []),
                 )
                 logger.info(
-                    "OE prompt selection diverse_programs count=%s ids=%s",
+                    "OE prompt selection program_id=%s diverse_programs count=%s ids=%s",
+                    program_id,
                     len(selection.get("diverse_ids", [])),
                     selection.get("diverse_ids", []),
                 )
                 logger.info(
-                    "OE prompt selection inspiration_programs count=%s ids=%s",
+                    "OE prompt selection program_id=%s inspiration_programs count=%s ids=%s",
+                    program_id,
                     len(selection.get("inspiration_ids", [])),
                     selection.get("inspiration_ids", []),
                 )
