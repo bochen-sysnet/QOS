@@ -109,7 +109,7 @@ def _evaluate_impl(program_path):
             candidate_pairs.append((bench, size))
     if not candidate_pairs:
         return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
-    pair_count = int(os.getenv("QOSE_NUM_SAMPLES", "1"))
+    pair_count = int(os.getenv("QOSE_NUM_SAMPLES", "10"))
     if seed is None:
         rng = random.Random()
     else:
