@@ -261,8 +261,8 @@ prompt:
       D) Skip certain size_to_reach values based on heuristics.
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
-  num_top_programs: 3
-  num_diverse_programs: 2
+  num_top_programs: 1
+  num_diverse_programs: 1
   use_template_stochasticity: true
 
   # Make sure OpenEvolve passes artifacts back into the model prompt each iteration.

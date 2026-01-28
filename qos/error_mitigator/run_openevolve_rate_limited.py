@@ -10,9 +10,9 @@ import time
 from openevolve.cli import main as openevolve_main
 from openevolve.llm.openai import OpenAILLM
 from openevolve.prompt.sampler import PromptSampler
-from openevolve.database import ProgramDatabase
+from openevolve.database import ProgramDatabase, Program
 from openevolve.evaluator import Evaluator
-from openevolve.utils.metrics_utils import get_fitness_score
+from openevolve.utils.metrics_utils import get_fitness_score, safe_numeric_average
 
 
 _GEMINI_API_PREFIX = "https://generativelanguage.googleapis.com/"
@@ -23,6 +23,165 @@ _EVALUATOR_ARTIFACTS_PATCHED = False
 _DATABASE_ARTIFACTS_PATCHED = False
 _PENDING_ARTIFACTS: dict[str, dict] = {}
 _PROMPT_HISTORY_PATCHED = False
+_PROCESS_PARALLEL_PATCHED = False
+
+
+def _patched_run_iteration_worker(
+    iteration: int, db_snapshot: dict, parent_id: str, inspiration_ids: list
+):
+    import openevolve.process_parallel as process_parallel
+
+    logger = logging.getLogger("openevolve.process_parallel")
+    try:
+        process_parallel._lazy_init_worker_components()
+
+        programs = {
+            pid: Program(**prog_dict)
+            for pid, prog_dict in db_snapshot["programs"].items()
+        }
+
+        parent = programs[parent_id]
+        inspirations = [programs[pid] for pid in inspiration_ids if pid in programs]
+
+        parent_artifacts = db_snapshot["artifacts"].get(parent_id)
+
+        parent_island = parent.metadata.get("island", db_snapshot["current_island"])
+        island_programs = [
+            programs[pid]
+            for pid in db_snapshot["islands"][parent_island]
+            if pid in programs
+        ]
+
+        island_programs.sort(
+            key=lambda p: p.metrics.get("combined_score", safe_numeric_average(p.metrics)),
+            reverse=True,
+        )
+
+        # Use all island programs as the prompt pool so we can select distinct inspirations.
+        programs_for_prompt = island_programs
+        best_programs_only = island_programs[
+            : process_parallel._worker_config.prompt.num_top_programs
+        ]
+
+        prompt = process_parallel._worker_prompt_sampler.build_prompt(
+            current_program=parent.code,
+            parent_program=parent.code,
+            program_metrics=parent.metrics,
+            previous_programs=[p.to_dict() for p in best_programs_only],
+            top_programs=[p.to_dict() for p in programs_for_prompt],
+            inspirations=[p.to_dict() for p in inspirations],
+            language=process_parallel._worker_config.language,
+            evolution_round=iteration,
+            diff_based_evolution=process_parallel._worker_config.diff_based_evolution,
+            program_artifacts=parent_artifacts,
+            feature_dimensions=db_snapshot.get("feature_dimensions", []),
+        )
+
+        iteration_start = time.time()
+
+        try:
+            llm_response = asyncio.run(
+                process_parallel._worker_llm_ensemble.generate_with_context(
+                    system_message=prompt["system"],
+                    messages=[{"role": "user", "content": prompt["user"]}],
+                )
+            )
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            return process_parallel.SerializableResult(
+                error=f"LLM generation failed: {str(e)}", iteration=iteration
+            )
+
+        if llm_response is None:
+            return process_parallel.SerializableResult(
+                error="LLM returned None response", iteration=iteration
+            )
+
+        if process_parallel._worker_config.diff_based_evolution:
+            from openevolve.utils.code_utils import (
+                apply_diff,
+                extract_diffs,
+                format_diff_summary,
+            )
+
+            diff_blocks = extract_diffs(
+                llm_response, process_parallel._worker_config.diff_pattern
+            )
+            if not diff_blocks:
+                return process_parallel.SerializableResult(
+                    error="No valid diffs found in response", iteration=iteration
+                )
+
+            child_code = apply_diff(
+                parent.code,
+                llm_response,
+                process_parallel._worker_config.diff_pattern,
+            )
+            changes_summary = format_diff_summary(diff_blocks)
+        else:
+            from openevolve.utils.code_utils import parse_full_rewrite
+
+            new_code = parse_full_rewrite(
+                llm_response, process_parallel._worker_config.language
+            )
+
+            if not new_code:
+                return process_parallel.SerializableResult(
+                    error="No valid code found in response", iteration=iteration
+                )
+
+            child_code = new_code
+            changes_summary = "Full rewrite"
+
+        if len(child_code) > process_parallel._worker_config.max_code_length:
+            return process_parallel.SerializableResult(
+                error=(
+                    "Generated code exceeds maximum length "
+                    f"({len(child_code)} > {process_parallel._worker_config.max_code_length})"
+                ),
+                iteration=iteration,
+            )
+
+        import uuid
+
+        child_id = str(uuid.uuid4())
+        child_metrics = asyncio.run(
+            process_parallel._worker_evaluator.evaluate_program(child_code, child_id)
+        )
+
+        artifacts = process_parallel._worker_evaluator.get_pending_artifacts(child_id)
+
+        child_program = Program(
+            id=child_id,
+            code=child_code,
+            language=process_parallel._worker_config.language,
+            parent_id=parent.id,
+            generation=parent.generation + 1,
+            metrics=child_metrics,
+            iteration_found=iteration,
+            metadata={
+                "changes": changes_summary,
+                "parent_metrics": parent.metrics,
+                "island": parent_island,
+            },
+        )
+
+        iteration_time = time.time() - iteration_start
+
+        return process_parallel.SerializableResult(
+            child_program_dict=child_program.to_dict(),
+            parent_id=parent.id,
+            iteration_time=iteration_time,
+            prompt=prompt,
+            llm_response=llm_response,
+            artifacts=artifacts,
+            iteration=iteration,
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error in worker iteration: {e}")
+        return process_parallel.SerializableResult(
+            error=f"Worker iteration error: {str(e)}", iteration=iteration
+        )
 
 
 def _install_rate_limit(rpm: float) -> None:
@@ -182,7 +341,7 @@ def _format_program_artifacts_block(program: dict, label: str) -> str:
             content = json.dumps(artifacts, sort_keys=True)
         else:
             return ""
-    return f"Execution Output:\n```\n{content}\n```"
+    return f"{label}:\n```\n{content}\n```"
 
 
 def _install_prompt_history_overrides() -> None:
@@ -273,7 +432,7 @@ def _install_prompt_history_overrides() -> None:
                         key_features.append(f"Performs well on {name} ({value})")
 
             key_features_str = ", ".join(key_features)
-            artifacts_block = _format_program_artifacts_block(program, "Top")
+            artifacts_block = _format_program_artifacts_block(program, "Top Execution Output")
             if artifacts_block:
                 key_features_str = f"{key_features_str}\n{artifacts_block}"
 
@@ -312,7 +471,9 @@ def _install_prompt_history_overrides() -> None:
                             for name in list(program.get("metrics", {}).keys())[:2]
                         ]
                     key_features_str = ", ".join(key_features)
-                    artifacts_block = _format_program_artifacts_block(program, "Diverse")
+                    artifacts_block = _format_program_artifacts_block(
+                        program, "Diverse Execution Output"
+                    )
                     if artifacts_block:
                         key_features_str = f"{key_features_str}\n{artifacts_block}"
 
@@ -363,7 +524,9 @@ def _install_prompt_history_overrides() -> None:
             score = get_fitness_score(program.get("metrics", {}), feature_dimensions or [])
             program_type = self._determine_program_type(program, feature_dimensions or [])
             unique_features = self._extract_unique_features(program)
-            artifacts_block = _format_program_artifacts_block(program, "Inspiration")
+            artifacts_block = _format_program_artifacts_block(
+                program, "Inspiration Execution Output"
+            )
             if artifacts_block:
                 unique_features = f"{unique_features}\n{artifacts_block}"
 
@@ -412,7 +575,7 @@ def _install_prompt_artifact_overrides() -> None:
             )
 
             inspirations = list(kwargs.get("inspirations") or [])
-            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False) and inspirations:
+            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False):
                 used_ids = {
                     p.get("id", "unknown")
                     for p in selected_top
@@ -425,6 +588,21 @@ def _install_prompt_artifact_overrides() -> None:
                     for p in inspirations
                     if p.get("id", "unknown") not in used_ids
                 ]
+                desired_inspirations = max(
+                    0, int(getattr(self.config, "num_top_programs", 0))
+                )
+                if desired_inspirations and len(inspirations) < desired_inspirations:
+                    candidate_pool = list(kwargs.get("previous_programs") or []) + top_programs
+                    seen_ids = {p.get("id", "unknown") for p in inspirations}
+                    for program in candidate_pool:
+                        program_id = program.get("id", "unknown")
+                        if program_id in used_ids or program_id in seen_ids:
+                            continue
+                        inspirations.append(program)
+                        used_ids.add(program_id)
+                        seen_ids.add(program_id)
+                        if len(inspirations) >= desired_inspirations:
+                            break
                 kwargs["inspirations"] = inspirations
             logger.info(
                 "OE prompt selection top_programs count=%s ids=%s",
@@ -511,6 +689,16 @@ def _install_prompt_logging_overrides() -> None:
     _PROMPT_LOGGING_PATCHED = True
 
 
+def _install_process_parallel_overrides() -> None:
+    global _PROCESS_PARALLEL_PATCHED
+    if _PROCESS_PARALLEL_PATCHED:
+        return
+    import openevolve.process_parallel as process_parallel
+
+    process_parallel._run_iteration_worker = _patched_run_iteration_worker
+    _PROCESS_PARALLEL_PATCHED = True
+
+
 def _install_database_artifact_overrides() -> None:
     global _DATABASE_ARTIFACTS_PATCHED
     if _DATABASE_ARTIFACTS_PATCHED:
@@ -519,6 +707,18 @@ def _install_database_artifact_overrides() -> None:
 
     def wrapped_add(self, program, iteration=None, target_island=None):
         program_id = program.id
+        if (
+            program.metadata.get("migrant")
+            and not program.artifacts_json
+            and not program.artifact_dir
+        ):
+            parent_id = getattr(program, "parent_id", None)
+            if parent_id:
+                parent = self.get(parent_id)
+                if parent and parent.artifacts_json:
+                    program.artifacts_json = parent.artifacts_json
+                if parent and parent.artifact_dir:
+                    program.artifact_dir = parent.artifact_dir
         result = original_add(self, program, iteration=iteration, target_island=target_island)
         artifacts = _PENDING_ARTIFACTS.pop(program_id, None)
         if artifacts:
@@ -567,6 +767,7 @@ def main() -> int:
     _install_prompt_artifact_overrides()
     _install_prompt_history_overrides()
     _install_prompt_logging_overrides()
+    _install_process_parallel_overrides()
     _install_database_artifact_overrides()
     _install_evaluator_artifact_storage_overrides()
     rpm_raw = os.getenv("GEMINI_RPM", "").strip() or os.getenv("OPENEVOLVE_RPM", "").strip()

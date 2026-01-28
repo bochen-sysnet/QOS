@@ -11,6 +11,7 @@ if _truthy(os.getenv("OPENEVOLVE_ENABLE_PATCHES", "")):
 
         _patches._install_prompt_artifact_overrides()
         _patches._install_prompt_history_overrides()
+        _patches._install_process_parallel_overrides()
     except Exception:
         # Avoid breaking worker startup if patching fails.
         pass
