@@ -1,5 +1,5 @@
 max_iterations: 100
-checkpoint_interval: 20
+checkpoint_interval: 10
 log_level: "INFO"
 log_dir: null
 random_seed: 42

@@ -20,6 +20,7 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_TOP_PROGRAMS     Override num_top_programs
   OPENEVOLVE_NUM_DIVERSE_PROGRAMS Override num_diverse_programs
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
+  OPENEVOLVE_INCLUDE_PEER_ARTIFACTS Enable peer (top/diverse/inspire) execution outputs
 
 Example:
   OPENAI_API_KEY=... ./run_oe.sh gpt openevolve_output/gpt_run --iterations 100
@@ -57,6 +58,14 @@ while [[ $# -gt 0 ]]; do
       export OPENEVOLVE_NUM_INSPIRATIONS="$2"
       shift 2
       ;;
+    --peer-artifacts)
+      export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=1
+      shift
+      ;;
+    --no-peer-artifacts)
+      export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=0
+      shift
+      ;;
     *)
       EXTRA_ARGS+=("$1")
       shift
@@ -79,10 +88,12 @@ case "$PROFILE" in
   gpt)
     export OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
     export OPENAI_MODEL="${OPENAI_MODEL:-gpt-5-mini}"
+    export OPENAI_SERVICE_TIER="${OPENAI_SERVICE_TIER:-flex}"
     ;;
   gemini)
     export OPENAI_API_BASE="${OPENAI_API_BASE:-https://generativelanguage.googleapis.com/v1beta/openai/}"
     export OPENAI_MODEL="${OPENAI_MODEL:-gemini-2.5-flash-lite}"
+    export GEMINI_RPM="${GEMINI_RPM:-5}"
     ;;
   qwen)
     export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:8000/v1}"

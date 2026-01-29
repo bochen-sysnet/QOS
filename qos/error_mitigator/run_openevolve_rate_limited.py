@@ -25,6 +25,7 @@ _PENDING_ARTIFACTS: dict[str, dict] = {}
 _PROMPT_HISTORY_PATCHED = False
 _PROCESS_PARALLEL_PATCHED = False
 _PROMPT_CONFIG_PATCHED = False
+_LLM_CONFIG_PATCHED = False
 
 
 def _get_inspiration_limit(config) -> int:
@@ -35,6 +36,10 @@ def _get_inspiration_limit(config) -> int:
         except ValueError:
             return 1
     return 1
+
+
+def _peer_artifacts_enabled() -> bool:
+    return _env_flag("OPENEVOLVE_INCLUDE_PEER_ARTIFACTS", default=False)
 
 
 def _install_prompt_config_overrides() -> None:
@@ -65,6 +70,30 @@ def _install_prompt_config_overrides() -> None:
 
     oe_config.PromptConfig.__init__ = wrapped_init
     _PROMPT_CONFIG_PATCHED = True
+
+
+def _install_llm_config_overrides() -> None:
+    global _LLM_CONFIG_PATCHED
+    if _LLM_CONFIG_PATCHED:
+        return
+    try:
+        from openevolve import config as oe_config
+    except Exception:
+        return
+
+    original_post_init = oe_config.LLMConfig.__post_init__
+
+    def wrapped_post_init(self):
+        try:
+            self.api_base = oe_config._resolve_env_var(self.api_base)
+            self.primary_model = oe_config._resolve_env_var(self.primary_model)
+            self.secondary_model = oe_config._resolve_env_var(self.secondary_model)
+        except ValueError:
+            pass
+        return original_post_init(self)
+
+    oe_config.LLMConfig.__post_init__ = wrapped_post_init
+    _LLM_CONFIG_PATCHED = True
 
 
 def _patched_run_iteration_worker(
@@ -474,7 +503,7 @@ def _install_prompt_history_overrides() -> None:
 
             key_features_str = ", ".join(key_features)
             artifacts_block = _format_program_artifacts_block(program, "Top Execution Output")
-            if artifacts_block:
+            if artifacts_block and _peer_artifacts_enabled():
                 key_features_str = f"{key_features_str}\n{artifacts_block}"
 
             top_programs_str += (
@@ -515,7 +544,7 @@ def _install_prompt_history_overrides() -> None:
                     artifacts_block = _format_program_artifacts_block(
                         program, "Diverse Execution Output"
                     )
-                    if artifacts_block:
+                    if artifacts_block and _peer_artifacts_enabled():
                         key_features_str = f"{key_features_str}\n{artifacts_block}"
 
                     diverse_programs_str += (
@@ -568,7 +597,7 @@ def _install_prompt_history_overrides() -> None:
             artifacts_block = _format_program_artifacts_block(
                 program, "Inspiration Execution Output"
             )
-            if artifacts_block:
+            if artifacts_block and _peer_artifacts_enabled():
                 unique_features = f"{unique_features}\n{artifacts_block}"
 
             inspiration_programs_str += (
@@ -600,66 +629,66 @@ def _install_prompt_artifact_overrides() -> None:
     logger = logging.getLogger(__name__)
 
     def wrapped_build_prompt(self, *args, **kwargs):
-        include_peer_artifacts = _env_flag("OPENEVOLVE_INCLUDE_PEER_ARTIFACTS", default=True)
-        if include_peer_artifacts and getattr(self.config, "include_artifacts", False):
+        include_peer_artifacts = _peer_artifacts_enabled()
+        if getattr(self.config, "include_artifacts", False):
             program_artifacts = kwargs.get("program_artifacts") or {}
             if not isinstance(program_artifacts, dict):
                 program_artifacts = {"current_artifacts": program_artifacts}
 
-            top_programs = list(kwargs.get("top_programs") or [])
-            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
-                kwargs["top_programs"] = top_programs
-            num_top = min(self.config.num_top_programs, len(top_programs))
-            selected_top = top_programs[:num_top]
-            diverse = _select_diverse_programs(
-                top_programs, num_top, self.config.num_diverse_programs
-            )
+        top_programs = list(kwargs.get("top_programs") or [])
+        if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
+            kwargs["top_programs"] = top_programs
+        num_top = min(self.config.num_top_programs, len(top_programs))
+        selected_top = top_programs[:num_top]
+        diverse = _select_diverse_programs(
+            top_programs, num_top, self.config.num_diverse_programs
+        )
 
-            inspirations = list(kwargs.get("inspirations") or [])
-            desired_inspirations = _get_inspiration_limit(self.config)
-            if len(inspirations) > desired_inspirations:
-                inspirations = inspirations[:desired_inspirations]
-            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
-                used_ids = {
-                    p.get("id", "unknown")
-                    for p in selected_top
-                } | {
-                    p.get("id", "unknown")
-                    for p in diverse
-                }
-                inspirations = [
-                    p
-                    for p in inspirations
-                    if p.get("id", "unknown") not in used_ids
-                ]
-                if desired_inspirations and len(inspirations) < desired_inspirations:
-                    candidate_pool = list(kwargs.get("previous_programs") or []) + top_programs
-                    seen_ids = {p.get("id", "unknown") for p in inspirations}
-                    for program in candidate_pool:
-                        program_id = program.get("id", "unknown")
-                        if program_id in used_ids or program_id in seen_ids:
-                            continue
-                        inspirations.append(program)
-                        used_ids.add(program_id)
-                        seen_ids.add(program_id)
-                        if len(inspirations) >= desired_inspirations:
-                            break
-            kwargs["inspirations"] = inspirations
-            logger.info(
-                "OE prompt selection top_programs count=%s ids=%s",
-                len(selected_top),
-                [p.get("id", "unknown") for p in selected_top],
-            )
-            logger.info(
-                "OE prompt selection diverse_programs count=%s ids=%s",
-                len(diverse),
-                [p.get("id", "unknown") for p in diverse],
-            )
-            logger.info(
-                "OE prompt selection inspiration_programs count=%s ids=%s",
-                len(inspirations),
-                [p.get("id", "unknown") for p in inspirations],
-            )
+        inspirations = list(kwargs.get("inspirations") or [])
+        desired_inspirations = _get_inspiration_limit(self.config)
+        if len(inspirations) > desired_inspirations:
+            inspirations = inspirations[:desired_inspirations]
+        if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
+            used_ids = {
+                p.get("id", "unknown")
+                for p in selected_top
+            } | {
+                p.get("id", "unknown")
+                for p in diverse
+            }
+            inspirations = [
+                p
+                for p in inspirations
+                if p.get("id", "unknown") not in used_ids
+            ]
+            if desired_inspirations and len(inspirations) < desired_inspirations:
+                candidate_pool = list(kwargs.get("previous_programs") or []) + top_programs
+                seen_ids = {p.get("id", "unknown") for p in inspirations}
+                for program in candidate_pool:
+                    program_id = program.get("id", "unknown")
+                    if program_id in used_ids or program_id in seen_ids:
+                        continue
+                    inspirations.append(program)
+                    used_ids.add(program_id)
+                    seen_ids.add(program_id)
+                    if len(inspirations) >= desired_inspirations:
+                        break
+        kwargs["inspirations"] = inspirations
+        logger.info(
+            "OE prompt selection top_programs count=%s ids=%s",
+            len(selected_top),
+            [p.get("id", "unknown") for p in selected_top],
+        )
+        logger.info(
+            "OE prompt selection diverse_programs count=%s ids=%s",
+            len(diverse),
+            [p.get("id", "unknown") for p in diverse],
+        )
+        logger.info(
+            "OE prompt selection inspiration_programs count=%s ids=%s",
+            len(inspirations),
+            [p.get("id", "unknown") for p in inspirations],
+        )
 
         prompt = original_build_prompt(self, *args, **kwargs)
         try:
@@ -806,6 +835,7 @@ def main() -> int:
 
     _install_gemini_overrides()
     _install_prompt_config_overrides()
+    _install_llm_config_overrides()
     _install_prompt_artifact_overrides()
     _install_prompt_history_overrides()
     _install_prompt_logging_overrides()
