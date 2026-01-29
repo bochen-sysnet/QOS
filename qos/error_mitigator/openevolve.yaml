@@ -1,5 +1,5 @@
 max_iterations: 100
-checkpoint_interval: 10
+checkpoint_interval: 20
 log_level: "INFO"
 log_dir: null
 random_seed: 42
@@ -14,10 +14,12 @@ convergence_threshold: 0.001
 early_stopping_metric: "combined_score"
 
 llm:
-  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
-  api_key: "${GEMINI_API_KEY}"
-  # available models: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview
-  primary_model: "gemini-2.5-flash-lite"
+  api_base: "${OPENAI_API_BASE}"
+  api_key: "${OPENAI_API_KEY}"
+  # available gpt models: gpt-5.2, gpt-5.1, gpt-5, gpt-5-nano
+  # available gemini models: gemini-2.5-flash-lite
+  # available qwen models: Qwen/Qwen2.5-Coder-14B-Instruct-AWQ
+  primary_model: "${OPENAI_MODEL}"
   temperature: 0.7
   top_p: 0.9
   max_tokens: 4096
@@ -80,6 +82,8 @@ prompt:
     - Use cheap metadata heuristics first; only call compute_*_cost when needed.
     - Keep behavior monotone and stable: similar circuits should yield similar decisions.
 
+    NOTE: "QOS" refers to the baseline implementation, and "QOSE" refers to the evolved program.
+
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
@@ -91,31 +95,31 @@ prompt:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce circuit count (overhead), and reduce cost-search time.
 
-    ARTIFACTS PROVIDED BY EVALUATOR (per case):
-      - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
-        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
-        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-      - qose_input_size
-      - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
-        qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
-      - qose_output_size, qose_method
-      - qose_gv_cost_trace, qose_wc_cost_trace
-      - qose_gv_time_trace, qose_wc_time_trace
-      Use artifacts to diagnose decisions.
-    NOTE:
-      - Artifacts may also include summaries for top/diverse/inspiration programs.
+    We provide the last program executed by the evaluator and top/diverse/inspiration programs if any. Use them to diagnose decisions. Details of the execution outputs are as follows:
 
-    ARTIFACTS PROVIDED BY EVALUATOR (summary):
+    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (summary):
       - qose_budget: budget used for all cases
       - qose_run_sec_avg: average runtime of evolved mitigator
       - qos_run_sec_avg: average runtime of baseline QOS
-      - gv_cost_calls_total: total GV cost calls
-      - wc_cost_calls_total: total WC cost calls
-      - qos_gv_cost_calls_total: total GV cost calls for baseline QOS
-      - qos_wc_cost_calls_total: total WC cost calls for baseline QOS
-      - qos_depth_avg: average absolute depth of QOS
-      - qos_cnot_avg: average absolute nonlocal gate count of QOS
-      - qos_overhead_avg: average absolute number of QOS circuits
+      - gv_cost_calls_total: total GV cost calls (evolved)
+      - wc_cost_calls_total: total WC cost calls (evolved)
+      - qos_gv_cost_calls_total: total GV cost calls (baseline)
+      - qos_wc_cost_calls_total: total WC cost calls (baseline)
+      - qos_depth_avg: average absolute depth of baseline circuits
+      - qos_cnot_avg: average absolute nonlocal gate count of baseline circuits
+      - qos_overhead_avg: average absolute number of baseline circuits
+
+    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (per case):
+      - input_features: static circuit features (depth, qubits, gates, etc.)
+        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
+        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
+      - qose_input_size: initial target size before cost-search adjustments
+      - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
+        qose_run_sec, qos_run_sec: paired QOSE vs baseline QOS metrics
+      - qose_output_size: final target size chosen by the algorithm
+      - qose_method: chosen method ("GV" or "WC")
+      - qose_gv_cost_trace, qose_wc_cost_trace: cost estimates per probe step
+      - qose_gv_time_trace, qose_wc_time_trace: time per probe step
 
     One example of an evolution:
     ```
@@ -253,7 +257,7 @@ prompt:
         # OE_END
         return size_to_reach, method
     ```
-    
+
     POSSIBLE LEVERS TO EXPLORE:
       A) Decide to use WC or GV selectively instead of always using both.
       B) Explore size_to_reach efficiently instead of using two while loops iteratively.
@@ -261,8 +265,8 @@ prompt:
       D) Skip certain size_to_reach values based on heuristics.
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
-  num_top_programs: 1
-  num_diverse_programs: 1
+  num_top_programs: 3
+  num_diverse_programs: 2
   use_template_stochasticity: true
 
   # Make sure OpenEvolve passes artifacts back into the model prompt each iteration.
@@ -296,7 +300,7 @@ evaluator:
   timeout: 4800
   max_retries: 1
   cascade_evaluation: false
-  parallel_evaluations: 1
+  parallel_evaluations: 4
   use_llm_feedback: false
   llm_feedback_weight: 0.0
 

@@ -102,34 +102,70 @@ def _expand_group(raw_group: str) -> List[Path]:
 
 def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
     import matplotlib.pyplot as plt
+    import textwrap
+    from cycler import cycler
 
     metrics_keys = ["combined_score"]
+    display_labels = labels
 
     fig, axes = plt.subplots(
         1,
         len(metrics_keys),
-        figsize=(4.6 * len(metrics_keys), 4.2),
+        figsize=(9.5 * len(metrics_keys), 5.0),
         sharex=False,
     )
     if len(metrics_keys) == 1:
         axes = [axes]
 
-    for group, label in zip(groups, labels):
+    colors = list(plt.cm.tab10.colors)
+    from itertools import cycle
+    color_cycle = cycle(colors)
+    def _linestyle_for_label(label: str) -> str:
+        lower = label.lower()
+        if "gemini" in lower:
+            return "--"
+        if "gpt" in lower:
+            return "-."
+        if "qwen" in lower:
+            return ":"
+        return "-"
+
+    for group, label in zip(groups, display_labels):
         events: List[Tuple[datetime, int, Dict[str, float]]] = []
         for path in group:
             events.extend(_parse_log(path))
         steps, _raw, best = _build_series(events)
+        linestyle = _linestyle_for_label(label)
         for ax, key in zip(axes, metrics_keys):
             values = [m.get(key, float("nan")) for m in best]
-            ax.plot(steps, values, marker="o", markersize=3, label=label)
+            ax.plot(
+                steps,
+                values,
+                linewidth=1.6,
+                alpha=0.9,
+                label=label,
+                color=next(color_cycle),
+                linestyle=linestyle,
+            )
             ax.set_title(key, fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.4)
 
     for ax in axes:
         ax.tick_params(labelsize=10)
         ax.set_xlabel("Iteration (time-ordered)", fontsize=10)
-    axes[0].legend(loc="best", fontsize=10)
-    fig.tight_layout()
+    axes[0].legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.03),
+        borderaxespad=0.0,
+        fontsize=8,
+        frameon=True,
+        ncol=2,
+        columnspacing=1.6,
+        labelspacing=0.9,
+        handletextpad=0.6,
+        handlelength=2.2,
+    )
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_path)
     plt.close(fig)
 

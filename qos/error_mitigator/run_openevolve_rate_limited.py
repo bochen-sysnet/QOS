@@ -24,6 +24,47 @@ _DATABASE_ARTIFACTS_PATCHED = False
 _PENDING_ARTIFACTS: dict[str, dict] = {}
 _PROMPT_HISTORY_PATCHED = False
 _PROCESS_PARALLEL_PATCHED = False
+_PROMPT_CONFIG_PATCHED = False
+
+
+def _get_inspiration_limit(config) -> int:
+    env_value = os.getenv("OPENEVOLVE_NUM_INSPIRATIONS")
+    if env_value is not None:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            return 1
+    return 1
+
+
+def _install_prompt_config_overrides() -> None:
+    global _PROMPT_CONFIG_PATCHED
+    if _PROMPT_CONFIG_PATCHED:
+        return
+    try:
+        from openevolve import config as oe_config
+    except Exception:
+        return
+
+    original_init = oe_config.PromptConfig.__init__
+
+    def wrapped_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        num_top = os.getenv("OPENEVOLVE_NUM_TOP_PROGRAMS")
+        num_diverse = os.getenv("OPENEVOLVE_NUM_DIVERSE_PROGRAMS")
+        if num_top is not None:
+            try:
+                self.num_top_programs = max(0, int(num_top))
+            except ValueError:
+                pass
+        if num_diverse is not None:
+            try:
+                self.num_diverse_programs = max(0, int(num_diverse))
+            except ValueError:
+                pass
+
+    oe_config.PromptConfig.__init__ = wrapped_init
+    _PROMPT_CONFIG_PATCHED = True
 
 
 def _patched_run_iteration_worker(
@@ -559,14 +600,14 @@ def _install_prompt_artifact_overrides() -> None:
     logger = logging.getLogger(__name__)
 
     def wrapped_build_prompt(self, *args, **kwargs):
-        include_peer_artifacts = _env_flag("OPENEVOLVE_INCLUDE_PEER_ARTIFACTS", default=False)
+        include_peer_artifacts = _env_flag("OPENEVOLVE_INCLUDE_PEER_ARTIFACTS", default=True)
         if include_peer_artifacts and getattr(self.config, "include_artifacts", False):
             program_artifacts = kwargs.get("program_artifacts") or {}
             if not isinstance(program_artifacts, dict):
                 program_artifacts = {"current_artifacts": program_artifacts}
 
             top_programs = list(kwargs.get("top_programs") or [])
-            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False):
+            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
                 kwargs["top_programs"] = top_programs
             num_top = min(self.config.num_top_programs, len(top_programs))
             selected_top = top_programs[:num_top]
@@ -575,7 +616,10 @@ def _install_prompt_artifact_overrides() -> None:
             )
 
             inspirations = list(kwargs.get("inspirations") or [])
-            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=False):
+            desired_inspirations = _get_inspiration_limit(self.config)
+            if len(inspirations) > desired_inspirations:
+                inspirations = inspirations[:desired_inspirations]
+            if _env_flag("OPENEVOLVE_DISTINCT_SELECTIONS", default=True):
                 used_ids = {
                     p.get("id", "unknown")
                     for p in selected_top
@@ -588,9 +632,6 @@ def _install_prompt_artifact_overrides() -> None:
                     for p in inspirations
                     if p.get("id", "unknown") not in used_ids
                 ]
-                desired_inspirations = max(
-                    0, int(getattr(self.config, "num_top_programs", 0))
-                )
                 if desired_inspirations and len(inspirations) < desired_inspirations:
                     candidate_pool = list(kwargs.get("previous_programs") or []) + top_programs
                     seen_ids = {p.get("id", "unknown") for p in inspirations}
@@ -603,7 +644,7 @@ def _install_prompt_artifact_overrides() -> None:
                         seen_ids.add(program_id)
                         if len(inspirations) >= desired_inspirations:
                             break
-                kwargs["inspirations"] = inspirations
+            kwargs["inspirations"] = inspirations
             logger.info(
                 "OE prompt selection top_programs count=%s ids=%s",
                 len(selected_top),
@@ -764,6 +805,7 @@ def main() -> int:
     os.environ.setdefault("OPENEVOLVE_ENABLE_PATCHES", "1")
 
     _install_gemini_overrides()
+    _install_prompt_config_overrides()
     _install_prompt_artifact_overrides()
     _install_prompt_history_overrides()
     _install_prompt_logging_overrides()
