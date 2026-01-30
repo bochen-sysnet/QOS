@@ -100,7 +100,7 @@ def _expand_group(raw_group: str) -> List[Path]:
     return paths
 
 
-def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
+def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> Path:
     import matplotlib.pyplot as plt
     import textwrap
     from cycler import cycler
@@ -110,12 +110,11 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
 
     fig, axes = plt.subplots(
         1,
-        len(metrics_keys),
-        figsize=(9.5 * len(metrics_keys), 5.0),
+        1,
+        figsize=(9.5, 5.0),
         sharex=False,
     )
-    if len(metrics_keys) == 1:
-        axes = [axes]
+    line_axes = [axes]
 
     colors = list(plt.cm.tab10.colors)
     from itertools import cycle
@@ -130,13 +129,15 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
             return ":"
         return "-"
 
+    final_scores: dict[str, float] = {}
+
     for group, label in zip(groups, display_labels):
         events: List[Tuple[datetime, int, Dict[str, float]]] = []
         for path in group:
             events.extend(_parse_log(path))
         steps, _raw, best = _build_series(events)
         linestyle = _linestyle_for_label(label)
-        for ax, key in zip(axes, metrics_keys):
+        for ax, key in zip(line_axes, metrics_keys):
             values = [m.get(key, float("nan")) for m in best]
             ax.plot(
                 steps,
@@ -149,11 +150,13 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
             )
             ax.set_title(key, fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.4)
+        if best:
+            final_scores[label] = best[-1].get("combined_score", float("nan"))
 
-    for ax in axes:
+    for ax in line_axes:
         ax.tick_params(labelsize=10)
         ax.set_xlabel("Iteration (time-ordered)", fontsize=10)
-    axes[0].legend(
+    line_axes[0].legend(
         loc="lower center",
         bbox_to_anchor=(0.5, 0.03),
         borderaxespad=0.0,
@@ -165,9 +168,56 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> None:
         handletextpad=0.6,
         handlelength=2.2,
     )
+
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(out_path)
     plt.close(fig)
+    return out_path
+
+
+def _plot_final_scores(out_path: Path, labels: List[str], final_scores: dict[str, float]) -> Path:
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    labels_order = list(final_scores.keys())
+    x = list(range(len(labels_order)))
+    heights = [final_scores[label] for label in labels_order]
+    bars = ax.bar(x, heights, width=0.7, alpha=0.9)
+    for bar in bars:
+        height = bar.get_height()
+        if height != height:
+            continue
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            height,
+            f"{height:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
+
+    ax.set_title("Final combined_score by run", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_order, rotation=90, ha="center", fontsize=8)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _collect_final_scores(
+    groups: List[List[Path]], labels: List[str]
+) -> dict[str, float]:
+    final_scores: dict[str, float] = {}
+    for group, label in zip(groups, labels):
+        events: List[Tuple[datetime, int, Dict[str, float]]] = []
+        for path in group:
+            events.extend(_parse_log(path))
+        _steps, _raw, best = _build_series(events)
+        if best:
+            final_scores[label] = best[-1].get("combined_score", float("nan"))
+    return final_scores
 
 
 def main() -> int:
@@ -246,10 +296,20 @@ def main() -> int:
         overfit_labels: list[str] = []
         for group, label in zip(groups, labels):
             label_lower = label.lower()
-            if "general" in label_lower:
+            if (
+                "general" in label_lower
+                or "_gen_" in label_lower
+                or label_lower.startswith("gen_")
+                or label_lower.endswith("_gen")
+            ):
                 general_groups.append(group)
                 general_labels.append(label)
-            if "overfit" in label_lower:
+            if (
+                "overfit" in label_lower
+                or "_of_" in label_lower
+                or label_lower.startswith("of_")
+                or label_lower.endswith("_of")
+            ):
                 overfit_groups.append(group)
                 overfit_labels.append(label)
         return general_groups, general_labels, overfit_groups, overfit_labels
@@ -266,13 +326,29 @@ def main() -> int:
             general_out = out_path.with_name(f"{out_path.stem}_general{out_path.suffix}")
             _plot(general_groups, general_labels, general_out)
             print(f"Wrote plot: {general_out}")
+            general_final_out = out_path.with_name(
+                f"{out_path.stem}_general_final_scores{out_path.suffix}"
+            )
+            general_final = _collect_final_scores(general_groups, general_labels)
+            final_path = _plot_final_scores(general_final_out, general_labels, general_final)
+            print(f"Wrote plot: {final_path}")
         if overfit_groups:
             overfit_out = out_path.with_name(f"{out_path.stem}_overfit{out_path.suffix}")
             _plot(overfit_groups, overfit_labels, overfit_out)
             print(f"Wrote plot: {overfit_out}")
+            overfit_final_out = out_path.with_name(
+                f"{out_path.stem}_overfit_final_scores{out_path.suffix}"
+            )
+            overfit_final = _collect_final_scores(overfit_groups, overfit_labels)
+            final_path = _plot_final_scores(overfit_final_out, overfit_labels, overfit_final)
+            print(f"Wrote plot: {final_path}")
     else:
-        _plot(groups, labels, out_path)
-        print(f"Wrote plot: {out_path}")
+        plot_path = _plot(groups, labels, out_path)
+        print(f"Wrote plot: {plot_path}")
+        final_out = out_path.with_name(f"{out_path.stem}_final_scores{out_path.suffix}")
+        final_scores = _collect_final_scores(groups, labels)
+        final_path = _plot_final_scores(final_out, labels, final_scores)
+        print(f"Wrote plot: {final_path}")
     return 0
 
 

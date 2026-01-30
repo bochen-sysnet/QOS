@@ -26,6 +26,7 @@ _PROMPT_HISTORY_PATCHED = False
 _PROCESS_PARALLEL_PATCHED = False
 _PROMPT_CONFIG_PATCHED = False
 _LLM_CONFIG_PATCHED = False
+_EVALUATOR_CONFIG_PATCHED = False
 
 
 def _get_inspiration_limit(config) -> int:
@@ -94,6 +95,30 @@ def _install_llm_config_overrides() -> None:
 
     oe_config.LLMConfig.__post_init__ = wrapped_post_init
     _LLM_CONFIG_PATCHED = True
+
+
+def _install_evaluator_config_overrides() -> None:
+    global _EVALUATOR_CONFIG_PATCHED
+    if _EVALUATOR_CONFIG_PATCHED:
+        return
+    try:
+        from openevolve import config as oe_config
+    except Exception:
+        return
+
+    original_init = oe_config.EvaluatorConfig.__init__
+
+    def wrapped_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        env_value = os.getenv("OPENEVOLVE_PARALLEL_EVALUATIONS")
+        if env_value:
+            try:
+                self.parallel_evaluations = max(1, int(env_value))
+            except ValueError:
+                pass
+
+    oe_config.EvaluatorConfig.__init__ = wrapped_init
+    _EVALUATOR_CONFIG_PATCHED = True
 
 
 def _patched_run_iteration_worker(
@@ -836,6 +861,7 @@ def main() -> int:
     _install_gemini_overrides()
     _install_prompt_config_overrides()
     _install_llm_config_overrides()
+    _install_evaluator_config_overrides()
     _install_prompt_artifact_overrides()
     _install_prompt_history_overrides()
     _install_prompt_logging_overrides()

@@ -21,6 +21,10 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_DIVERSE_PROGRAMS Override num_diverse_programs
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
   OPENEVOLVE_INCLUDE_PEER_ARTIFACTS Enable peer (top/diverse/inspire) execution outputs
+  RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
+
+Flags:
+  --resume-latest                Resume from latest checkpoint under output_dir
 
 Example:
   OPENAI_API_KEY=... ./run_oe.sh gpt openevolve_output/gpt_run --iterations 100
@@ -58,12 +62,16 @@ while [[ $# -gt 0 ]]; do
       export OPENEVOLVE_NUM_INSPIRATIONS="$2"
       shift 2
       ;;
-    --peer-artifacts)
+    --memory)
       export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=1
       shift
       ;;
-    --no-peer-artifacts)
+    --no-memory)
       export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=0
+      shift
+      ;;
+    --resume-latest)
+      export RESUME_LATEST=1
       shift
       ;;
     *)
@@ -72,6 +80,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${RESUME_LATEST:-}" == "1" ]]; then
+  latest_checkpoint="$(ls -d "$OUTPUT_DIR"/checkpoints/checkpoint_* 2>/dev/null | sort -V | tail -n 1)"
+  if [[ -n "$latest_checkpoint" ]]; then
+    echo "Resuming from latest checkpoint: $latest_checkpoint"
+    EXTRA_ARGS+=(--checkpoint "$latest_checkpoint")
+  else
+    echo "Resume requested, but no checkpoints found under $OUTPUT_DIR" >&2
+  fi
+fi
 
 # Default config uses env variables for base/model/key.
 CONFIG_PATH="qos/error_mitigator/openevolve.yaml"
@@ -89,23 +107,27 @@ case "$PROFILE" in
     export OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
     export OPENAI_MODEL="${OPENAI_MODEL:-gpt-5-mini}"
     export OPENAI_SERVICE_TIER="${OPENAI_SERVICE_TIER:-flex}"
+    export OPENEVOLVE_PARALLEL_EVALUATIONS="${OPENEVOLVE_PARALLEL_EVALUATIONS:-1}"
     ;;
   gemini)
     export OPENAI_API_BASE="${OPENAI_API_BASE:-https://generativelanguage.googleapis.com/v1beta/openai/}"
     export OPENAI_MODEL="${OPENAI_MODEL:-gemini-2.5-flash-lite}"
     export GEMINI_RPM="${GEMINI_RPM:-5}"
+    export OPENEVOLVE_PARALLEL_EVALUATIONS="${OPENEVOLVE_PARALLEL_EVALUATIONS:-1}"
     ;;
   qwen)
     export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:8000/v1}"
     export OPENAI_MODEL="${OPENAI_MODEL:-Qwen/Qwen2.5-Coder-14B-Instruct-AWQ}"
     # For local servers that don't require a key.
     export OPENAI_API_KEY="${OPENAI_API_KEY:-local}"
+    export OPENEVOLVE_PARALLEL_EVALUATIONS="${OPENEVOLVE_PARALLEL_EVALUATIONS:-1}"
     ;;
   custom)
     if [[ -z "${OPENAI_API_BASE:-}" || -z "${OPENAI_MODEL:-}" || -z "${OPENAI_API_KEY:-}" ]]; then
       echo "custom profile requires OPENAI_API_BASE, OPENAI_MODEL, and OPENAI_API_KEY" >&2
       exit 1
     fi
+    export OPENEVOLVE_PARALLEL_EVALUATIONS="${OPENEVOLVE_PARALLEL_EVALUATIONS:-1}"
     ;;
   *)
     echo "Unknown profile: $PROFILE" >&2
