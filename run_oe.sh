@@ -25,6 +25,9 @@ Environment variables (override defaults):
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir
+  --repeat N                     Run N times (gemini only; rotates keys)
+  --key-start N                  Starting key index for gemini (default 0)
+  --key-prefix PATH              Key file prefix for gemini (default keys/gemini-ge)
 
 Example:
   OPENAI_API_KEY=... ./run_oe.sh gpt openevolve_output/gpt_run --iterations 100
@@ -46,6 +49,9 @@ shift 2
 export OPENEVOLVE_NUM_TOP_PROGRAMS="${OPENEVOLVE_NUM_TOP_PROGRAMS:-3}"
 export OPENEVOLVE_NUM_DIVERSE_PROGRAMS="${OPENEVOLVE_NUM_DIVERSE_PROGRAMS:-2}"
 export OPENEVOLVE_NUM_INSPIRATIONS="${OPENEVOLVE_NUM_INSPIRATIONS:-1}"
+REPEAT=1
+KEY_START=0
+KEY_PREFIX="keys/gemini-ge"
 
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -74,22 +80,24 @@ while [[ $# -gt 0 ]]; do
       export RESUME_LATEST=1
       shift
       ;;
+    --repeat)
+      REPEAT="$2"
+      shift 2
+      ;;
+    --key-start)
+      KEY_START="$2"
+      shift 2
+      ;;
+    --key-prefix)
+      KEY_PREFIX="$2"
+      shift 2
+      ;;
     *)
       EXTRA_ARGS+=("$1")
       shift
       ;;
   esac
 done
-
-if [[ "${RESUME_LATEST:-}" == "1" ]]; then
-  latest_checkpoint="$(ls -d "$OUTPUT_DIR"/checkpoints/checkpoint_* 2>/dev/null | sort -V | tail -n 1)"
-  if [[ -n "$latest_checkpoint" ]]; then
-    echo "Resuming from latest checkpoint: $latest_checkpoint"
-    EXTRA_ARGS+=(--checkpoint "$latest_checkpoint")
-  else
-    echo "Resume requested, but no checkpoints found under $OUTPUT_DIR" >&2
-  fi
-fi
 
 # Default config uses env variables for base/model/key.
 CONFIG_PATH="qos/error_mitigator/openevolve.yaml"
@@ -136,9 +144,52 @@ case "$PROFILE" in
     ;;
  esac
 
-conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
-  qos/error_mitigator/evolution_target.py \
-  qos/error_mitigator/evaluator.py \
-  --config "$CONFIG_PATH" \
-  --output "$OUTPUT_DIR" \
-  "${EXTRA_ARGS[@]}"
+if [[ "$REPEAT" -lt 1 ]]; then
+  REPEAT=1
+fi
+
+run_once() {
+  local -a run_args=("${EXTRA_ARGS[@]}")
+  local run_idx="$1"
+  if [[ "$run_idx" -gt 0 ]]; then
+    latest_checkpoint="$(ls -d "$OUTPUT_DIR"/checkpoints/checkpoint_* 2>/dev/null | sort -V | tail -n 1)"
+    if [[ -n "$latest_checkpoint" ]]; then
+      echo "Resuming from latest checkpoint: $latest_checkpoint"
+      run_args+=(--checkpoint "$latest_checkpoint")
+    else
+      echo "Resume requested, but no checkpoints found under $OUTPUT_DIR" >&2
+    fi
+  elif [[ "${RESUME_LATEST:-}" == "1" ]]; then
+    latest_checkpoint="$(ls -d "$OUTPUT_DIR"/checkpoints/checkpoint_* 2>/dev/null | sort -V | tail -n 1)"
+    if [[ -n "$latest_checkpoint" ]]; then
+      echo "Resuming from latest checkpoint: $latest_checkpoint"
+      run_args+=(--checkpoint "$latest_checkpoint")
+    else
+      echo "Resume requested, but no checkpoints found under $OUTPUT_DIR" >&2
+    fi
+  fi
+
+  conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
+    qos/error_mitigator/evolution_target.py \
+    qos/error_mitigator/evaluator.py \
+    --config "$CONFIG_PATH" \
+    --output "$OUTPUT_DIR" \
+    "${run_args[@]}"
+}
+
+if [[ "$PROFILE" == "gemini" && "$REPEAT" -gt 1 ]]; then
+  for ((i=0; i<REPEAT; i++)); do
+    key_index=$((KEY_START + i))
+    key_file="${KEY_PREFIX}${key_index}.key"
+    if [[ -f "$key_file" ]]; then
+      export OPENAI_API_KEY
+      OPENAI_API_KEY="$(<"$key_file")"
+      echo "Using gemini key: $key_file"
+    else
+      echo "Gemini key not found: $key_file" >&2
+    fi
+    run_once "$i"
+  done
+else
+  run_once 0
+fi

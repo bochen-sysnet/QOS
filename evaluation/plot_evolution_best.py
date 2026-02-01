@@ -110,35 +110,51 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> Path:
 
     fig, axes = plt.subplots(
         1,
-        1,
-        figsize=(9.5, 5.0),
+        3,
+        figsize=(12.0, 4.5),
         sharex=False,
+        sharey=True,
     )
-    line_axes = [axes]
+    line_axes = list(axes)
+
+    axis_map = {
+        "gpt": line_axes[0],
+        "qwen": line_axes[1],
+        "gemini": line_axes[2],
+    }
 
     colors = list(plt.cm.tab10.colors)
     from itertools import cycle
     color_cycle = cycle(colors)
-    def _linestyle_for_label(label: str) -> str:
+    plotted_axes = {ax: False for ax in line_axes}
+
+    def _model_bucket(label: str) -> str | None:
         lower = label.lower()
-        if "gemini" in lower:
-            return "--"
         if "gpt" in lower:
-            return "-."
+            return "gpt"
         if "qwen" in lower:
-            return ":"
+            return "qwen"
+        if "gemini" in lower or lower.startswith("gem") or " gem" in lower or "_gem" in lower:
+            return "gemini"
+        return None
+
+    def _linestyle_for_label(label: str) -> str:
         return "-"
 
     final_scores: dict[str, float] = {}
+    min_score = -1000.0
 
     for group, label in zip(groups, display_labels):
         events: List[Tuple[datetime, int, Dict[str, float]]] = []
         for path in group:
             events.extend(_parse_log(path))
         steps, _raw, best = _build_series(events)
+        bucket = _model_bucket(label)
+        target_axes = [axis_map[bucket]] if bucket else line_axes
         linestyle = _linestyle_for_label(label)
-        for ax, key in zip(line_axes, metrics_keys):
+        for ax, key in zip(target_axes, metrics_keys):
             values = [m.get(key, float("nan")) for m in best]
+            values = [v if v == v and v > min_score else float("nan") for v in values]
             ax.plot(
                 steps,
                 values,
@@ -150,26 +166,43 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> Path:
             )
             ax.set_title(key, fontsize=12)
             ax.grid(True, linestyle="--", alpha=0.4)
+            plotted_axes[ax] = True
         if best:
             final_scores[label] = best[-1].get("combined_score", float("nan"))
 
     for ax in line_axes:
         ax.tick_params(labelsize=10)
         ax.set_xlabel("Iteration (time-ordered)", fontsize=10)
-    line_axes[0].legend(
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.03),
-        borderaxespad=0.0,
-        fontsize=8,
-        frameon=True,
-        ncol=2,
-        columnspacing=1.6,
-        labelspacing=0.9,
-        handletextpad=0.6,
-        handlelength=2.2,
-    )
+        if plotted_axes[ax]:
+            ax.legend(
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.03),
+                borderaxespad=0.0,
+                fontsize=7,
+                frameon=True,
+                ncol=1,
+                columnspacing=1.2,
+                labelspacing=0.7,
+                handletextpad=0.5,
+                handlelength=2.0,
+            )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No runs",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="gray",
+            )
 
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    line_axes[0].set_title("combined_score (gpt)", fontsize=11)
+    line_axes[1].set_title("combined_score (qwen)", fontsize=11)
+    line_axes[2].set_title("combined_score (gemini)", fontsize=11)
+
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
     fig.savefig(out_path)
     plt.close(fig)
     return out_path
@@ -178,28 +211,57 @@ def _plot(groups: List[List[Path]], labels: List[str], out_path: Path) -> Path:
 def _plot_final_scores(out_path: Path, labels: List[str], final_scores: dict[str, float]) -> Path:
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    labels_order = list(final_scores.keys())
-    x = list(range(len(labels_order)))
-    heights = [final_scores[label] for label in labels_order]
-    bars = ax.bar(x, heights, width=0.7, alpha=0.9)
-    for bar in bars:
-        height = bar.get_height()
-        if height != height:
-            continue
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            height,
-            f"{height:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-        )
+    fig, axes = plt.subplots(1, 3, figsize=(12.0, 4.5), sharey=True)
+    axis_map = {
+        "gpt": axes[0],
+        "qwen": axes[1],
+        "gemini": axes[2],
+    }
 
-    ax.set_title("Final combined_score by run", fontsize=12)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels_order, rotation=90, ha="center", fontsize=8)
-    ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+    def _model_bucket(label: str) -> str | None:
+        lower = label.lower()
+        if "gpt" in lower:
+            return "gpt"
+        if "qwen" in lower:
+            return "qwen"
+        if "gemini" in lower or lower.startswith("gem") or " gem" in lower or "_gem" in lower:
+            return "gemini"
+        return None
+
+    for model, ax in axis_map.items():
+        labels_order = [l for l in final_scores.keys() if _model_bucket(l) == model]
+        x = list(range(len(labels_order)))
+        heights = [final_scores[label] for label in labels_order]
+        bars = ax.bar(x, heights, width=0.7, alpha=0.9)
+        for bar in bars:
+            height = bar.get_height()
+            if height != height:
+                continue
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                height,
+                f"{height:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
+
+        ax.set_title(f"Final combined_score ({model})", fontsize=11)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels_order, rotation=90, ha="center", fontsize=8)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+        if not labels_order:
+            ax.text(
+                0.5,
+                0.5,
+                "No runs",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="gray",
+            )
+
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
