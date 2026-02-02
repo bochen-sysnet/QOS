@@ -2,6 +2,7 @@ import argparse
 import csv
 import datetime as dt
 import importlib.util
+import json
 from pathlib import Path
 import multiprocessing as mp
 import logging
@@ -101,7 +102,7 @@ TARGET_REL = {
     },
 }
 
-METHOD_ORDER = ["FrozenQubits", "CutQC", "QOS", "QOSN", "QOSE"]
+METHOD_ORDER = ["FrozenQubits", "CutQC", "QOS", "QOSN", "QOSE", "qwen", "gemini", "gpt"]
 METHOD_ALIASES = {
     "frozenqubit": "FrozenQubits",
     "frozenqubits": "FrozenQubits",
@@ -110,6 +111,10 @@ METHOD_ALIASES = {
     "qos": "QOS",
     "qosn": "QOSN",
     "qose": "QOSE",
+    "qwen": "qwen",
+    "gem": "gemini",
+    "gemini": "gemini",
+    "gpt": "gpt",
 }
 
 
@@ -276,6 +281,98 @@ def _find_qose_program(path_hint: str) -> Optional[Path]:
     return None
 
 
+def _model_tokens(model: str) -> List[str]:
+    model = model.lower().strip()
+    if model == "gemini":
+        return ["gemini", "gem"]
+    if model == "gpt":
+        return ["gpt"]
+    if model == "qwen":
+        return ["qwen"]
+    return [model]
+
+
+def _find_best_qose_programs(models: List[str], root: Path) -> Dict[str, Path]:
+    best: Dict[str, Tuple[float, Path]] = {}
+    for info_path in root.rglob("best_program_info.json"):
+        try:
+            data = json.loads(info_path.read_text())
+        except Exception:
+            continue
+        metrics = data.get("metrics") or {}
+        score = metrics.get("combined_score")
+        if score is None:
+            continue
+        lower_path = str(info_path).lower()
+        for model in models:
+            tokens = _model_tokens(model)
+            if not any(token in lower_path for token in tokens):
+                continue
+            current = best.get(model)
+            if current is None or score > current[0]:
+                best_program = info_path.parent / "best_program.py"
+                if best_program.exists():
+                    best[model] = (float(score), best_program)
+            break
+    return {model: path for model, (score, path) in best.items()}
+
+
+def _normalize_qose_method(name: str) -> str:
+    lower = name.strip().lower()
+    if lower in {"qose", "qosee"}:
+        return "QOSE"
+    if lower in {"gem", "gemini"}:
+        return "gemini"
+    if lower == "gpt":
+        return "gpt"
+    if lower == "qwen":
+        return "qwen"
+    return name.strip()
+
+
+def _resolve_best_program_path(root: Path, hint: str) -> Optional[Path]:
+    candidate = Path(hint)
+    if candidate.is_absolute() and candidate.exists():
+        if candidate.is_file():
+            return candidate
+        for sub in ("best/best_program.py", "best_program.py"):
+            path = candidate / sub
+            if path.exists():
+                return path
+        return None
+    if candidate.exists():
+        if candidate.is_file():
+            return candidate.resolve()
+        for sub in ("best/best_program.py", "best_program.py"):
+            path = candidate / sub
+            if path.exists():
+                return path.resolve()
+        return None
+    # Treat hint as a folder under the root.
+    for sub in ("best/best_program.py", "best_program.py"):
+        path = root / hint / sub
+        if path.exists():
+            return path.resolve()
+    return None
+
+
+def _parse_manual_qose_mapping(raw: str, root: Path) -> Dict[str, Path]:
+    mapping: Dict[str, Path] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        method = _normalize_qose_method(key)
+        value = value.strip()
+        if not value:
+            continue
+        program = _resolve_best_program_path(root, value)
+        if program:
+            mapping[method] = program
+    return mapping
+
+
 def _load_qose_run(qose_program: Path) -> Callable:
     spec = importlib.util.spec_from_file_location("qose_program", str(qose_program))
     if spec is None or spec.loader is None:
@@ -299,39 +396,51 @@ def _load_qose_run(qose_program: Path) -> Callable:
     return evolved_run
 
 
-def _relative_methods(include_qose: bool) -> List[str]:
+def _relative_methods(include_qose: bool, qose_methods: Optional[List[str]] = None) -> List[str]:
     methods = ["FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
-        methods.append("QOSE")
+        if qose_methods:
+            methods.extend(qose_methods)
+        else:
+            methods.append("QOSE")
     return methods
 
 
-def _fidelity_methods(include_qose: bool) -> List[str]:
+def _fidelity_methods(include_qose: bool, qose_methods: Optional[List[str]] = None) -> List[str]:
     methods = ["Qiskit", "FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
-        methods.append("QOSE")
+        if qose_methods:
+            methods.extend(qose_methods)
+        else:
+            methods.append("QOSE")
     return methods
 
 
-def _timing_methods(include_qose: bool) -> List[str]:
+def _timing_methods(include_qose: bool, qose_methods: Optional[List[str]] = None) -> List[str]:
     methods = ["FrozenQubits", "CutQC", "QOS", "QOSN"]
     if include_qose:
-        methods.append("QOSE")
+        if qose_methods:
+            methods.extend(qose_methods)
+        else:
+            methods.append("QOSE")
     return methods
 
 
-def _cut_methods(include_qose: bool) -> List[str]:
+def _cut_methods(include_qose: bool, qose_methods: Optional[List[str]] = None) -> List[str]:
     methods = ["Qiskit", "QOS", "QOSN"]
     if include_qose:
-        methods.append("QOSE")
+        if qose_methods:
+            methods.extend(qose_methods)
+        else:
+            methods.append("QOSE")
     methods.extend(["FrozenQubits", "CutQC"])
     return methods
 
 
-def _parse_methods(value: str, include_qose: bool) -> List[str]:
+def _parse_methods(value: str, include_qose: bool, qose_methods: Optional[List[str]] = None) -> List[str]:
     raw = value.strip()
     if not raw or raw.lower() in {"all", "default"}:
-        return _relative_methods(include_qose)
+        return _relative_methods(include_qose, qose_methods)
 
     requested = []
     for entry in raw.split(","):
@@ -347,7 +456,12 @@ def _parse_methods(value: str, include_qose: bool) -> List[str]:
 
     ordered = []
     seen = set()
-    for method in METHOD_ORDER:
+    method_order = list(METHOD_ORDER)
+    if qose_methods:
+        for method in qose_methods:
+            if method not in method_order:
+                method_order.append(method)
+    for method in method_order:
         if method in requested and method not in seen:
             ordered.append(method)
             seen.add(method)
@@ -1691,6 +1805,12 @@ def _summarize(rows: List[Dict[str, object]], methods: List[str]) -> Dict[str, f
         "CutQC": "rel_nonlocal_cutqc",
         "QOSE": "rel_nonlocal_qose",
     }
+    for method in methods:
+        if method in rel_depth_keys:
+            continue
+        key = method.lower()
+        rel_depth_keys[method] = f"rel_depth_{key}"
+        rel_nonlocal_keys[method] = f"rel_nonlocal_{key}"
 
     summary: Dict[str, float] = {}
     for method in methods:
@@ -1717,7 +1837,7 @@ def _summarize(rows: List[Dict[str, object]], methods: List[str]) -> Dict[str, f
     return summary
 
 
-def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[str]):
+def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], methods: List[str]):
     all_rows: List[Dict[str, object]] = []
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
     timing_rows = []
@@ -1728,7 +1848,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
     real_job_counts_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     cut_circuits: Dict[Tuple[int, str, str], List[QuantumCircuit]] = {}
     fragment_fidelity: Dict[Tuple[int, str], Dict[str, object]] = {}
-    include_qose = qose_run is not None and "QOSE" in methods
+    qose_runs = qose_runs or {}
+    qose_methods = [m for m in methods if m in qose_runs]
+    include_qose = bool(qose_methods)
     run_qos = "QOS" in methods
     run_qosn = "QOSN" in methods
     run_fq = "FrozenQubits" in methods
@@ -1841,29 +1963,34 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         flush=True,
                     )
 
-            qose_m = None
-            qose_t = {}
-            qose_circs = []
+            qose_results: Dict[str, Dict[str, object]] = {}
             if include_qose:
-                qose_t0 = time.perf_counter()
-                qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_run)
-                if qose_m is None:
-                    if run_qos and qos_m is not None:
-                        qose_m = qos_m
-                        qose_circs = qos_circs
-                    elif run_qosn and qosn_m is not None:
-                        qose_m = qosn_m
-                        qose_circs = qosn_circs
-                    else:
-                        qose_m = base
-                        qose_circs = [qc]
-                    qose_t = {}
-                if args.verbose:
-                    print(
-                        f"  qose depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']} "
-                        f"sec={time.perf_counter() - qose_t0:.2f}",
-                        flush=True,
-                    )
+                for method in qose_methods:
+                    qose_t0 = time.perf_counter()
+                    qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_runs[method])
+                    if qose_m is None:
+                        if run_qos and qos_m is not None:
+                            qose_m = qos_m
+                            qose_circs = qos_circs
+                        elif run_qosn and qosn_m is not None:
+                            qose_m = qosn_m
+                            qose_circs = qosn_circs
+                        else:
+                            qose_m = base
+                            qose_circs = [qc]
+                        qose_t = {}
+                    qose_results[method] = {
+                        "metrics": qose_m,
+                        "timing": qose_t,
+                        "circs": qose_circs,
+                        "elapsed": time.perf_counter() - qose_t0,
+                    }
+                    if args.verbose:
+                        print(
+                            f"  {method} depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']} "
+                            f"sec={qose_results[method]['elapsed']:.2f}",
+                            flush=True,
+                        )
 
             if args.fragment_fidelity_sweep and run_qos and qos_circs is not None:
                 fragment_fidelity[(size, bench)] = _fragment_fidelity_sweep(
@@ -1893,13 +2020,18 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                 rel_nonlocal[bench]["QOSN"] = _relative(
                     qosn_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
                 )
-            if include_qose and qose_m is not None:
-                rel_depth[bench]["QOSE"] = _relative(qose_m["depth"], base["depth"])
-                rel_nonlocal[bench]["QOSE"] = _relative(
-                    qose_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
-                )
+            if include_qose:
+                for method, qose_data in qose_results.items():
+                    qose_m = qose_data.get("metrics")
+                    if not qose_m:
+                        continue
+                    rel_depth[bench][method] = _relative(qose_m["depth"], base["depth"])
+                    rel_nonlocal[bench][method] = _relative(
+                        qose_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
+                    )
 
             if args.with_fidelity:
+                rel_fidelity = {}
                 if args.verbose:
                     print("  fidelity sim start", flush=True)
                 sim_times = {}
@@ -1916,7 +2048,9 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                 qosn_fidelity = ""
                 fq_fidelity = ""
                 cutqc_fidelity = ""
-                qose_fidelity = ""
+                qose_fidelity: Dict[str, float] = {}
+                qose_std: Dict[str, float] = {}
+                rel_fidelity = {}
 
                 if run_qos and qos_circs is not None:
                     t0 = time.perf_counter()
@@ -1954,15 +2088,21 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     fidelity_by_size[size][bench]["CutQC"] = cutqc_fidelity
                     fidelity_err_by_size[size][bench]["CutQC"] = cutqc_std
                     rel_fidelity["CutQC"] = _relative(cutqc_fidelity, base_fidelity)
-                if include_qose and qose_circs is not None:
-                    t0 = time.perf_counter()
-                    qose_fidelity, qose_std = _fidelity_stats(
-                        qose_circs, args.fidelity_shots, noise, args.fidelity_seed
-                    )
-                    sim_times["QOSE"] = time.perf_counter() - t0
-                    fidelity_by_size[size][bench]["QOSE"] = qose_fidelity
-                    fidelity_err_by_size[size][bench]["QOSE"] = qose_std
-                    rel_fidelity["QOSE"] = _relative(qose_fidelity, base_fidelity)
+                if include_qose:
+                    for method, qose_data in qose_results.items():
+                        qose_circs = qose_data.get("circs")
+                        if not qose_circs:
+                            continue
+                        t0 = time.perf_counter()
+                        qose_val, qose_std_val = _fidelity_stats(
+                            qose_circs, args.fidelity_shots, noise, args.fidelity_seed
+                        )
+                        sim_times[method] = time.perf_counter() - t0
+                        qose_fidelity[method] = qose_val
+                        qose_std[method] = qose_std_val
+                        fidelity_by_size[size][bench][method] = qose_val
+                        fidelity_err_by_size[size][bench][method] = qose_std_val
+                        rel_fidelity[method] = _relative(qose_val, base_fidelity)
 
                 if args.verbose:
                     print(f"  fidelity sim sec={sum(sim_times.values()):.2f}", flush=True)
@@ -1979,7 +2119,8 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                 qosn_fidelity = ""
                 fq_fidelity = ""
                 cutqc_fidelity = ""
-                qose_fidelity = ""
+                qose_fidelity = {}
+                rel_fidelity = {}
                 rel_fidelity_qos = ""
                 rel_fidelity_qosn = ""
                 rel_fidelity_fq = ""
@@ -2046,18 +2187,22 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     )
                     real_fidelity_by_size[size][bench]["CutQC"] = real_cut
                     real_fidelity_err_by_size[size][bench]["CutQC"] = real_cut_std
-                if include_qose and qose_circs is not None:
-                    real_qose, real_qose_std = _real_fidelity_stats(
-                        qose_circs,
-                        args.real_fidelity_shots,
-                        args.real_backend,
-                        args.fidelity_seed,
-                        "QOSE",
-                        bench,
-                        size,
-                    )
-                    real_fidelity_by_size[size][bench]["QOSE"] = real_qose
-                    real_fidelity_err_by_size[size][bench]["QOSE"] = real_qose_std
+                if include_qose:
+                    for method, qose_data in qose_results.items():
+                        qose_circs = qose_data.get("circs")
+                        if not qose_circs:
+                            continue
+                        real_qose, real_qose_std = _real_fidelity_stats(
+                            qose_circs,
+                            args.real_fidelity_shots,
+                            args.real_backend,
+                            args.fidelity_seed,
+                            method,
+                            bench,
+                            size,
+                        )
+                        real_fidelity_by_size[size][bench][method] = real_qose
+                        real_fidelity_err_by_size[size][bench][method] = real_qose_std
             if args.with_real_fidelity or _REAL_DRY_RUN:
                 real_job_counts_by_size[size][bench]["Qiskit"] = float(
                     sum(_count_real_jobs(c) for c in [qc])
@@ -2078,10 +2223,14 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     real_job_counts_by_size[size][bench]["CutQC"] = float(
                         sum(_count_real_jobs(c) for c in cutqc_circs)
                     )
-                if include_qose and qose_circs is not None:
-                    real_job_counts_by_size[size][bench]["QOSE"] = float(
-                        sum(_count_real_jobs(c) for c in qose_circs)
-                    )
+                if include_qose:
+                    for method, qose_data in qose_results.items():
+                        qose_circs = qose_data.get("circs")
+                        if not qose_circs:
+                            continue
+                        real_job_counts_by_size[size][bench][method] = float(
+                            sum(_count_real_jobs(c) for c in qose_circs)
+                        )
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
 
@@ -2162,23 +2311,29 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                         "rel_fidelity_cutqc": rel_fidelity_cutqc,
                     }
                 )
-            if include_qose and qose_m is not None:
-                qose_sim = float(sim_times.get("QOSE", 0.0))
-                qose_num_circuits = max(1, len(qose_circs))
-                row.update(
-                    {
-                        "qose_depth": qose_m["depth"],
-                        "qose_nonlocal": qose_m["num_nonlocal_gates"],
-                        "qose_fidelity": qose_fidelity,
-                        "qose_sim_time": qose_sim,
-                        "qose_num_circuits": qose_num_circuits,
-                        "qose_classical_overhead": _safe_ratio(qose_sim, qiskit_sim),
-                        "qose_quantum_overhead": float(qose_num_circuits),
-                        "rel_depth_qose": rel_depth[bench]["QOSE"],
-                        "rel_nonlocal_qose": rel_nonlocal[bench]["QOSE"],
-                        "rel_fidelity_qose": rel_fidelity_qose,
-                    }
-                )
+            if include_qose:
+                for method, qose_data in qose_results.items():
+                    qose_m = qose_data.get("metrics")
+                    qose_circs = qose_data.get("circs") or []
+                    if not qose_m:
+                        continue
+                    qose_sim = float(sim_times.get(method, 0.0))
+                    qose_num_circuits = max(1, len(qose_circs))
+                    prefix = method.lower()
+                    row.update(
+                        {
+                            f"{prefix}_depth": qose_m["depth"],
+                            f"{prefix}_nonlocal": qose_m["num_nonlocal_gates"],
+                            f"{prefix}_fidelity": qose_fidelity.get(method, ""),
+                            f"{prefix}_sim_time": qose_sim,
+                            f"{prefix}_num_circuits": qose_num_circuits,
+                            f"{prefix}_classical_overhead": _safe_ratio(qose_sim, qiskit_sim),
+                            f"{prefix}_quantum_overhead": float(qose_num_circuits),
+                            f"rel_depth_{prefix}": rel_depth[bench].get(method, ""),
+                            f"rel_nonlocal_{prefix}": rel_nonlocal[bench].get(method, ""),
+                            f"rel_fidelity_{prefix}": rel_fidelity.get(method, ""),
+                        }
+                    )
             all_rows.append(row)
 
             if args.collect_timing:
@@ -2191,8 +2346,11 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     timing_methods.append(("FrozenQubits", fq_t))
                 if run_cutqc and cutqc_t is not None:
                     timing_methods.append(("CutQC", cutqc_t))
-                if include_qose and qose_t is not None:
-                    timing_methods.append(("QOSE", qose_t))
+                if include_qose:
+                    for method, qose_data in qose_results.items():
+                        qose_t = qose_data.get("timing")
+                        if qose_t is not None:
+                            timing_methods.append((method, qose_t))
                 for method, timing in timing_methods:
                     row = {"bench": bench, "size": size, "method": method}
                     row.update(timing)
@@ -2205,8 +2363,11 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
                     cut_circuits[(size, bench, "QOS")] = qos_circs
                 if run_qosn and qosn_circs is not None:
                     cut_circuits[(size, bench, "QOSN")] = qosn_circs
-                if include_qose and qose_circs is not None:
-                    cut_circuits[(size, bench, "QOSE")] = qose_circs
+                if include_qose:
+                    for method, qose_data in qose_results.items():
+                        qose_circs = qose_data.get("circs")
+                        if qose_circs is not None:
+                            cut_circuits[(size, bench, method)] = qose_circs
                 if run_fq and fq_circs is not None:
                     cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
                 if run_cutqc and cutqc_circs is not None:
@@ -2230,16 +2391,48 @@ def _run_eval(args, benches, sizes, qose_run: Optional[Callable], methods: List[
     )
 
 
-def _load_qose_run_from_args(args) -> Tuple[Optional[Callable], Optional[Path]]:
-    qose_program = _find_qose_program(getattr(args, "qose_program", ""))
-    if not qose_program:
-        return None, None
-    try:
-        return _load_qose_run(qose_program), qose_program
-    except Exception as exc:
-        if getattr(args, "verbose", False):
-            print(f"Skipping QOSE program {qose_program}: {exc}", file=sys.stderr)
-        return None, None
+def _load_qose_runs_from_args(
+    args,
+) -> Tuple[Dict[str, Callable], Dict[str, Path]]:
+    qose_runs: Dict[str, Callable] = {}
+    qose_programs: Dict[str, Path] = {}
+    manual_map = getattr(args, "qose_manual", "").strip()
+    if manual_map:
+        root = Path(getattr(args, "qose_best_root", str(ROOT / "openevolve_output")))
+        manual_paths = _parse_manual_qose_mapping(manual_map, root)
+        for method, program in manual_paths.items():
+            try:
+                qose_runs[method] = _load_qose_run(program)
+                qose_programs[method] = program
+            except Exception as exc:
+                if getattr(args, "verbose", False):
+                    print(f"Skipping QOSE program {program}: {exc}", file=sys.stderr)
+        return qose_runs, qose_programs
+    if getattr(args, "qose_auto_best", False):
+        models = [m.strip() for m in getattr(args, "qose_models", "").split(",") if m.strip()]
+        root = Path(getattr(args, "qose_best_root", str(ROOT / "openevolve_output")))
+        best_programs = _find_best_qose_programs(models, root)
+        for model in models:
+            program = best_programs.get(model)
+            if not program:
+                continue
+            try:
+                qose_runs[model] = _load_qose_run(program)
+                qose_programs[model] = program
+            except Exception as exc:
+                if getattr(args, "verbose", False):
+                    print(f"Skipping QOSE program {program}: {exc}", file=sys.stderr)
+    else:
+        qose_program = _find_qose_program(getattr(args, "qose_program", ""))
+        if not qose_program:
+            return qose_runs, qose_programs
+        try:
+            qose_runs["QOSE"] = _load_qose_run(qose_program)
+            qose_programs["QOSE"] = qose_program
+        except Exception as exc:
+            if getattr(args, "verbose", False):
+                print(f"Skipping QOSE program {qose_program}: {exc}", file=sys.stderr)
+    return qose_runs, qose_programs
 
 
 def _plot_cut_visualization(
@@ -2375,7 +2568,7 @@ def main() -> None:
         "--methods",
         default="all",
         help=(
-            "Comma-separated methods to run: FrozenQubits,CutQC,QOS,QOSN,QOSE "
+            "Comma-separated methods to run: FrozenQubits,CutQC,QOS,QOSN,QOSE,qwen,gemini,gpt "
             "(or 'all' for defaults)."
         ),
     )
@@ -2391,6 +2584,30 @@ def main() -> None:
             "Optional path to evolved QOSE program (evolved_run). "
             "If unset, auto-detect qose_program.py or openevolve_output/best_program.py."
         ),
+    )
+    parser.add_argument(
+        "--qose-manual",
+        default="",
+        help=(
+            "Manual model mapping: qwen=folder,gemini=folder,gpt=folder. "
+            "Values can be folders under openevolve_output or explicit paths. "
+            "If set, overrides --qose-auto-best."
+        ),
+    )
+    parser.add_argument(
+        "--qose-auto-best",
+        action="store_true",
+        help="Auto-select best evolved programs per model from openevolve_output.",
+    )
+    parser.add_argument(
+        "--qose-models",
+        default="qwen,gemini,gpt",
+        help="Comma-separated model names to load when using --qose-auto-best.",
+    )
+    parser.add_argument(
+        "--qose-best-root",
+        default=str(ROOT / "openevolve_output"),
+        help="Root directory to search for best_program_info.json files.",
     )
     parser.add_argument(
         "--out-dir",
@@ -2424,14 +2641,24 @@ def main() -> None:
         selected = {b.strip() for b in args.benches.split(",") if b.strip()}
         benches = [(b, label) for b, label in BENCHES if b in selected]
 
-    qose_run, qose_program = _load_qose_run_from_args(args)
-    selected_methods = _parse_methods(args.methods, qose_run is not None)
-    if "QOSE" in selected_methods and qose_run is None:
-        print("Requested QOSE but no QOSE program was found; skipping QOSE.", file=sys.stderr)
-        selected_methods = [m for m in selected_methods if m != "QOSE"]
-    include_qose = qose_run is not None and "QOSE" in selected_methods
-    if args.verbose and qose_program and include_qose:
-        print(f"Using QOSE program: {qose_program}", file=sys.stderr)
+    qose_runs, qose_programs = _load_qose_runs_from_args(args)
+    selected_methods = _parse_methods(args.methods, bool(qose_runs), list(qose_runs.keys()))
+    missing_qose = [
+        m
+        for m in selected_methods
+        if m in {"QOSE", "qwen", "gemini", "gpt"} and m not in qose_runs
+    ]
+    if missing_qose:
+        print(
+            f"Requested QOSE methods not available: {', '.join(missing_qose)}; skipping.",
+            file=sys.stderr,
+        )
+        selected_methods = [m for m in selected_methods if m not in missing_qose]
+    include_qose = bool(qose_runs) and any(m in qose_runs for m in selected_methods)
+    if args.verbose and qose_programs and include_qose:
+        for method, program in qose_programs.items():
+            if method in selected_methods:
+                print(f"Using QOSE program ({method}): {program}", file=sys.stderr)
 
     if args.sweep:
         sweep_rows = []
@@ -2469,7 +2696,7 @@ def main() -> None:
                                 _frag,
                                 _real_jobs,
                             ) = _run_eval(
-                                args, benches, sizes, qose_run, selected_methods
+                                args, benches, sizes, qose_runs, selected_methods
                             )
                             summary = _summarize(rows, selected_methods)
                             sweep_rows.append(
@@ -2517,7 +2744,7 @@ def main() -> None:
             cut_circuits,
             fragment_fidelity,
             real_job_counts_by_size,
-        ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
+        ) = _run_eval(args, benches, sizes, qose_runs, selected_methods)
         print(f"Wrote sweep: {sweep_path}")
         print(
             "Best config:"
@@ -2537,7 +2764,7 @@ def main() -> None:
             cut_circuits,
             fragment_fidelity,
             real_job_counts_by_size,
-        ) = _run_eval(args, benches, sizes, qose_run, selected_methods)
+        ) = _run_eval(args, benches, sizes, qose_runs, selected_methods)
 
     fidelity_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
     combined_path = _plot_combined(
