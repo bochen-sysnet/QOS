@@ -87,13 +87,14 @@ prompt:
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
-      - qose_overhead: average number of circuits to run ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
-          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
+          combined_score = -(w * (exp_penalty(qose_depth) + exp_penalty(qose_cnot)) + avg_run_time)
+          exp_penalty(x) = exp(k * (x - 1)) - 1
+          default k=20; default w chosen so a 2% depth/cnot increase requires 80% time reduction.
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
-        reduce circuit count (overhead), and reduce cost-search time.
+        reduce cost-search time, and avoid depth/CNOT regressions.
 
     We provide the last program executed by the evaluator and top/diverse/inspiration programs if any. Use them to diagnose decisions. Details of the execution outputs are as follows:
 
@@ -107,14 +108,13 @@ prompt:
       - qos_wc_cost_calls_total: total WC cost calls (baseline)
       - qos_depth_avg: average absolute depth of baseline circuits
       - qos_cnot_avg: average absolute nonlocal gate count of baseline circuits
-      - qos_overhead_avg: average absolute number of baseline circuits
 
     EXECUTION OUTPUTS PROVIDED BY EVALUATOR (per case):
       - input_features: static circuit features (depth, qubits, gates, etc.)
         num_connected_components, number_instructions, num_measurements, num_cnot_gates,
         program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
       - qose_input_size: initial target size before cost-search adjustments
-      - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
+      - qose_depth, qos_depth, qose_cnot, qos_cnot,
         qose_run_sec, qos_run_sec: paired QOSE vs baseline QOS metrics
       - qose_output_size: final target size chosen by the algorithm
       - qose_method: chosen method ("GV" or "WC")

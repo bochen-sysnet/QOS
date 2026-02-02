@@ -1,5 +1,6 @@
 import importlib.util
 import logging
+import math
 import numbers
 import os
 import random
@@ -120,8 +121,9 @@ def _evaluate_impl(program_path):
         bench_size_pairs = rng.sample(candidate_pairs, pair_count)
     else:
         bench_size_pairs = [rng.choice(candidate_pairs) for _ in range(pair_count)]
-    depth_sum = cnot_sum = overhead_sum = run_time_sum = 0.0
-    qos_depth_sum = qos_cnot_sum = qos_overhead_sum = qos_run_time_sum = 0.0
+    depth_sum = cnot_sum = run_time_sum = 0.0
+    depth_pen_sum = cnot_pen_sum = 0.0
+    qos_depth_sum = qos_cnot_sum = qos_run_time_sum = 0.0
     count = 0
     cases = []
 
@@ -149,6 +151,11 @@ def _evaluate_impl(program_path):
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
     failure_traces = []
+    exp_k = 20.0
+    target_increase = float(os.getenv("QOSE_EXP_TARGET_INCREASE", "0.02"))
+    target_time = float(os.getenv("QOSE_EXP_TARGET_TIME", "0.2"))
+    pen_target = math.expm1(exp_k * max(0.0, target_increase))
+    exp_weight = (1.0 - target_time) / (2.0 * pen_target) if pen_target > 0 else 1.0
     for bench, size in bench_size_pairs:
         if count >= pair_count:
             break
@@ -336,22 +343,21 @@ def _evaluate_impl(program_path):
 
         qose_depth = qose_m["depth"]
         qose_cnot = qose_m["num_nonlocal_gates"]
-        qose_overhead = len(qose_circs)
         qos_depth = qos_m["depth"]
         qos_cnot = qos_m["num_nonlocal_gates"]
-        qos_overhead = len(qos_circs)
 
         rel_depth = _safe_ratio(qose_depth, qos_depth)
         rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
-        rel_overhead = _safe_ratio(qose_overhead, qos_overhead)
         rel_run_time = _safe_ratio(run_time, qos_run_time)
+        depth_pen = math.expm1(exp_k * (rel_depth - 1.0))
+        cnot_pen = math.expm1(exp_k * (rel_cnot - 1.0))
         depth_sum += rel_depth
         cnot_sum += rel_cnot
-        overhead_sum += rel_overhead
         run_time_sum += rel_run_time
+        depth_pen_sum += depth_pen
+        cnot_pen_sum += cnot_pen
         qos_depth_sum += qos_depth
         qos_cnot_sum += qos_cnot
-        qos_overhead_sum += qos_overhead
         qos_run_time_sum += qos_run_time
         gv_calls = mitigator._gv_cost_calls
         wc_calls = mitigator._wc_cost_calls
@@ -378,8 +384,6 @@ def _evaluate_impl(program_path):
                 "qos_depth": qos_depth,
                 "qose_cnot": qose_cnot,
                 "qos_cnot": qos_cnot,
-                "qose_num_circuits": qose_overhead,
-                "qos_num_circuits": qos_overhead,
                 "qose_run_sec": run_time,
                 "qos_run_sec": qos_run_time,
                 "qose_output_size": mitigator._qose_cost_search_output_size,
@@ -407,13 +411,13 @@ def _evaluate_impl(program_path):
 
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
-    avg_overhead = overhead_sum / count
     avg_run_time = run_time_sum / count
-    combined_score = -(avg_depth + avg_cnot + avg_overhead + avg_run_time)
+    avg_depth_pen = depth_pen_sum / count
+    avg_cnot_pen = cnot_pen_sum / count
+    combined_score = -(exp_weight * (avg_depth_pen + avg_cnot_pen) + avg_run_time)
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,
-        "qose_overhead": avg_overhead,
         "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
@@ -427,7 +431,6 @@ def _evaluate_impl(program_path):
         "qos_wc_cost_calls_total": total_qos_wc_calls,
         "qos_depth_avg": (qos_depth_sum / count) if count else 0.0,
         "qos_cnot_avg": (qos_cnot_sum / count) if count else 0.0,
-        "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,
         "cases": cases,
     }
     return _round_float_values(metrics), _round_float_values(artifacts)
