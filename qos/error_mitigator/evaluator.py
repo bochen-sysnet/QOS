@@ -151,11 +151,10 @@ def _evaluate_impl(program_path):
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
     failure_traces = []
-    exp_k = 20.0
     target_increase = float(os.getenv("QOSE_EXP_TARGET_INCREASE", "0.02"))
     target_time = float(os.getenv("QOSE_EXP_TARGET_TIME", "0.2"))
-    pen_target = math.expm1(exp_k * max(0.0, target_increase))
-    exp_weight = (1.0 - target_time) / (2.0 * pen_target) if pen_target > 0 else 1.0
+    exp_weight = 0.02
+    exp_k = math.log(1.0 + (1.0 - target_time) / (2.0 * exp_weight)) / target_increase
     for bench, size in bench_size_pairs:
         if count >= pair_count:
             break

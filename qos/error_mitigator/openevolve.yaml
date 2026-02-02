@@ -91,7 +91,7 @@ prompt:
       - combined_score (maximize):
           combined_score = -(w * (exp_penalty(qose_depth) + exp_penalty(qose_cnot)) + avg_run_time)
           exp_penalty(x) = exp(k * (x - 1)) - 1
-          default k=20; default w chosen so a 2% depth/cnot increase requires 80% time reduction.
+          default w=0.02; k is derived so a 2% depth/cnot increase requires 80% time reduction.
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.
