@@ -44,6 +44,15 @@ def _round_float_values(value):
         return [_round_float_values(v) for v in value]
     return value
 
+
+def _safe_expm1(x: float, cap: float = 50.0) -> float:
+    """Clamp exponent input to avoid overflow while preserving sign."""
+    if x > cap:
+        x = cap
+    elif x < -cap:
+        x = -cap
+    return math.expm1(x)
+
 def _safe_ratio(numerator, denominator):
     if denominator <= 0:
         return float(numerator)
@@ -348,8 +357,8 @@ def _evaluate_impl(program_path):
         rel_depth = _safe_ratio(qose_depth, qos_depth)
         rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
         rel_run_time = _safe_ratio(run_time, qos_run_time)
-        depth_pen = math.expm1(exp_k * (rel_depth - 1.0))
-        cnot_pen = math.expm1(exp_k * (rel_cnot - 1.0))
+        depth_pen = _safe_expm1(exp_k * (rel_depth - 1.0))
+        cnot_pen = _safe_expm1(exp_k * (rel_cnot - 1.0))
         depth_sum += rel_depth
         cnot_sum += rel_cnot
         run_time_sum += rel_run_time
@@ -411,8 +420,8 @@ def _evaluate_impl(program_path):
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
     avg_run_time = run_time_sum / count
-    avg_depth_pen = depth_pen_sum / count
-    avg_cnot_pen = cnot_pen_sum / count
+    avg_depth_pen = _safe_expm1(exp_k * (avg_depth - 1.0))
+    avg_cnot_pen = _safe_expm1(exp_k * (avg_cnot - 1.0))
     combined_score = -(exp_weight * (avg_depth_pen + avg_cnot_pen) + avg_run_time)
     metrics = {
         "qose_depth": avg_depth,
