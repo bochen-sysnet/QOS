@@ -89,9 +89,11 @@ prompt:
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
-          combined_score = -(w * (exp_penalty(qose_depth) + exp_penalty(qose_cnot)) + avg_run_time)
-          exp_penalty(x) = exp(k * (x - 1)) - 1
-          default w=0.02; k is derived so a 2% depth/cnot increase requires 80% time reduction.
+          r1 = (qose_depth + qose_cnot) / 2
+          r2 = avg_run_time
+          if r1 >= 1: combined_score = -(16 * (r1 - 1) + (r2 - 1))
+          if r1 < 1:  combined_score = -(2  * (r1 - 1) + (r2 - 1))
+          This makes score 0 at (r1=1,r2=1), (r1=1.05,r2=0.2), (r1=0.95,r2=1.1).
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.

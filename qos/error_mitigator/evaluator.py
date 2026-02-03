@@ -1,6 +1,5 @@
 import importlib.util
 import logging
-import math
 import numbers
 import os
 import random
@@ -45,13 +44,6 @@ def _round_float_values(value):
     return value
 
 
-def _safe_expm1(x: float, cap: float = 50.0) -> float:
-    """Clamp exponent input to avoid overflow while preserving sign."""
-    if x > cap:
-        x = cap
-    elif x < -cap:
-        x = -cap
-    return math.expm1(x)
 
 def _safe_ratio(numerator, denominator):
     if denominator <= 0:
@@ -119,19 +111,25 @@ def _evaluate_impl(program_path):
             candidate_pairs.append((bench, size))
     if not candidate_pairs:
         return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
-    pair_count = int(os.getenv("QOSE_NUM_SAMPLES", "10"))
-    if seed is None:
-        rng = random.Random()
+    stratified_sizes = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
+    sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
+    sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
+    rng = random.Random(int(seed)) if seed is not None else random.Random(sample_seed)
+    if stratified_sizes:
+        sizes = list(range(size_min, size_max + 1, 2))
+        if not sizes:
+            sizes = list(range(size_min, size_max + 1))
+        size_pool = sizes * ((len(benches) + len(sizes) - 1) // len(sizes))
+        rng.shuffle(size_pool)
+        bench_size_pairs = []
+        for bench, size in zip(benches, size_pool):
+            if (bench, size) in candidate_pairs:
+                bench_size_pairs.append((bench, size))
+        if not bench_size_pairs:
+            bench_size_pairs = candidate_pairs[: len(benches)]
     else:
-        rng = random.Random(int(seed))
-    if pair_count <= 1:
-        bench_size_pairs = [rng.choice(candidate_pairs)]
-    elif pair_count <= len(candidate_pairs):
-        bench_size_pairs = rng.sample(candidate_pairs, pair_count)
-    else:
-        bench_size_pairs = [rng.choice(candidate_pairs) for _ in range(pair_count)]
+        bench_size_pairs = candidate_pairs[: len(benches)]
     depth_sum = cnot_sum = run_time_sum = 0.0
-    depth_pen_sum = cnot_pen_sum = 0.0
     qos_depth_sum = qos_cnot_sum = qos_run_time_sum = 0.0
     count = 0
     cases = []
@@ -160,14 +158,11 @@ def _evaluate_impl(program_path):
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
     failure_traces = []
-    target_increase = float(os.getenv("QOSE_EXP_TARGET_INCREASE", "0.02"))
-    target_time = float(os.getenv("QOSE_EXP_TARGET_TIME", "0.2"))
-    exp_weight = 0.02
-    exp_k = math.log(1.0 + (1.0 - target_time) / (2.0 * exp_weight)) / target_increase
+    w_up = 16.0
+    w_down = 2.0
+    bench_pairs_str = ", ".join(f"({b},{s})" for b, s in bench_size_pairs)
+    logger.warning("Evaluating bench/size pairs: %s", bench_pairs_str)
     for bench, size in bench_size_pairs:
-        if count >= pair_count:
-            break
-        logger.warning("Evaluating bench=%s size=%s", bench, size)
         current_stage = "load_qasm"
         try:
             qc = _load_qasm_circuit(bench, size)
@@ -177,7 +172,6 @@ def _evaluate_impl(program_path):
 
             # Baseline QOS
             current_stage = "baseline_qos_run"
-            logger.warning("Baseline QOS run start bench=%s size=%s", bench, size)
             qos_q = Qernel(qc.copy())
             qos_mitigator = ErrorMitigator(
                 size_to_reach=effective_size_to_reach,
@@ -192,35 +186,23 @@ def _evaluate_impl(program_path):
             t0 = time.perf_counter()
             qos_q = qos_mitigator.run(qos_q)
             qos_run_time = time.perf_counter() - t0
-            logger.warning(
-                "Baseline QOS run done bench=%s size=%s sec=%.2f",
-                bench,
-                size,
-                qos_run_time,
-            )
             total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
             total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
             current_stage = "baseline_qos_analyze"
-            logger.warning("Baseline QOS analyze start bench=%s size=%s", bench, size)
             qos_m = _analyze_qernel(
                 qos_q,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
-            logger.warning("Baseline QOS analyze done bench=%s size=%s", bench, size)
             current_stage = "baseline_qos_extract"
-            logger.warning("Baseline QOS extract start bench=%s size=%s", bench, size)
             qos_circs = _extract_circuits(qos_q)
-            logger.warning("Baseline QOS extract done bench=%s size=%s", bench, size)
 
             # Evolved QOSE
             current_stage = "qose_analysis"
-            logger.warning("QOSE analysis start bench=%s size=%s", bench, size)
             q = Qernel(qc.copy())
             BasicAnalysisPass().run(q)
             SupermarqFeaturesAnalysisPass().run(q)
-            logger.warning("QOSE analysis done bench=%s size=%s", bench, size)
             input_meta = q.get_metadata()
             input_features = {k: input_meta.get(k) for k in feature_keys if k in input_meta}
             mitigator = ErrorMitigator(
@@ -272,7 +254,6 @@ def _evaluate_impl(program_path):
             OptimalWireCuttingPass.cost = _wc_cost
             try:
                 current_stage = "qose_run"
-                logger.warning("QOSE run start bench=%s size=%s", bench, size)
                 t0 = time.perf_counter()
                 q = mitigator.run(q)
                 run_time = time.perf_counter() - t0
@@ -284,7 +265,6 @@ def _evaluate_impl(program_path):
                     {"combined_score": -1000.0},
                     {"info": f"Cost search failed: {mitigator._qose_cost_search_error}"},
                 )
-            logger.warning("QOSE run done bench=%s size=%s sec=%.2f", bench, size, run_time)
             timings = getattr(mitigator, "timings", {}) or {}
             total_time = float(timings.get("total", run_time))
             analysis_time = float(timings.get("analysis", 0.0))
@@ -306,31 +286,13 @@ def _evaluate_impl(program_path):
                 + qr_time
             )
             other_time = max(0.0, total_time - accounted)
-            logger.warning(
-                "QOSE timing bench=%s size=%s total=%.2f analysis=%.2f qaoa=%.2f "
-                "qf=%.2f cut_select=%.2f cost_search=%.2f gv=%.2f wc=%.2f qr=%.2f other=%.2f",
-                bench,
-                size,
-                total_time,
-                analysis_time,
-                qaoa_analysis_time,
-                qf_time,
-                cut_select_time,
-                cost_search_time,
-                gv_time,
-                wc_time,
-                qr_time,
-                other_time,
-            )
             current_stage = "qose_analyze"
-            logger.warning("QOSE analyze start bench=%s size=%s", bench, size)
             qose_m = _analyze_qernel(
                 q,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
-            logger.warning("QOSE analyze done bench=%s size=%s", bench, size)
             qose_circs = _extract_circuits(q)
         except Exception as exc:
             trace = traceback.format_exc()
@@ -357,13 +319,9 @@ def _evaluate_impl(program_path):
         rel_depth = _safe_ratio(qose_depth, qos_depth)
         rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
         rel_run_time = _safe_ratio(run_time, qos_run_time)
-        depth_pen = _safe_expm1(exp_k * (rel_depth - 1.0))
-        cnot_pen = _safe_expm1(exp_k * (rel_cnot - 1.0))
         depth_sum += rel_depth
         cnot_sum += rel_cnot
         run_time_sum += rel_run_time
-        depth_pen_sum += depth_pen
-        cnot_pen_sum += cnot_pen
         qos_depth_sum += qos_depth
         qos_cnot_sum += qos_cnot
         qos_run_time_sum += qos_run_time
@@ -405,14 +363,15 @@ def _evaluate_impl(program_path):
         )
         count += 1
 
-    if count < pair_count:
+    expected = len(bench_size_pairs)
+    if count < expected:
         trace_blob = "\n\n".join(failure_traces)
         return (
             {"combined_score": -1000.0},
             {
                 "info": (
                     "Evaluation failed: "
-                    f"only {count}/{pair_count} successful runs.\n{trace_blob}"
+                    f"only {count}/{expected} successful runs.\n{trace_blob}"
                 )
             },
         )
@@ -420,9 +379,11 @@ def _evaluate_impl(program_path):
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
     avg_run_time = run_time_sum / count
-    avg_depth_pen = _safe_expm1(exp_k * (avg_depth - 1.0))
-    avg_cnot_pen = _safe_expm1(exp_k * (avg_cnot - 1.0))
-    combined_score = -(exp_weight * (avg_depth_pen + avg_cnot_pen) + avg_run_time)
+    avg_r1 = (avg_depth + avg_cnot) / 2.0
+    if avg_r1 >= 1.0:
+        combined_score = -(w_up * (avg_r1 - 1.0) + (avg_run_time - 1.0))
+    else:
+        combined_score = -(w_down * (avg_r1 - 1.0) + (avg_run_time - 1.0))
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,
