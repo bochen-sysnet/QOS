@@ -87,13 +87,10 @@ prompt:
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
+      - qose_overhead: average circuit-count ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
-          r1 = (qose_depth + qose_cnot) / 2
-          r2 = avg_run_time
-          if r1 >= 1: combined_score = -(16 * (r1 - 1) + (r2 - 1))
-          if r1 < 1:  combined_score = -(2  * (r1 - 1) + (r2 - 1))
-          This makes score 0 at (r1=1,r2=1), (r1=1.05,r2=0.2), (r1=0.95,r2=1.1).
+          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.

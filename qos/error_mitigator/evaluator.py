@@ -26,6 +26,8 @@ logging.getLogger("qiskit.compiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+_QOS_BASELINE_CACHE = {}
+
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
     return raw.lower() in {"1", "true", "yes", "y"}
@@ -73,26 +75,7 @@ def _evaluate_impl(program_path):
     if bench_env:
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
-        bench_choices = [b for b, _label in BENCHES]
-        sample_count = int(os.getenv("QOSE_NUM_SAMPLES", "9"))
-        seed = None
-        if seed is None:
-            if sample_count <= 1:
-                benches = [bench_choices[0]]
-            elif sample_count <= len(bench_choices):
-                benches = bench_choices[:sample_count]
-            else:
-                benches = [
-                    bench_choices[idx % len(bench_choices)] for idx in range(sample_count)
-                ]
-        else:
-            rng = random.Random(int(seed))
-            if sample_count <= 1:
-                benches = [rng.choice(bench_choices)]
-            elif sample_count <= len(bench_choices):
-                benches = rng.sample(bench_choices, sample_count)
-            else:
-                benches = [rng.choice(bench_choices) for _ in range(sample_count)]
+        benches = [b for b, _label in BENCHES]
 
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
@@ -114,7 +97,7 @@ def _evaluate_impl(program_path):
     stratified_sizes = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
     sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
     sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
-    rng = random.Random(int(seed)) if seed is not None else random.Random(sample_seed)
+    rng = random.Random(sample_seed)
     if stratified_sizes:
         sizes = list(range(size_min, size_max + 1, 2))
         if not sizes:
@@ -157,9 +140,10 @@ def _evaluate_impl(program_path):
     total_wc_calls = 0
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
+    overhead_sum = 0.0
+    qos_overhead_sum = 0.0
     failure_traces = []
-    w_up = 16.0
-    w_down = 2.0
+    # Combined score: negative sum of ratios (depth + cnot + time).
     bench_pairs_str = ", ".join(f"({b},{s})" for b, s in bench_size_pairs)
     logger.warning("Evaluating bench/size pairs: %s", bench_pairs_str)
     for bench, size in bench_size_pairs:
@@ -171,32 +155,60 @@ def _evaluate_impl(program_path):
             )
 
             # Baseline QOS
-            current_stage = "baseline_qos_run"
-            qos_q = Qernel(qc.copy())
-            qos_mitigator = ErrorMitigator(
-                size_to_reach=effective_size_to_reach,
-                ideal_size_to_reach=args.ideal_size_to_reach,
-                budget=args.budget,
-                methods=[],
-                use_cost_search=args.qos_cost_search,
-                collect_timing=False,
-            )
-            qos_mitigator._gv_cost_calls = 0
-            qos_mitigator._wc_cost_calls = 0
-            t0 = time.perf_counter()
-            qos_q = qos_mitigator.run(qos_q)
-            qos_run_time = time.perf_counter() - t0
-            total_qos_gv_calls += getattr(qos_mitigator, "_gv_cost_calls", 0)
-            total_qos_wc_calls += getattr(qos_mitigator, "_wc_cost_calls", 0)
-            current_stage = "baseline_qos_analyze"
-            qos_m = _analyze_qernel(
-                qos_q,
+            baseline_key = (
+                bench,
+                size,
+                effective_size_to_reach,
+                args.ideal_size_to_reach,
+                args.budget,
+                args.qos_cost_search,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
-            current_stage = "baseline_qos_extract"
-            qos_circs = _extract_circuits(qos_q)
+            baseline = _QOS_BASELINE_CACHE.get(baseline_key)
+            if baseline is None:
+                current_stage = "baseline_qos_run"
+                qos_q = Qernel(qc.copy())
+                qos_mitigator = ErrorMitigator(
+                    size_to_reach=effective_size_to_reach,
+                    ideal_size_to_reach=args.ideal_size_to_reach,
+                    budget=args.budget,
+                    methods=[],
+                    use_cost_search=args.qos_cost_search,
+                    collect_timing=False,
+                )
+                qos_mitigator._gv_cost_calls = 0
+                qos_mitigator._wc_cost_calls = 0
+                t0 = time.perf_counter()
+                qos_q = qos_mitigator.run(qos_q)
+                qos_run_time = time.perf_counter() - t0
+                qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
+                qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
+                current_stage = "baseline_qos_analyze"
+                qos_m = _analyze_qernel(
+                    qos_q,
+                    args.metric_mode,
+                    args.metrics_baseline,
+                    args.metrics_optimization_level,
+                )
+                current_stage = "baseline_qos_extract"
+                qos_circs = _extract_circuits(qos_q)
+                baseline = {
+                    "qos_run_time": qos_run_time,
+                    "qos_depth": qos_m["depth"],
+                    "qos_cnot": qos_m["num_nonlocal_gates"],
+                    "qos_gv_calls": qos_gv_calls,
+                    "qos_wc_calls": qos_wc_calls,
+                    "qos_num_circuits": len(qos_circs),
+                }
+                _QOS_BASELINE_CACHE[baseline_key] = baseline
+            qos_run_time = baseline["qos_run_time"]
+            total_qos_gv_calls += baseline["qos_gv_calls"]
+            total_qos_wc_calls += baseline["qos_wc_calls"]
+            qos_depth = baseline["qos_depth"]
+            qos_cnot = baseline["qos_cnot"]
+            qos_num_circuits = baseline["qos_num_circuits"]
 
             # Evolved QOSE
             current_stage = "qose_analysis"
@@ -313,18 +325,20 @@ def _evaluate_impl(program_path):
 
         qose_depth = qose_m["depth"]
         qose_cnot = qose_m["num_nonlocal_gates"]
-        qos_depth = qos_m["depth"]
-        qos_cnot = qos_m["num_nonlocal_gates"]
 
         rel_depth = _safe_ratio(qose_depth, qos_depth)
         rel_cnot = _safe_ratio(qose_cnot, qos_cnot)
         rel_run_time = _safe_ratio(run_time, qos_run_time)
+        qose_num_circuits = len(qose_circs)
+        rel_overhead = _safe_ratio(qose_num_circuits, qos_num_circuits)
         depth_sum += rel_depth
         cnot_sum += rel_cnot
         run_time_sum += rel_run_time
+        overhead_sum += rel_overhead
         qos_depth_sum += qos_depth
         qos_cnot_sum += qos_cnot
         qos_run_time_sum += qos_run_time
+        qos_overhead_sum += qos_num_circuits
         gv_calls = mitigator._gv_cost_calls
         wc_calls = mitigator._wc_cost_calls
         gv_trace = mitigator._qose_gv_cost_trace
@@ -350,6 +364,8 @@ def _evaluate_impl(program_path):
                 "qos_depth": qos_depth,
                 "qose_cnot": qose_cnot,
                 "qos_cnot": qos_cnot,
+                "qose_num_circuits": qose_num_circuits,
+                "qos_num_circuits": qos_num_circuits,
                 "qose_run_sec": run_time,
                 "qos_run_sec": qos_run_time,
                 "qose_output_size": mitigator._qose_cost_search_output_size,
@@ -379,14 +395,12 @@ def _evaluate_impl(program_path):
     avg_depth = depth_sum / count
     avg_cnot = cnot_sum / count
     avg_run_time = run_time_sum / count
-    avg_r1 = (avg_depth + avg_cnot) / 2.0
-    if avg_r1 >= 1.0:
-        combined_score = -(w_up * (avg_r1 - 1.0) + (avg_run_time - 1.0))
-    else:
-        combined_score = -(w_down * (avg_r1 - 1.0) + (avg_run_time - 1.0))
+    avg_overhead = overhead_sum / count
+    combined_score = -(avg_depth + avg_cnot + avg_overhead + avg_run_time)
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,
+        "qose_overhead": avg_overhead,
         "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
@@ -400,6 +414,7 @@ def _evaluate_impl(program_path):
         "qos_wc_cost_calls_total": total_qos_wc_calls,
         "qos_depth_avg": (qos_depth_sum / count) if count else 0.0,
         "qos_cnot_avg": (qos_cnot_sum / count) if count else 0.0,
+        "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,
         "cases": cases,
     }
     return _round_float_values(metrics), _round_float_values(artifacts)
