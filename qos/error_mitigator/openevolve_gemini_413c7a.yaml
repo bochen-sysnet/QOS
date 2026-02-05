@@ -1,5 +1,5 @@
-max_iterations: 100
-checkpoint_interval: 10
+max_iterations: 20
+checkpoint_interval: 5
 log_level: "INFO"
 log_dir: null
 random_seed: 42
@@ -10,22 +10,26 @@ diff_based_evolution: false
 max_code_length: 30000
 
 early_stopping_patience: null
-convergence_threshold: 0.001
+convergence_threshold: 0.0005
 early_stopping_metric: "combined_score"
 
 llm:
-  api_base: "${OPENAI_API_BASE}"
-  api_key: "${OPENAI_API_KEY}"
-  # available gpt models: gpt-5.2, gpt-5.1, gpt-5, gpt-5-nano
-  # available gemini models: gemini-2.5-flash-lite
-  # available qwen models: Qwen/Qwen2.5-Coder-14B-Instruct-AWQ
-  primary_model: "${OPENAI_MODEL}"
-  temperature: 0.7
-  top_p: 0.9
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: "${GEMINI_API_KEY}"
+  models:
+    # Edit this before run, e.g. "gemini-3-flash"
+    # gemini-2.5-flash-lite
+    # gemini-2.5-flash 
+    # gemini-3-flash-preview 
+    # gemini-3-pro-preview 
+    - name: "gemini-2.5-flash-lite"
+      weight: 1.0
+  temperature: 0.75
+  top_p: 0.92
   max_tokens: 4096
   timeout: 450
   retries: 3
-  retry_delay: 5
+  retry_delay: 1
 
 prompt:
   system_message: |
@@ -37,9 +41,8 @@ prompt:
     - Output code only: no explanations, no markdown fences, no extra text.
 
     GENERALIZATION REQUIREMENT (CRITICAL):
-    - The evaluator samples random (circuit_type, num_qubits) pairs each run.
-    - Qubit counts are constrained to [12,24] and must exist in the benchmark set.
-    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.) and sizes.
+    - The evaluation will use a set of 9 circuits.
+    - Your logic must generalize across circuit families (QAOA, BV, GHZ, VQE, QSVm, etc.).
     - Do NOT branch on q.get_name(), bench strings, or any per-benchmark constants.
 
     FUNCTION CONTRACT (MUST FOLLOW EXACTLY):
@@ -82,44 +85,37 @@ prompt:
     - Use cheap metadata heuristics first; only call compute_*_cost when needed.
     - Keep behavior monotone and stable: similar circuits should yield similar decisions.
 
-    NOTE: "QOS" refers to the baseline implementation, and "QOSE" refers to the evolved program.
-
     METRICS:
       - qose_depth: average depth ratio (QOSE/QOS)
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
-      - qose_overhead: average circuit-count ratio (QOSE/QOS)
+      - qose_overhead: average number of circuits to run ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize):
           combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
-    NOTE:
-      - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
-        reduce cost-search time, and avoid depth/CNOT regressions.
 
-    We provide the execution outputs of the last program executed by the evaluator. 
-    Use them to diagnose decisions. Details of the execution outputs are as follows:
+    ARTIFACTS PROVIDED BY EVALUATOR (per case):
+      - input_features: depth, num_qubits, num_clbits, num_nonlocal_gates,
+        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
+        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
+      - qose_depth, qos_depth, qose_cnot, qos_cnot, qose_num_circuits, qos_num_circuits,
+        qose_run_sec, qos_run_sec: paired QOSE/QOS metrics
+      - qose_output_size, qose_method
+      - qose_gv_cost_trace, qose_wc_cost_trace
+      - qose_gv_time_trace, qose_wc_time_trace
+      Use artifacts to diagnose decisions.
 
-    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (summary):
+    ARTIFACTS PROVIDED BY EVALUATOR (summary):
+      - qose_input_size: input size_to_reach for all cases
       - qose_budget: budget used for all cases
       - qose_run_sec_avg: average runtime of evolved mitigator
       - qos_run_sec_avg: average runtime of baseline QOS
-      - gv_cost_calls_total: total GV cost calls (evolved)
-      - wc_cost_calls_total: total WC cost calls (evolved)
-      - qos_gv_cost_calls_total: total GV cost calls (baseline)
-      - qos_wc_cost_calls_total: total WC cost calls (baseline)
-      - qos_depth_avg: average absolute depth of baseline circuits
-      - qos_cnot_avg: average absolute nonlocal gate count of baseline circuits
-
-    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (per case):
-      - input_features: static circuit features (depth, qubits, gates, etc.)
-        num_connected_components, number_instructions, num_measurements, num_cnot_gates,
-        program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth
-      - qose_input_size: initial target size before cost-search adjustments
-      - qose_depth, qos_depth, qose_cnot, qos_cnot,
-        qose_run_sec, qos_run_sec: paired QOSE vs baseline QOS metrics
-      - qose_output_size: final target size chosen by the algorithm
-      - qose_method: chosen method ("GV" or "WC")
-      - qose_gv_cost_trace, qose_wc_cost_trace: cost estimates per probe step
-      - qose_gv_time_trace, qose_wc_time_trace: time per probe step
+      - gv_cost_calls_total: total GV cost calls
+      - wc_cost_calls_total: total WC cost calls
+      - qos_gv_cost_calls_total: total GV cost calls for baseline QOS
+      - qos_wc_cost_calls_total: total WC cost calls for baseline QOS
+      - qos_depth_avg: average absolute depth of QOS
+      - qos_cnot_avg: average absolute nonlocal gate count of QOS
+      - qos_overhead_avg: average absolute number of QOS circuits
 
     AN EXAMPLE OF EVOLVEMENT without cost search (Not Optimal):
     def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
@@ -307,6 +303,12 @@ prompt:
 
       size_to_reach = int(final_size)
       # OE_END
+      self._qose_cost_search_input_size = input_size
+      self._qose_cost_search_budget = budget
+      self._qose_cost_search_output_size = size_to_reach
+      self._qose_cost_search_method = method
+      self._qose_gv_cost_trace = gv_cost_trace
+      self._qose_wc_cost_trace = wc_cost_trace
 
       return size_to_reach, method
 
@@ -317,7 +319,7 @@ prompt:
       D) Skip certain size_to_reach values based on heuristics.
 
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
-  num_top_programs: 3
+  num_top_programs: 2
   num_diverse_programs: 2
   use_template_stochasticity: true
 
@@ -328,11 +330,11 @@ prompt:
 
 database:
   db_path: null
-  in_memory: true
+  in_memory: false
   log_prompts: true
 
-  population_size: 100
-  archive_size: 20
+  population_size: 24
+  archive_size: 16
   num_islands: 4
 
   migration_interval: 30
@@ -349,7 +351,7 @@ database:
   diversity_reference_size: 30
 
 evaluator:
-  timeout: 12000
+  timeout: 600
   max_retries: 1
   cascade_evaluation: false
   parallel_evaluations: 1
