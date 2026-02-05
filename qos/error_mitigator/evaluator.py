@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import logging
 import numbers
 import os
@@ -27,6 +28,7 @@ logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 _QOS_BASELINE_CACHE = {}
+_BASELINE_CACHE_LOADED = False
 
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
@@ -52,16 +54,78 @@ def _safe_ratio(numerator, denominator):
         return float(numerator)
     return float(numerator) / float(denominator)
 
-def _evaluate_impl(program_path):
-    # Load candidate
-    spec = importlib.util.spec_from_file_location("candidate", program_path)
-    candidate = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(candidate)
-    evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
-    if evolved_cost_search is None:
-        return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
+def _baseline_cache_paths() -> list[str]:
+    raw_paths = os.getenv("QOSE_BASELINE_CACHE_PATHS", "").strip()
+    single_path = os.getenv("QOSE_BASELINE_CACHE_PATH", "").strip()
+    paths: list[str] = []
+    if raw_paths:
+        paths.extend([p.strip() for p in raw_paths.split(",") if p.strip()])
+    if single_path:
+        paths.append(single_path)
+    if not paths:
+        size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
+        if size_max <= 12:
+            paths.append("openevolve_output/baselines/qos_baseline_12q.json")
+        else:
+            paths.append("openevolve_output/baselines/qos_baseline_all.json")
+    logger.warning("Baseline cache paths: %s", ", ".join(paths))
+    # de-dupe while preserving order
+    seen = set()
+    ordered = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
 
-    args = SimpleNamespace(
+def _baseline_require_cache() -> bool:
+    raw = os.getenv("QOSE_BASELINE_REQUIRE_CACHE", "").strip().lower()
+    return raw in {"1", "true", "yes", "y"}
+
+def _baseline_key_to_str(key) -> str:
+    return json.dumps(list(key), separators=(",", ":"))
+
+def _baseline_key_from_str(value: str):
+    return tuple(json.loads(value))
+
+def _load_baseline_cache_from_disk() -> None:
+    global _BASELINE_CACHE_LOADED
+    if _BASELINE_CACHE_LOADED:
+        return
+    paths = _baseline_cache_paths()
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as handle:
+                data = json.load(handle)
+            for key_str, baseline in data.items():
+                try:
+                    _QOS_BASELINE_CACHE[_baseline_key_from_str(key_str)] = baseline
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    _BASELINE_CACHE_LOADED = True
+
+def _save_baseline_cache_to_disk() -> None:
+    paths = _baseline_cache_paths()
+    if not paths:
+        return
+    # Prefer an existing path if present; otherwise use the first provided.
+    path = next((p for p in paths if os.path.exists(p)), paths[0])
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        data = {_baseline_key_to_str(k): v for k, v in _QOS_BASELINE_CACHE.items()}
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+    except Exception:
+        pass
+
+def _build_args():
+    return SimpleNamespace(
         size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "0")),
         ideal_size_to_reach=int(os.getenv("QOSE_IDEAL_SIZE_TO_REACH", "2")),
         budget=int(os.getenv("QOSE_BUDGET", "3")),
@@ -71,17 +135,8 @@ def _evaluate_impl(program_path):
         metrics_baseline="torino",
         metrics_optimization_level=3,
     )
-    bench_env = os.getenv("QOSE_BENCHES", "").strip()
-    if bench_env:
-        benches = [b.strip() for b in bench_env.split(",") if b.strip()]
-    else:
-        benches = [b for b, _label in BENCHES]
 
-    valid_benches = {b for b, _label in BENCHES}
-    unknown = [b for b in benches if b not in valid_benches]
-    if unknown:
-        return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
-
+def _select_bench_size_pairs(args, benches):
     size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
     size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
     candidate_pairs = []
@@ -93,7 +148,7 @@ def _evaluate_impl(program_path):
                 continue
             candidate_pairs.append((bench, size))
     if not candidate_pairs:
-        return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
+        return []
     stratified_sizes = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
     sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
     sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
@@ -112,6 +167,94 @@ def _evaluate_impl(program_path):
             bench_size_pairs = candidate_pairs[: len(benches)]
     else:
         bench_size_pairs = candidate_pairs[: len(benches)]
+    return bench_size_pairs
+
+def _precompute_baseline_cache(args, bench_size_pairs):
+    for bench, size in bench_size_pairs:
+        effective_size_to_reach = size if args.size_to_reach <= 0 else args.size_to_reach
+        baseline_key = (
+            bench,
+            size,
+            effective_size_to_reach,
+            args.ideal_size_to_reach,
+            args.budget,
+            args.qos_cost_search,
+            args.metric_mode,
+            args.metrics_baseline,
+            args.metrics_optimization_level,
+        )
+        if baseline_key in _QOS_BASELINE_CACHE:
+            continue
+        qc = _load_qasm_circuit(bench, size)
+        qos_q = Qernel(qc.copy())
+        qos_mitigator = ErrorMitigator(
+            size_to_reach=effective_size_to_reach,
+            ideal_size_to_reach=args.ideal_size_to_reach,
+            budget=args.budget,
+            methods=[],
+            use_cost_search=args.qos_cost_search,
+            collect_timing=False,
+        )
+        qos_mitigator._gv_cost_calls = 0
+        qos_mitigator._wc_cost_calls = 0
+        t0 = time.perf_counter()
+        qos_q = qos_mitigator.run(qos_q)
+        qos_run_time = time.perf_counter() - t0
+        qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
+        qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
+        qos_m = _analyze_qernel(
+            qos_q,
+            args.metric_mode,
+            args.metrics_baseline,
+            args.metrics_optimization_level,
+        )
+        qos_circs = _extract_circuits(qos_q)
+        baseline = {
+            "qos_run_time": qos_run_time,
+            "qos_depth": qos_m["depth"],
+            "qos_cnot": qos_m["num_nonlocal_gates"],
+            "qos_gv_calls": qos_gv_calls,
+            "qos_wc_calls": qos_wc_calls,
+            "qos_num_circuits": len(qos_circs),
+        }
+        _QOS_BASELINE_CACHE[baseline_key] = baseline
+    _save_baseline_cache_to_disk()
+
+def precompute_baseline_cache():
+    args = _build_args()
+    bench_env = os.getenv("QOSE_BENCHES", "").strip()
+    if bench_env:
+        benches = [b.strip() for b in bench_env.split(",") if b.strip()]
+    else:
+        benches = [b for b, _label in BENCHES]
+    bench_size_pairs = _select_bench_size_pairs(args, benches)
+    if bench_size_pairs:
+        _precompute_baseline_cache(args, bench_size_pairs)
+
+def _evaluate_impl(program_path):
+    # Load candidate
+    spec = importlib.util.spec_from_file_location("candidate", program_path)
+    candidate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(candidate)
+    evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
+    if evolved_cost_search is None:
+        return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
+
+    args = _build_args()
+    bench_env = os.getenv("QOSE_BENCHES", "").strip()
+    if bench_env:
+        benches = [b.strip() for b in bench_env.split(",") if b.strip()]
+    else:
+        benches = [b for b, _label in BENCHES]
+
+    valid_benches = {b for b, _label in BENCHES}
+    unknown = [b for b in benches if b not in valid_benches]
+    if unknown:
+        return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
+
+    bench_size_pairs = _select_bench_size_pairs(args, benches)
+    if not bench_size_pairs:
+        return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
     depth_sum = cnot_sum = run_time_sum = 0.0
     qos_depth_sum = qos_cnot_sum = qos_run_time_sum = 0.0
     count = 0
@@ -143,6 +286,7 @@ def _evaluate_impl(program_path):
     overhead_sum = 0.0
     qos_overhead_sum = 0.0
     failure_traces = []
+    _load_baseline_cache_from_disk()
     # Combined score: negative sum of ratios (depth + cnot + time).
     bench_pairs_str = ", ".join(f"({b},{s})" for b, s in bench_size_pairs)
     logger.warning("Evaluating bench/size pairs: %s", bench_pairs_str)
@@ -168,6 +312,12 @@ def _evaluate_impl(program_path):
             )
             baseline = _QOS_BASELINE_CACHE.get(baseline_key)
             if baseline is None:
+                if _baseline_require_cache():
+                    logger.warning(
+                        "Baseline cache miss for bench=%s size=%s; computing baseline anyway",
+                        bench,
+                        size,
+                    )
                 current_stage = "baseline_qos_run"
                 qos_q = Qernel(qc.copy())
                 qos_mitigator = ErrorMitigator(
@@ -203,6 +353,7 @@ def _evaluate_impl(program_path):
                     "qos_num_circuits": len(qos_circs),
                 }
                 _QOS_BASELINE_CACHE[baseline_key] = baseline
+                _save_baseline_cache_to_disk()
             qos_run_time = baseline["qos_run_time"]
             total_qos_gv_calls += baseline["qos_gv_calls"]
             total_qos_wc_calls += baseline["qos_wc_calls"]
@@ -421,7 +572,7 @@ def _evaluate_impl(program_path):
 
 
 def evaluate(program_path):
-    timeout_sec = int(os.getenv("QOSE_EVAL_TIMEOUT_SEC", "2400"))
+    timeout_sec = int(os.getenv("QOSE_EVAL_TIMEOUT_SEC", "6000"))
     if timeout_sec <= 0:
         try:
             metrics, artifacts = _evaluate_impl(program_path)
@@ -486,3 +637,8 @@ def _evaluate_worker(program_path, result_queue):
                 "trace": traceback.format_exc(),
             }
         )
+
+
+if __name__ == "__main__":
+    if os.getenv("QOSE_PRECOMPUTE_BASELINE", "").strip().lower() in {"1", "true", "yes", "y"}:
+        precompute_baseline_cache()
