@@ -25,6 +25,7 @@ Environment variables (override defaults):
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir
+  --target PATH                  Target program file (default: qos/error_mitigator/evolution_target.py)
   --repeat N                     Run N times (gemini only; rotates keys)
   --key-start N                  Starting key index for gemini (default 0)
   --key-prefix PATH              Key file prefix for gemini (default keys/gemini-ge)
@@ -53,6 +54,7 @@ REPEAT=1
 KEY_START=0
 KEY_PREFIX="keys/gemini-ge"
 
+TARGET_PATH="qos/error_mitigator/evolution_target.py"
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -79,6 +81,10 @@ while [[ $# -gt 0 ]]; do
     --resume-latest)
       export RESUME_LATEST=1
       shift
+      ;;
+    --target)
+      TARGET_PATH="$2"
+      shift 2
       ;;
     --repeat)
       REPEAT="$2"
@@ -169,8 +175,9 @@ run_once() {
     fi
   fi
 
+  echo "Using target: $TARGET_PATH"
   conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
-    qos/error_mitigator/evolution_target.py \
+    "$TARGET_PATH" \
     qos/error_mitigator/evaluator.py \
     --config "$CONFIG_PATH" \
     --output "$OUTPUT_DIR" \
