@@ -242,52 +242,24 @@ class ErrorMitigator():
 
     def _cost_search_impl(self, q: Qernel, size_to_reach: int, budget: int):
         costs = self.computeCuttingCosts(q, size_to_reach)
-        max_iters = int(os.getenv("QOS_COST_SEARCH_MAX_ITERS", "0"))
-        if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-            print(
-                f"[QOS] cost_search init size_to_reach={size_to_reach} "
-                f"GV={costs['GV']} WC={costs['WC']} budget={budget} "
-                f"max_iters={max_iters}",
-                flush=True,
-            )
-        iter_ctr = 0
+
         while (costs["GV"] <= budget or costs["WC"] <= budget) and size_to_reach > 2:
-            iter_ctr += 1
-            if max_iters > 0 and iter_ctr > max_iters:
-                break
             size_to_reach = size_to_reach - 1
             costs = self.computeCuttingCosts(q, size_to_reach)
-            if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                print(
-                    f"[QOS] cost_search shrink iter={iter_ctr} size_to_reach={size_to_reach} "
-                    f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                    flush=True,
-                )
 
-        iter_ctr = 0
         while costs["GV"] > budget and costs["WC"] > budget:
-            iter_ctr += 1
-            if max_iters > 0 and iter_ctr > max_iters:
-                break
             size_to_reach = size_to_reach + 1
             costs = self.computeCuttingCosts(q, size_to_reach)
-            if os.getenv("QOS_VERBOSE", "").lower() in {"1", "true", "yes", "y"}:
-                print(
-                    f"[QOS] cost_search grow iter={iter_ctr} size_to_reach={size_to_reach} "
-                    f"GV={costs['GV']} WC={costs['WC']} max_iters={max_iters}",
-                    flush=True,
-                )
 
-        method = None
+        method = "WC"
         if costs["GV"] <= costs["WC"]:
             method = "GV"
-        else:
-            method = "WC" 
+            
         return size_to_reach, method
 
     def cost_search(self, q: Qernel, size_to_reach: int, budget: int):
         t0 = time.perf_counter()
-        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "600"))
+        timeout_sec = int(os.getenv("QOS_COST_SEARCH_TIMEOUT_SEC", "60"))
         self._qose_cost_search_error = None
         if timeout_sec <= 0:
             trace_queue = queue_mod.Queue()

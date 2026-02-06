@@ -64,10 +64,14 @@ def _baseline_cache_paths() -> list[str]:
         paths.append(single_path)
     if not paths:
         size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
+        size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
         if size_max <= 12:
             paths.append("openevolve_output/baselines/qos_baseline_12q.json")
         else:
-            paths.append("openevolve_output/baselines/qos_baseline_all.json")
+            if size_min == 12:
+                paths.append("openevolve_output/baselines/qos_baseline_all.json")
+            else:
+                paths.append("openevolve_output/baselines/qos_baseline_24q.json")
     logger.warning("Baseline cache paths: %s", ", ".join(paths))
     # de-dupe while preserving order
     seen = set()
