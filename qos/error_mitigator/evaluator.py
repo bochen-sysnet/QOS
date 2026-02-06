@@ -4,6 +4,7 @@ import logging
 import numbers
 import os
 import random
+import re
 import time
 import traceback
 import multiprocessing as mp
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _QOS_BASELINE_CACHE = {}
 _BASELINE_CACHE_LOADED = False
+_BASELINE_CACHE_LOADED_FROM = ()
 
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
@@ -65,14 +67,18 @@ def _baseline_cache_paths() -> list[str]:
     if not paths:
         size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
         size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
+        seed_tag = _baseline_cache_seed_tag()
         if size_max <= 12:
-            paths.append("openevolve_output/baselines/qos_baseline_12q.json")
+            base = "qos_baseline_12q"
         else:
             if size_min == 12:
-                paths.append("openevolve_output/baselines/qos_baseline_all.json")
+                base = "qos_baseline_all"
             else:
-                paths.append("openevolve_output/baselines/qos_baseline_24q.json")
-    logger.warning("Baseline cache paths: %s", ", ".join(paths))
+                base = "qos_baseline_24q"
+        if seed_tag:
+            paths.append(f"openevolve_output/baselines/{base}_{seed_tag}.json")
+        else:
+            paths.append(f"openevolve_output/baselines/{base}.json")
     # de-dupe while preserving order
     seen = set()
     ordered = []
@@ -92,11 +98,30 @@ def _baseline_key_to_str(key) -> str:
 def _baseline_key_from_str(value: str):
     return tuple(json.loads(value))
 
+def _baseline_cache_seed_tag() -> str:
+    # Cache partitioning follows evaluation sampling seed only.
+    raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
+    if not raw:
+        return ""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)
+    return f"seed{safe}"
+
 def _load_baseline_cache_from_disk() -> None:
-    global _BASELINE_CACHE_LOADED
-    if _BASELINE_CACHE_LOADED:
+    global _BASELINE_CACHE_LOADED, _BASELINE_CACHE_LOADED_FROM, _QOS_BASELINE_CACHE
+    paths = tuple(_baseline_cache_paths())
+    if _BASELINE_CACHE_LOADED and _BASELINE_CACHE_LOADED_FROM == paths:
         return
-    paths = _baseline_cache_paths()
+    existing_paths = [p for p in paths if p and os.path.exists(p)]
+    if existing_paths:
+        logger.warning("Baseline cache: reusing %s", ", ".join(existing_paths))
+    else:
+        logger.warning(
+            "Baseline cache: no cache file found (%s); will generate on demand",
+            ", ".join(paths) if paths else "<none>",
+        )
+    # Path set changed (e.g., different seed); keep cache isolated per path set.
+    if _BASELINE_CACHE_LOADED_FROM != paths:
+        _QOS_BASELINE_CACHE = {}
     for path in paths:
         if not path or not os.path.exists(path):
             continue
@@ -111,6 +136,7 @@ def _load_baseline_cache_from_disk() -> None:
         except Exception:
             continue
     _BASELINE_CACHE_LOADED = True
+    _BASELINE_CACHE_LOADED_FROM = paths
 
 def _save_baseline_cache_to_disk() -> None:
     paths = _baseline_cache_paths()
