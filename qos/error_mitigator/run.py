@@ -42,9 +42,11 @@ def _parse_trace_events(events, default_size):
     wc_cost_trace = []
     gv_time_trace = []
     wc_time_trace = []
+    completed_pairs = []
     last_size = default_size
     last_gv_cost = None
     last_wc_cost = None
+    pair_partial = {}
     for event in events:
         kind = event.get("kind")
         if kind == "PAIR":
@@ -60,6 +62,15 @@ def _parse_trace_events(events, default_size):
             wc_cost_trace.append(wc_cost)
             gv_time_trace.append(gv_sec)
             wc_time_trace.append(wc_sec)
+            completed_pairs.append(
+                {
+                    "size": size,
+                    "gv_cost": gv_cost,
+                    "wc_cost": wc_cost,
+                    "gv_sec": gv_sec,
+                    "wc_sec": wc_sec,
+                }
+            )
         elif kind == "GV":
             size = event.get("size", last_size)
             gv_cost = event.get("cost")
@@ -68,6 +79,20 @@ def _parse_trace_events(events, default_size):
             last_gv_cost = gv_cost
             gv_cost_trace.append(gv_cost)
             gv_time_trace.append(gv_sec)
+            entry = pair_partial.get(size, {})
+            entry["gv_cost"] = gv_cost
+            entry["gv_sec"] = gv_sec
+            pair_partial[size] = entry
+            if "wc_cost" in entry:
+                completed_pairs.append(
+                    {
+                        "size": size,
+                        "gv_cost": entry.get("gv_cost"),
+                        "wc_cost": entry.get("wc_cost"),
+                        "gv_sec": entry.get("gv_sec"),
+                        "wc_sec": entry.get("wc_sec"),
+                    }
+                )
         elif kind == "WC":
             size = event.get("size", last_size)
             wc_cost = event.get("cost")
@@ -76,15 +101,51 @@ def _parse_trace_events(events, default_size):
             last_wc_cost = wc_cost
             wc_cost_trace.append(wc_cost)
             wc_time_trace.append(wc_sec)
+            entry = pair_partial.get(size, {})
+            entry["wc_cost"] = wc_cost
+            entry["wc_sec"] = wc_sec
+            pair_partial[size] = entry
+            if "gv_cost" in entry:
+                completed_pairs.append(
+                    {
+                        "size": size,
+                        "gv_cost": entry.get("gv_cost"),
+                        "wc_cost": entry.get("wc_cost"),
+                        "gv_sec": entry.get("gv_sec"),
+                        "wc_sec": entry.get("wc_sec"),
+                    }
+                )
     return (
         gv_cost_trace,
         wc_cost_trace,
         gv_time_trace,
         wc_time_trace,
+        completed_pairs,
         last_size,
         last_gv_cost,
         last_wc_cost,
     )
+
+
+def _select_timeout_fallback(
+    completed_pairs, budget, default_size, default_gv_cost, default_wc_cost
+):
+    if completed_pairs:
+        # Work off the latest complete pair at each size.
+        by_size = {}
+        for pair in completed_pairs:
+            by_size[pair["size"]] = pair
+        completed = [by_size[s] for s in sorted(by_size)]
+        feasible = [
+            pair
+            for pair in completed
+            if pair["gv_cost"] <= budget or pair["wc_cost"] <= budget
+        ]
+        # Mimic search intent: smallest feasible size from fully evaluated pairs.
+        chosen = feasible[0] if feasible else completed[-1]
+        method = "GV" if chosen["gv_cost"] <= chosen["wc_cost"] else "WC"
+        return chosen["size"], method
+    return default_size, _choose_method(default_gv_cost, default_wc_cost)
 
 
 def _is_verbose() -> bool:
@@ -226,16 +287,15 @@ class ErrorMitigator():
                 f"WC={wc_cost} ({wc_sec:.2f}s)",
                 flush=True,
             )
-        _emit_trace(
-            {
-                "kind": "PAIR",
-                "size": size_to_reach,
-                "gv_cost": gv_cost,
-                "wc_cost": wc_cost,
-                "gv_sec": gv_sec,
-                "wc_sec": wc_sec,
-            }
-        )
+        # Emit per-method events so baseline and evolved traces are aligned.
+        if use_gv:
+            _emit_trace(
+                {"kind": "GV", "size": size_to_reach, "cost": gv_cost, "sec": gv_sec}
+            )
+        if use_wc:
+            _emit_trace(
+                {"kind": "WC", "size": size_to_reach, "cost": wc_cost, "sec": wc_sec}
+            )
         self._last_gv_sec = gv_sec
         self._last_wc_sec = wc_sec
         return {"GV": gv_cost, "WC": wc_cost}
@@ -278,6 +338,7 @@ class ErrorMitigator():
                 wc_cost_trace,
                 gv_time_trace,
                 wc_time_trace,
+                completed_pairs,
                 last_size,
                 last_gv_cost,
                 last_wc_cost,
@@ -307,6 +368,7 @@ class ErrorMitigator():
             wc_cost_trace,
             gv_time_trace,
             wc_time_trace,
+            completed_pairs,
             last_size,
             last_gv_cost,
             last_wc_cost,
@@ -322,34 +384,40 @@ class ErrorMitigator():
         if proc.is_alive():
             proc.terminate()
             proc.join()
-            method = _choose_method(last_gv_cost, last_wc_cost)
+            size, method = _select_timeout_fallback(
+                completed_pairs, budget, last_size, last_gv_cost, last_wc_cost
+            )
             _mark_timeout_trace(gv_time_trace, wc_time_trace)
             self._qose_gv_time_trace = gv_time_trace
             self._qose_wc_time_trace = wc_time_trace
-            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_output_size = size
             self._qose_cost_search_method = method
-            return last_size, method, cost_time, True
+            return size, method, cost_time, True
 
         try:
             result = result_queue.get_nowait()
         except queue_mod.Empty:
-            method = _choose_method(last_gv_cost, last_wc_cost)
+            size, method = _select_timeout_fallback(
+                completed_pairs, budget, last_size, last_gv_cost, last_wc_cost
+            )
             _mark_timeout_trace(gv_time_trace, wc_time_trace)
             self._qose_gv_time_trace = gv_time_trace
             self._qose_wc_time_trace = wc_time_trace
-            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_output_size = size
             self._qose_cost_search_method = method
-            return last_size, method, cost_time, True
+            return size, method, cost_time, True
 
         if not result.get("ok"):
             self._qose_cost_search_error = result.get("error")
-            method = _choose_method(last_gv_cost, last_wc_cost)
+            size, method = _select_timeout_fallback(
+                completed_pairs, budget, last_size, last_gv_cost, last_wc_cost
+            )
             _mark_timeout_trace(gv_time_trace, wc_time_trace)
             self._qose_gv_time_trace = gv_time_trace
             self._qose_wc_time_trace = wc_time_trace
-            self._qose_cost_search_output_size = last_size
+            self._qose_cost_search_output_size = size
             self._qose_cost_search_method = method
-            return last_size, method, cost_time, True
+            return size, method, cost_time, True
 
         method = result["method"]
         size = result["size"]
