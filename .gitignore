@@ -19,6 +19,13 @@ keys/*
 
 # json files
 *.json
+*.jsonl
+
+# qpy files
+*.qpy
+
+# pkl files
+*.pkl
 
 # Distribution / packaging
 .Python

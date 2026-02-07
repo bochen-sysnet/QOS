@@ -3,6 +3,7 @@ import csv
 import datetime as dt
 import importlib.util
 import json
+import pickle
 import shlex
 from pathlib import Path
 import multiprocessing as mp
@@ -54,16 +55,67 @@ _EVAL_LOGGER = logging.getLogger(__name__)
 _REAL_DRY_RUN = False
 _REAL_DRY_RUN_CALLS = 0
 _RESUME_STATE_VERSION = 1
+_REAL_JOB_RESULT_CACHE = None
 
 
 class RealQPUWaitTimeout(RuntimeError):
     pass
 
 
+class _RealJobResultCache:
+    def __init__(self, path: Path):
+        self.path = path
+        self._results: Dict[str, Dict[str, object]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    key = str(rec.get("job_key", ""))
+                    if not key:
+                        continue
+                    counts = rec.get("counts")
+                    if isinstance(counts, dict):
+                        self._results[key] = counts
+        except Exception:
+            self._results = {}
+
+    def count(self) -> int:
+        return len(self._results)
+
+    def get(self, job_key: str) -> Optional[Dict[str, int]]:
+        counts = self._results.get(job_key)
+        if counts is None:
+            return None
+        try:
+            return {str(k): int(v) for k, v in counts.items()}
+        except Exception:
+            return None
+
+    def put(self, job_key: str, counts: Dict[str, int], meta: Dict[str, object]) -> None:
+        self._results[job_key] = {str(k): int(v) for k, v in counts.items()}
+        rec = {"job_key": job_key, "counts": self._results[job_key], **meta}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                f.flush()
+        except Exception:
+            pass
+
+
 def _dry_run_submit(ctx: Dict[str, int], method_ctx: Dict[str, int | str]) -> None:
     global _REAL_DRY_RUN_CALLS
     _REAL_DRY_RUN_CALLS += 1
     method_ctx["submitted"] = int(method_ctx.get("submitted", 0)) + 1
+    method_ctx["completed"] = int(method_ctx.get("completed", 0)) + 1
 
 
 def _dry_run_traverse(
@@ -200,6 +252,75 @@ def _parse_real_job_timeout_sec() -> int:
         return max(0, int(raw))
     except Exception:
         return 0
+
+
+def _safe_token(value: str) -> str:
+    out = []
+    for ch in value:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)
+
+
+def _method_cache_paths(cache_dir: Optional[Path], size: int, bench: str, method: str) -> Tuple[Optional[Path], Optional[Path]]:
+    if cache_dir is None:
+        return None, None
+    stem = f"s{int(size)}_{_safe_token(bench)}_{_safe_token(method)}"
+    return cache_dir / f"{stem}.json", cache_dir / f"{stem}.pkl"
+
+
+def _save_method_cache(
+    cache_dir: Optional[Path],
+    size: int,
+    bench: str,
+    method: str,
+    metrics: Dict[str, int],
+    circuits: List[QuantumCircuit],
+) -> None:
+    metrics_path, circuits_path = _method_cache_paths(cache_dir, size, bench, method)
+    if metrics_path is None or circuits_path is None:
+        return
+    try:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "depth": int(metrics.get("depth", 0)),
+            "num_nonlocal_gates": int(metrics.get("num_nonlocal_gates", 0)),
+        }
+        _atomic_write_json(metrics_path, payload)
+        tmp = circuits_path.with_suffix(circuits_path.suffix + ".tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(circuits, f)
+        tmp.replace(circuits_path)
+    except Exception:
+        return
+
+
+def _load_method_cache(
+    cache_dir: Optional[Path],
+    size: int,
+    bench: str,
+    method: str,
+) -> Optional[Tuple[Dict[str, int], List[QuantumCircuit]]]:
+    metrics_path, circuits_path = _method_cache_paths(cache_dir, size, bench, method)
+    if metrics_path is None or circuits_path is None:
+        return None
+    if not metrics_path.exists() or not circuits_path.exists():
+        return None
+    try:
+        data = json.loads(metrics_path.read_text())
+        with circuits_path.open("rb") as f:
+            circuits = pickle.load(f)
+        if not isinstance(circuits, list):
+            return None
+        metrics = {
+            "depth": int(data.get("depth", 0)),
+            "num_nonlocal_gates": int(data.get("num_nonlocal_gates", 0)),
+        }
+        return metrics, circuits
+    except Exception:
+        return None
 
 TARGET_REL = {
     "depth": {
@@ -898,6 +1019,30 @@ def _call_with_alarm_timeout(fn: Callable[[], object], timeout_sec: int, timeout
             pass
 
 
+def _job_quantum_seconds(job) -> Optional[float]:
+    # Runtime API varies by version; prefer usage_estimation then metadata usage.
+    try:
+        usage_est = getattr(job, "usage_estimation", None)
+        if isinstance(usage_est, dict):
+            qsec = usage_est.get("quantum_seconds", None)
+            if qsec is not None:
+                return float(qsec)
+    except Exception:
+        pass
+    try:
+        metrics_fn = getattr(job, "metrics", None)
+        if callable(metrics_fn):
+            metrics = metrics_fn() or {}
+            usage = metrics.get("usage", {}) if isinstance(metrics, dict) else {}
+            if isinstance(usage, dict):
+                for key in ("quantum_seconds", "seconds"):
+                    if usage.get(key) is not None:
+                        return float(usage[key])
+    except Exception:
+        pass
+    return None
+
+
 def _real_counts(
     circuit: QuantumCircuit,
     shots: int,
@@ -905,6 +1050,26 @@ def _real_counts(
     ctx: Dict[str, int],
     method_ctx: Dict[str, int | str],
 ) -> Dict[str, int]:
+    global _REAL_JOB_RESULT_CACHE
+    job_key = (
+        f"{backend_name}|{shots}|{method_ctx.get('method')}|{method_ctx.get('bench')}|"
+        f"{method_ctx.get('size')}|c{ctx.get('circuit_idx',1)}|f{ctx.get('fragment_idx',1)}|i{ctx.get('inst_idx',1)}"
+    )
+    if _REAL_JOB_RESULT_CACHE is not None:
+        cached_counts = _REAL_JOB_RESULT_CACHE.get(job_key)
+        if cached_counts is not None:
+            method_ctx["reused"] = int(method_ctx.get("reused", 0)) + 1
+            method_ctx["completed"] = int(method_ctx.get("completed", 0)) + 1
+            _EVAL_LOGGER.warning(
+                "Real QPU job cache-hit method=%s bench=%s size=%s completed=%s/%s",
+                method_ctx.get("method"),
+                method_ctx.get("bench"),
+                method_ctx.get("size"),
+                method_ctx.get("completed"),
+                method_ctx.get("expected_total"),
+            )
+            return cached_counts
+
     backend = _get_real_backend(backend_name)
     circ = _ensure_measurements(circuit)
     tcirc = transpile(circ, backend=backend, optimization_level=0)
@@ -947,17 +1112,38 @@ def _real_counts(
         result = _call_with_alarm_timeout(job.result, timeout_sec, timeout_msg)
         elapsed = time.perf_counter() - wait_start
         method_ctx["completed"] = int(method_ctx.get("completed", 0)) + 1
+        qpu_sec = _job_quantum_seconds(job)
         _EVAL_LOGGER.warning(
-            "Real QPU job finished method=%s bench=%s size=%s job_id=%s elapsed_sec=%.2f completed=%s/%s",
+            "Real QPU job finished method=%s bench=%s size=%s job_id=%s elapsed_sec=%.2f qpu_sec=%s completed=%s/%s",
             method_ctx.get("method"),
             method_ctx.get("bench"),
             method_ctx.get("size"),
             job_id,
             elapsed,
+            f"{qpu_sec:.2f}" if qpu_sec is not None else "n/a",
             method_ctx.get("completed"),
             method_ctx.get("expected_total"),
         )
-        return _sampler_result_to_counts(result, shots, tcirc.num_clbits)
+        counts = _sampler_result_to_counts(result, shots, tcirc.num_clbits)
+        if _REAL_JOB_RESULT_CACHE is not None:
+            _REAL_JOB_RESULT_CACHE.put(
+                job_key,
+                counts,
+                {
+                    "job_id": job_id,
+                    "backend": backend_name,
+                    "shots": shots,
+                    "method": method_ctx.get("method"),
+                    "bench": method_ctx.get("bench"),
+                    "size": method_ctx.get("size"),
+                    "circuit_idx": ctx.get("circuit_idx", 1),
+                    "fragment_idx": ctx.get("fragment_idx", 1),
+                    "inst_idx": ctx.get("inst_idx", 1),
+                    "qpu_sec": qpu_sec,
+                    "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+                },
+            )
+        return counts
     except TimeoutError as exc:
         try:
             job.cancel()
@@ -1096,6 +1282,8 @@ def _real_fidelity_stats(
         "size": size,
         "expected_total": jobs_total,
         "submitted": 0,
+        "completed": 0,
+        "reused": 0,
         "progress_step": max(1, jobs_total // 10),
     }
     if _REAL_DRY_RUN and _is_eval_verbose():
@@ -1121,14 +1309,16 @@ def _real_fidelity_stats(
         vals.append(
             _real_fidelity_for_circuit(circuit, shots, backend_name, seed, ctx, method_ctx)
         )
-    if int(method_ctx.get("submitted", 0)) != jobs_total:
+    if int(method_ctx.get("completed", 0)) != jobs_total:
         _EVAL_LOGGER.warning(
-            "Real QPU jobs mismatch method=%s bench=%s size=%s expected=%s submitted=%s",
+            "Real QPU jobs mismatch method=%s bench=%s size=%s expected=%s completed=%s submitted=%s reused=%s",
             method,
             bench,
             size,
             jobs_total,
+            method_ctx.get("completed"),
             method_ctx.get("submitted"),
+            method_ctx.get("reused"),
         )
     if _REAL_DRY_RUN:
         return 0.0, 0.0
@@ -1443,8 +1633,8 @@ def _plot_panel(
     width = 0.08
     all_vals: List[float] = []
     for i, (bench, label) in enumerate(benches):
-        vals = [rel_data[bench].get(m, 1.0) for m in methods]
-        all_vals.extend(vals)
+        vals = [rel_data[bench].get(m, np.nan) for m in methods]
+        all_vals.extend([v for v in vals if np.isfinite(v)])
         errs = None
         if err_data is not None:
             errs = [err_data.get(bench, {}).get(m, 0.0) for m in methods]
@@ -1468,7 +1658,8 @@ def _plot_panel(
         if max_val > 0:
             ax.set_ylim(top=max(ax.get_ylim()[1], max_val + pad * 2))
         for idx, method in enumerate(methods):
-            vals = [rel_data[bench].get(method, 1.0) for bench, _ in benches]
+            vals = [rel_data[bench].get(method, np.nan) for bench, _ in benches]
+            vals = [v for v in vals if np.isfinite(v)]
             if not vals:
                 continue
             avg = sum(vals) / len(vals)
@@ -2011,6 +2202,99 @@ def _method_prefix(method: str) -> str:
     return method.lower()
 
 
+def _build_progress_maps_from_rows(
+    rows: List[Dict[str, object]],
+    benches: List[Tuple[str, str]],
+    sizes: List[int],
+    methods: List[str],
+    with_fidelity: bool,
+    with_real_fidelity: bool,
+):
+    rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
+    fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+    real_fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
+
+    for size in sizes:
+        rel_depth = {bench: {} for bench, _ in benches}
+        rel_nonlocal = {bench: {} for bench, _ in benches}
+        rel_by_size[size] = (rel_depth, rel_nonlocal)
+        if with_fidelity:
+            fidelity_by_size[size] = {bench: {} for bench, _ in benches}
+            fidelity_err_by_size[size] = {bench: {} for bench, _ in benches}
+        if with_real_fidelity:
+            real_fidelity_by_size[size] = {bench: {} for bench, _ in benches}
+            real_fidelity_err_by_size[size] = {bench: {} for bench, _ in benches}
+
+    for row in rows:
+        try:
+            size = int(row.get("size"))
+            bench = str(row.get("bench"))
+        except Exception:
+            continue
+        if size not in rel_by_size:
+            continue
+        rel_depth, rel_nonlocal = rel_by_size[size]
+        if bench not in rel_depth:
+            continue
+        for method in methods:
+            prefix = _method_prefix(method)
+            dkey = f"rel_depth_{prefix}"
+            nkey = f"rel_nonlocal_{prefix}"
+            dval = row.get(dkey, "")
+            nval = row.get(nkey, "")
+            if dval not in {"", None}:
+                rel_depth[bench][method] = _safe_float(dval, float("nan"))
+            if nval not in {"", None}:
+                rel_nonlocal[bench][method] = _safe_float(nval, float("nan"))
+            if with_fidelity:
+                fkey = f"{prefix}_fidelity"
+                fskey = f"{prefix}_fidelity_std"
+                if row.get(fkey, "") not in {"", None}:
+                    fidelity_by_size[size][bench][method] = _safe_float(row.get(fkey), float("nan"))
+                if row.get(fskey, "") not in {"", None}:
+                    fidelity_err_by_size[size][bench][method] = _safe_float(
+                        row.get(fskey), float("nan")
+                    )
+            if with_real_fidelity:
+                rfkey = f"{prefix}_real_fidelity"
+                rfskey = f"{prefix}_real_fidelity_std"
+                if row.get(rfkey, "") not in {"", None}:
+                    real_fidelity_by_size[size][bench][method] = _safe_float(
+                        row.get(rfkey), float("nan")
+                    )
+                if row.get(rfskey, "") not in {"", None}:
+                    real_fidelity_err_by_size[size][bench][method] = _safe_float(
+                        row.get(rfskey), float("nan")
+                    )
+
+        if with_fidelity and row.get("baseline_fidelity", "") not in {"", None}:
+            fidelity_by_size[size][bench]["Qiskit"] = _safe_float(
+                row.get("baseline_fidelity"), float("nan")
+            )
+            if row.get("baseline_fidelity_std", "") not in {"", None}:
+                fidelity_err_by_size[size][bench]["Qiskit"] = _safe_float(
+                    row.get("baseline_fidelity_std"), float("nan")
+                )
+        if with_real_fidelity and row.get("baseline_real_fidelity", "") not in {"", None}:
+            real_fidelity_by_size[size][bench]["Qiskit"] = _safe_float(
+                row.get("baseline_real_fidelity"), float("nan")
+            )
+            if row.get("baseline_real_fidelity_std", "") not in {"", None}:
+                real_fidelity_err_by_size[size][bench]["Qiskit"] = _safe_float(
+                    row.get("baseline_real_fidelity_std"), float("nan")
+                )
+
+    return (
+        rel_by_size,
+        (fidelity_by_size if with_fidelity else None),
+        (fidelity_err_by_size if with_fidelity else None),
+        (real_fidelity_by_size if with_real_fidelity else None),
+        (real_fidelity_err_by_size if with_real_fidelity else None),
+    )
+
+
 def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
     for method in methods:
         prefix = _method_prefix(method)
@@ -2094,6 +2378,7 @@ def _run_eval(
     initial_rows: Optional[List[Dict[str, object]]] = None,
     initial_timing_rows: Optional[List[Dict[str, object]]] = None,
     completed_keys: Optional[set[str]] = None,
+    method_cache_dir: Optional[Path] = None,
     on_bench_complete: Optional[Callable[[int, str, List[Dict[str, object]], List[Dict[str, object]], set[str]], None]] = None,
 ):
     all_rows: List[Dict[str, object]] = list(initial_rows or [])
@@ -2120,6 +2405,7 @@ def _run_eval(
             existing_row_map[_bench_key(int(_row["size"]), str(_row["bench"]))] = _row
         except Exception:
             continue
+    total_benches = len(sizes) * len(benches)
 
     noise = None
     if args.with_fidelity or args.fragment_fidelity_sweep:
@@ -2175,112 +2461,116 @@ def _run_eval(
                     bool(args.with_fidelity),
                     bool(args.with_real_fidelity),
                 )
-                if args.verbose:
-                    print(f"size={size} bench={bench} [resume] skipped", flush=True)
+                print(
+                    f"[progress] resume-skip size={size} bench={bench} completed={len(completed_keys)}/{total_benches}",
+                    flush=True,
+                )
                 continue
-            if args.verbose:
-                print(f"size={size} bench={bench}", flush=True)
+            print(
+                f"[progress] start size={size} bench={bench} completed={len(completed_keys)}/{total_benches}",
+                flush=True,
+            )
             bench_start = time.perf_counter()
             qc = _load_qasm_circuit(bench, size)
-            if args.verbose:
-                print(f"  load_qasm_sec={time.perf_counter() - bench_start:.2f}", flush=True)
             base = _analyze_circuit(
                 qc,
                 args.metric_mode,
                 args.metrics_baseline,
                 args.metrics_optimization_level,
             )
-            if args.verbose:
-                print(
-                    f"  baseline depth={base['depth']} cnot={base['num_nonlocal_gates']} "
-                    f"sec={time.perf_counter() - bench_start:.2f}",
-                    flush=True,
-                )
             qos_m = qos_t = qos_circs = None
             qosn_m = qosn_t = qosn_circs = None
             fq_m = fq_t = fq_circs = None
             cutqc_m = cutqc_t = cutqc_circs = None
 
             if run_qos:
-                qos_t0 = time.perf_counter()
-                qos_m, qos_t, qos_circs = _run_mitigator(
-                    qc, [], args, bench_name=bench, size_label=size
-                )
-                if args.verbose:
-                    print(
-                        f"  qos depth={qos_m['depth']} cnot={qos_m['num_nonlocal_gates']} "
-                        f"sec={time.perf_counter() - qos_t0:.2f}",
-                        flush=True,
+                cached = _load_method_cache(method_cache_dir, size, bench, "QOS")
+                if cached is not None:
+                    qos_m, qos_circs = cached
+                    qos_t = {}
+                    print(f"[progress] size={size} bench={bench} method=QOS source=cache", flush=True)
+                else:
+                    print(f"[progress] size={size} bench={bench} method=QOS source=compute", flush=True)
+                    qos_m, qos_t, qos_circs = _run_mitigator(
+                        qc, [], args, bench_name=bench, size_label=size
                     )
+                    _save_method_cache(method_cache_dir, size, bench, "QOS", qos_m, qos_circs)
             if run_qosn:
-                qosn_t0 = time.perf_counter()
-                qosn_m, qosn_t, qosn_circs = _run_mitigator(
-                    qc,
-                    [],
-                    args,
-                    use_cost_search_override=False,
-                    bench_name=bench,
-                    size_label=size,
-                )
-                if args.verbose:
-                    print(
-                        f"  qosn depth={qosn_m['depth']} cnot={qosn_m['num_nonlocal_gates']} "
-                        f"sec={time.perf_counter() - qosn_t0:.2f}",
-                        flush=True,
+                cached = _load_method_cache(method_cache_dir, size, bench, "QOSN")
+                if cached is not None:
+                    qosn_m, qosn_circs = cached
+                    qosn_t = {}
+                    print(f"[progress] size={size} bench={bench} method=QOSN source=cache", flush=True)
+                else:
+                    print(f"[progress] size={size} bench={bench} method=QOSN source=compute", flush=True)
+                    qosn_m, qosn_t, qosn_circs = _run_mitigator(
+                        qc,
+                        [],
+                        args,
+                        use_cost_search_override=False,
+                        bench_name=bench,
+                        size_label=size,
                     )
+                    _save_method_cache(method_cache_dir, size, bench, "QOSN", qosn_m, qosn_circs)
             if run_fq:
-                fq_t0 = time.perf_counter()
-                fq_m, fq_t, fq_circs = _run_mitigator(
-                    qc, ["QF"], args, bench_name=bench, size_label=size
-                )
-                if args.verbose:
-                    print(
-                        f"  frozen depth={fq_m['depth']} cnot={fq_m['num_nonlocal_gates']} "
-                        f"sec={time.perf_counter() - fq_t0:.2f}",
-                        flush=True,
+                cached = _load_method_cache(method_cache_dir, size, bench, "FrozenQubits")
+                if cached is not None:
+                    fq_m, fq_circs = cached
+                    fq_t = {}
+                    print(f"[progress] size={size} bench={bench} method=FrozenQubits source=cache", flush=True)
+                else:
+                    print(f"[progress] size={size} bench={bench} method=FrozenQubits source=compute", flush=True)
+                    fq_m, fq_t, fq_circs = _run_mitigator(
+                        qc, ["QF"], args, bench_name=bench, size_label=size
                     )
+                    _save_method_cache(method_cache_dir, size, bench, "FrozenQubits", fq_m, fq_circs)
 
             if run_cutqc:
-                cutqc_methods = ["GV"] if args.cutqc_method == "gv" else ["WC"]
-                cutqc_t0 = time.perf_counter()
-                cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(
-                    qc, cutqc_methods, args, bench_name=bench, size_label=size
-                )
-                if args.verbose:
-                    print(
-                        f"  cutqc depth={cutqc_m['depth']} cnot={cutqc_m['num_nonlocal_gates']} "
-                        f"sec={time.perf_counter() - cutqc_t0:.2f}",
-                        flush=True,
+                cached = _load_method_cache(method_cache_dir, size, bench, "CutQC")
+                if cached is not None:
+                    cutqc_m, cutqc_circs = cached
+                    cutqc_t = {}
+                    print(f"[progress] size={size} bench={bench} method=CutQC source=cache", flush=True)
+                else:
+                    print(f"[progress] size={size} bench={bench} method=CutQC source=compute", flush=True)
+                    cutqc_methods = ["GV"] if args.cutqc_method == "gv" else ["WC"]
+                    cutqc_m, cutqc_t, cutqc_circs = _run_mitigator(
+                        qc, cutqc_methods, args, bench_name=bench, size_label=size
                     )
+                    _save_method_cache(method_cache_dir, size, bench, "CutQC", cutqc_m, cutqc_circs)
 
             qose_results: Dict[str, Dict[str, object]] = {}
             if include_qose:
                 for method in qose_methods:
-                    qose_t0 = time.perf_counter()
-                    qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_runs[method])
-                    if qose_m is None:
-                        if run_qos and qos_m is not None:
-                            qose_m = qos_m
-                            qose_circs = qos_circs
-                        elif run_qosn and qosn_m is not None:
-                            qose_m = qosn_m
-                            qose_circs = qosn_circs
-                        else:
-                            qose_m = base
-                            qose_circs = [qc]
+                    cached = _load_method_cache(method_cache_dir, size, bench, method)
+                    if cached is not None:
+                        qose_m, qose_circs = cached
                         qose_t = {}
+                        qose_elapsed = 0.0
+                        print(f"[progress] size={size} bench={bench} method={method} source=cache", flush=True)
+                    else:
+                        print(f"[progress] size={size} bench={bench} method={method} source=compute", flush=True)
+                        qose_t0 = time.perf_counter()
+                        qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_runs[method])
+                        if qose_m is None:
+                            if run_qos and qos_m is not None:
+                                qose_m = qos_m
+                                qose_circs = qos_circs
+                            elif run_qosn and qosn_m is not None:
+                                qose_m = qosn_m
+                                qose_circs = qosn_circs
+                            else:
+                                qose_m = base
+                                qose_circs = [qc]
+                            qose_t = {}
+                        qose_elapsed = time.perf_counter() - qose_t0
+                        _save_method_cache(method_cache_dir, size, bench, method, qose_m, qose_circs)
                     qose_results[method] = {
                         "metrics": qose_m,
                         "timing": qose_t,
                         "circs": qose_circs,
-                        "elapsed": time.perf_counter() - qose_t0,
+                        "elapsed": qose_elapsed,
                     }
-                    if args.verbose:
-                        print(
-                            f"  {method} depth={qose_m['depth']} cnot={qose_m['num_nonlocal_gates']} "
-                            f"sec={qose_results[method]['elapsed']:.2f}",
-                            flush=True,
-                        )
 
             if args.fragment_fidelity_sweep and run_qos and qos_circs is not None:
                 fragment_fidelity[(size, bench)] = _fragment_fidelity_sweep(
@@ -2420,6 +2710,7 @@ def _run_eval(
                 rel_fidelity_qose = ""
 
             if args.with_real_fidelity:
+                print(f"[progress] size={size} bench={bench} method=Qiskit stage=real_fidelity", flush=True)
                 real_base, real_base_std = _real_fidelity_stats(
                     [qc],
                     args.real_fidelity_shots,
@@ -2432,6 +2723,7 @@ def _run_eval(
                 real_fidelity_by_size[size][bench]["Qiskit"] = real_base
                 real_fidelity_err_by_size[size][bench]["Qiskit"] = real_base_std
                 if run_qos and qos_circs is not None:
+                    print(f"[progress] size={size} bench={bench} method=QOS stage=real_fidelity", flush=True)
                     real_qos, real_qos_std = _real_fidelity_stats(
                         qos_circs,
                         args.real_fidelity_shots,
@@ -2444,6 +2736,7 @@ def _run_eval(
                     real_fidelity_by_size[size][bench]["QOS"] = real_qos
                     real_fidelity_err_by_size[size][bench]["QOS"] = real_qos_std
                 if run_qosn and qosn_circs is not None:
+                    print(f"[progress] size={size} bench={bench} method=QOSN stage=real_fidelity", flush=True)
                     real_qosn, real_qosn_std = _real_fidelity_stats(
                         qosn_circs,
                         args.real_fidelity_shots,
@@ -2456,6 +2749,7 @@ def _run_eval(
                     real_fidelity_by_size[size][bench]["QOSN"] = real_qosn
                     real_fidelity_err_by_size[size][bench]["QOSN"] = real_qosn_std
                 if run_fq and fq_circs is not None:
+                    print(f"[progress] size={size} bench={bench} method=FrozenQubits stage=real_fidelity", flush=True)
                     real_fq, real_fq_std = _real_fidelity_stats(
                         fq_circs,
                         args.real_fidelity_shots,
@@ -2468,6 +2762,7 @@ def _run_eval(
                     real_fidelity_by_size[size][bench]["FrozenQubits"] = real_fq
                     real_fidelity_err_by_size[size][bench]["FrozenQubits"] = real_fq_std
                 if run_cutqc and cutqc_circs is not None:
+                    print(f"[progress] size={size} bench={bench} method=CutQC stage=real_fidelity", flush=True)
                     real_cut, real_cut_std = _real_fidelity_stats(
                         cutqc_circs,
                         args.real_fidelity_shots,
@@ -2484,6 +2779,7 @@ def _run_eval(
                         qose_circs = qose_data.get("circs")
                         if not qose_circs:
                             continue
+                        print(f"[progress] size={size} bench={bench} method={method} stage=real_fidelity", flush=True)
                         real_qose, real_qose_std = _real_fidelity_stats(
                             qose_circs,
                             args.real_fidelity_shots,
@@ -3014,6 +3310,15 @@ def main() -> None:
     )
     if args.reset_resume and resume_state_path.exists():
         resume_state_path.unlink()
+    job_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_job_cache.jsonl")
+    if args.reset_resume and job_cache_path.exists():
+        job_cache_path.unlink()
+    global _REAL_JOB_RESULT_CACHE
+    _REAL_JOB_RESULT_CACHE = _RealJobResultCache(job_cache_path)
+    print(
+        f"Real-job cache: {job_cache_path} entries={_REAL_JOB_RESULT_CACHE.count()}",
+        flush=True,
+    )
     signature = _resume_signature(args, benches, sizes, selected_methods)
     initial_rows: List[Dict[str, object]] = []
     initial_timing_rows: List[Dict[str, object]] = []
@@ -3035,6 +3340,10 @@ def main() -> None:
 
     partial_csv_path = out_dir / f"relative_properties_partial{tag_suffix}.csv"
     partial_timing_path = out_dir / f"timing_partial{tag_suffix}.csv"
+    method_cache_dir = resume_state_path.with_name(f"{resume_state_path.stem}_method_cache")
+    method_cache_dir.mkdir(parents=True, exist_ok=True)
+    progress_plot_stamp = f"progress{tag_suffix}" if tag_suffix else "progress"
+    progress_total = len(sizes) * len(benches)
 
     def _on_bench_complete(
         size: int,
@@ -3059,8 +3368,34 @@ def main() -> None:
         _write_rows_csv(partial_csv_path, rows)
         if args.collect_timing and timing:
             _write_rows_csv(partial_timing_path, timing)
+        (
+            progress_rel_by_size,
+            progress_fidelity_by_size,
+            progress_fidelity_err_by_size,
+            progress_real_fidelity_by_size,
+            progress_real_fidelity_err_by_size,
+        ) = _build_progress_maps_from_rows(
+            rows,
+            benches,
+            sizes,
+            selected_methods,
+            bool(args.with_fidelity),
+            bool(args.with_real_fidelity),
+        )
+        _plot_combined(
+            progress_rel_by_size,
+            benches,
+            out_dir,
+            progress_plot_stamp,
+            progress_fidelity_by_size,
+            progress_fidelity_err_by_size,
+            progress_real_fidelity_by_size,
+            progress_real_fidelity_err_by_size,
+            methods=selected_methods,
+            fidelity_methods=["Qiskit"] + [m for m in selected_methods if m != "Qiskit"],
+        )
         print(
-            f"[progress] completed size={size} bench={bench} saved={resume_state_path}",
+            f"[progress] completed size={size} bench={bench} total={len(completed)}/{progress_total} saved={resume_state_path}",
             flush=True,
         )
 
@@ -3182,6 +3517,7 @@ def main() -> None:
                 initial_rows=initial_rows,
                 initial_timing_rows=initial_timing_rows,
                 completed_keys=completed_keys,
+                method_cache_dir=method_cache_dir,
                 on_bench_complete=_on_bench_complete,
             )
         except RealQPUWaitTimeout as exc:
@@ -3277,6 +3613,11 @@ def main() -> None:
     print(f"Resume state updated: {resume_state_path}")
     if _REAL_DRY_RUN and _REAL_DRY_RUN_CALLS:
         print(f"Real QPU dry-run sampler_run_calls_total={_REAL_DRY_RUN_CALLS}")
+    if _REAL_JOB_RESULT_CACHE is not None:
+        try:
+            print(f"Real-job cache entries: {_REAL_JOB_RESULT_CACHE.count()}")
+        except Exception:
+            pass
     print("Full evaluation finished successfully.")
     _cleanup_children()
 
