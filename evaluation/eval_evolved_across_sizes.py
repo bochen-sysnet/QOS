@@ -74,23 +74,27 @@ def _restore_env(items: list[tuple[str, str | None]]) -> None:
             os.environ[key] = prev
 
 
-def _plot(rows: list[dict[str, Any]], output_dir: Path) -> None:
+def _plot(
+    rows: list[dict[str, Any]], output_dir: Path, figure_format: str, run_name: str
+) -> None:
     sizes = [r["size"] for r in rows]
     depth = [r["qose_depth"] for r in rows]
     cnot = [r["qose_cnot"] for r in rows]
+    run_time = [r["avg_run_time"] for r in rows]
     combined = [r["combined_score"] for r in rows]
 
     x = list(range(len(sizes)))
-    width = 0.35
+    width = 0.25
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
 
-    ax1.bar([v - width / 2 for v in x], depth, width, label="Depth Ratio")
-    ax1.bar([v + width / 2 for v in x], cnot, width, label="CNOT Ratio")
+    ax1.bar([v - width for v in x], depth, width, label="Depth Ratio")
+    ax1.bar(x, cnot, width, label="CNOT Ratio")
+    ax1.bar([v + width for v in x], run_time, width, label="Time Ratio")
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(s) for s in sizes])
     ax1.set_ylabel("Ratio (QOSE / QOS)")
-    ax1.set_title("Depth/CNOT Ratio vs Qubit Size")
+    ax1.set_title("Depth/CNOT/Time Ratio vs Qubit Size")
     ax1.grid(True, axis="y", linestyle="--", alpha=0.35)
     ax1.legend()
 
@@ -102,12 +106,14 @@ def _plot(rows: list[dict[str, Any]], output_dir: Path) -> None:
     ax2.set_title("Combined Score vs Qubit Size")
     ax2.grid(True, axis="y", linestyle="--", alpha=0.35)
 
-    png_path = output_dir / "size_sweep_bars.png"
-    pdf_path = output_dir / "size_sweep_bars.pdf"
-    fig.savefig(png_path, dpi=180)
-    fig.savefig(pdf_path)
-    print(f"[done] wrote plot: {png_path}")
-    print(f"[done] wrote plot: {pdf_path}")
+    pdf_path = output_dir / f"size_sweep_{run_name}.pdf"
+    png_path = output_dir / f"size_sweep_{run_name}.png"
+    if figure_format in {"pdf", "both"}:
+        fig.savefig(pdf_path)
+        print(f"[done] wrote plot: {pdf_path}")
+    if figure_format in {"png", "both"}:
+        fig.savefig(png_path, dpi=180)
+        print(f"[done] wrote plot: {png_path}")
 
 
 def main() -> None:
@@ -135,8 +141,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation/plots/evolved_size_sweep",
-        help="Output directory for CSV/JSON/plots",
+        default="evaluation/plots/size_sweep",
+        help="Output directory. Default: evaluation/plots/size_sweep",
+    )
+    parser.add_argument(
+        "--figure-format",
+        choices=("pdf", "png", "both"),
+        default="pdf",
+        help="Figure output format (default: pdf)",
+    )
+    parser.add_argument(
+        "--save-metrics",
+        action="store_true",
+        help="Also write CSV/JSON metrics files (default: off)",
     )
     args = parser.parse_args()
 
@@ -145,7 +162,8 @@ def main() -> None:
         raise FileNotFoundError(f"Program not found: {program}")
 
     sizes = _parse_sizes(args.sizes)
-    output_dir = Path(args.output_dir)
+    run_name = program.parent.parent.name if program.parent.name == "best" else program.stem
+    output_dir = Path(args.output_dir) if args.output_dir.strip() else Path("evaluation/plots/size_sweep")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.benches.strip():
@@ -201,42 +219,43 @@ def main() -> None:
         }
         rows.append(row)
         print(
-            "[progress] done size=%s combined=%.4f depth=%.4f cnot=%.4f elapsed=%.1fs"
+            "[progress] done size=%s combined=%.4f depth=%.4f cnot=%.4f time=%.4f elapsed=%.1fs"
             % (
                 size,
                 row["combined_score"],
                 row["qose_depth"],
                 row["qose_cnot"],
+                row["avg_run_time"],
                 elapsed,
             ),
             flush=True,
         )
 
-    csv_path = output_dir / "size_sweep_metrics.csv"
-    json_path = output_dir / "size_sweep_metrics.json"
-    fields = [
-        "size",
-        "qose_depth",
-        "qose_cnot",
-        "qose_overhead",
-        "avg_run_time",
-        "combined_score",
-        "qose_run_sec_avg",
-        "qos_run_sec_avg",
-        "eval_elapsed_sec",
-        "failure_reason",
-    ]
-    with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    with json_path.open("w") as f:
-        json.dump(rows, f, indent=2)
-
-    _plot(rows, output_dir)
+    _plot(rows, output_dir, args.figure_format, run_name)
     total = time.perf_counter() - run_start
-    print(f"[done] wrote metrics: {csv_path}")
-    print(f"[done] wrote metrics: {json_path}")
+    if args.save_metrics:
+        csv_path = output_dir / f"size_sweep_{run_name}_metrics.csv"
+        json_path = output_dir / f"size_sweep_{run_name}_metrics.json"
+        fields = [
+            "size",
+            "qose_depth",
+            "qose_cnot",
+            "qose_overhead",
+            "avg_run_time",
+            "combined_score",
+            "qose_run_sec_avg",
+            "qos_run_sec_avg",
+            "eval_elapsed_sec",
+            "failure_reason",
+        ]
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        with json_path.open("w") as f:
+            json.dump(rows, f, indent=2)
+        print(f"[done] wrote metrics: {csv_path}")
+        print(f"[done] wrote metrics: {json_path}")
     print(f"[done] total elapsed: {total:.1f}s")
 
 
