@@ -1,0 +1,26 @@
+[
+  {
+    "size": 12,
+    "qose_depth": 1.15,
+    "qose_cnot": 1.25,
+    "qose_overhead": 1.0,
+    "avg_run_time": 0.132,
+    "combined_score": -3.532,
+    "qose_run_sec_avg": 0.1155,
+    "qos_run_sec_avg": 8.4016,
+    "eval_elapsed_sec": 0.773410809924826,
+    "failure_reason": ""
+  },
+  {
+    "size": 14,
+    "qose_depth": NaN,
+    "qose_cnot": NaN,
+    "qose_overhead": NaN,
+    "avg_run_time": NaN,
+    "combined_score": -1000.0,
+    "qose_run_sec_avg": NaN,
+    "qos_run_sec_avg": NaN,
+    "eval_elapsed_sec": 120.11491451901384,
+    "failure_reason": "Evaluation timed out after 120s"
+  }
+]

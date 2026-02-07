@@ -4,7 +4,6 @@ import logging
 import numbers
 import os
 import random
-import re
 import time
 import traceback
 import multiprocessing as mp
@@ -31,6 +30,8 @@ logger = logging.getLogger(__name__)
 _QOS_BASELINE_CACHE = {}
 _BASELINE_CACHE_LOADED = False
 _BASELINE_CACHE_LOADED_FROM = ()
+_SCORE_MODE_LEGACY = "legacy"
+_SCORE_MODE_PIECEWISE = "piecewise"
 
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
@@ -56,6 +57,47 @@ def _safe_ratio(numerator, denominator):
         return float(numerator)
     return float(numerator) / float(denominator)
 
+
+def _score_mode() -> str:
+    raw = os.getenv("QOSE_SCORE_MODE", _SCORE_MODE_LEGACY).strip().lower()
+    if raw in {"pwl", "piecewise", "piecewise_linear"}:
+        return _SCORE_MODE_PIECEWISE
+    return _SCORE_MODE_LEGACY
+
+
+def _combined_score_from_ratios(
+    avg_depth: float, avg_cnot: float, avg_run_time: float, avg_overhead: float
+) -> tuple[float, str]:
+    mode = _score_mode()
+    if mode == _SCORE_MODE_PIECEWISE:
+        # Piecewise-linear score (uses depth/cnot/time only):
+        # - score is 0 when all ratios == 1
+        # - stronger penalty when structure worsens (avg depth/cnot > 1)
+        # - with these slopes, 5% depth/cnot increase needs ~80% time reduction to be > 0
+        # - and 5% time increase needs ~5% depth/cnot reduction to be > 0
+        struct_delta = 1.0 - ((avg_depth + avg_cnot) / 2.0)
+        time_delta = 1.0 - avg_run_time
+        slope_pos = 1.1
+        slope_neg = 15.9
+        struct_term = slope_pos * struct_delta if struct_delta >= 0 else slope_neg * struct_delta
+        return struct_term + time_delta, mode
+    # Legacy score.
+    return -(avg_depth + avg_cnot + avg_overhead + avg_run_time), mode
+
+
+def _score_metadata(mode: str) -> dict[str, str]:
+    if mode == _SCORE_MODE_PIECEWISE:
+        return {
+            "score_formula": (
+                "struct_delta=1-((qose_depth+qose_cnot)/2); time_delta=1-avg_run_time; "
+                "struct_term=1.1*struct_delta if struct_delta>=0 else 15.9*struct_delta; "
+                "combined_score=struct_term+time_delta"
+            ),
+        }
+    return {
+        "score_formula": "combined_score=-(qose_depth+qose_cnot+qose_overhead+avg_run_time)",
+    }
+
 def _baseline_cache_paths() -> list[str]:
     raw_paths = os.getenv("QOSE_BASELINE_CACHE_PATHS", "").strip()
     single_path = os.getenv("QOSE_BASELINE_CACHE_PATH", "").strip()
@@ -65,20 +107,8 @@ def _baseline_cache_paths() -> list[str]:
     if single_path:
         paths.append(single_path)
     if not paths:
-        size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
-        size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
-        seed_tag = _baseline_cache_seed_tag()
-        if size_max <= 12:
-            base = "qos_baseline_12q"
-        else:
-            if size_min == 12:
-                base = "qos_baseline_all"
-            else:
-                base = "qos_baseline_24q"
-        if seed_tag:
-            paths.append(f"openevolve_output/baselines/{base}_{seed_tag}.json")
-        else:
-            paths.append(f"openevolve_output/baselines/{base}.json")
+        # Default to one shared baseline cache for all runs.
+        paths.append("openevolve_output/baselines/qos_baseline_all.json")
     # de-dupe while preserving order
     seen = set()
     ordered = []
@@ -95,16 +125,42 @@ def _baseline_require_cache() -> bool:
 def _baseline_key_to_str(key) -> str:
     return json.dumps(list(key), separators=(",", ":"))
 
-def _baseline_key_from_str(value: str):
-    return tuple(json.loads(value))
+def _normalize_baseline_key_tuple(key_tuple):
+    key = tuple(key_tuple)
+    # Legacy cache key shape:
+    # (bench, size, size_to_reach, ideal_size_to_reach, budget, qos_cost_search,
+    #  metric_mode, metrics_baseline, metrics_optimization_level)
+    if len(key) == 9:
+        return (
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            key[5],
+            key[7],
+            key[8],
+        )
+    return key
 
-def _baseline_cache_seed_tag() -> str:
-    # Cache partitioning follows evaluation sampling seed only.
-    raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
-    if not raw:
-        return ""
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)
-    return f"seed{safe}"
+def _baseline_key_from_str(value: str):
+    return _normalize_baseline_key_tuple(json.loads(value))
+
+def _baseline_key(
+    bench,
+    size,
+    effective_size_to_reach,
+    args,
+):
+    # Cache key intentionally excludes budget and metric_mode.
+    return (
+        bench,
+        size,
+        effective_size_to_reach,
+        args.ideal_size_to_reach,
+        args.qos_cost_search,
+        args.metrics_baseline,
+        args.metrics_optimization_level,
+    )
 
 def _load_baseline_cache_from_disk() -> None:
     global _BASELINE_CACHE_LOADED, _BASELINE_CACHE_LOADED_FROM, _QOS_BASELINE_CACHE
@@ -169,14 +225,7 @@ def _build_args():
 def _select_bench_size_pairs(args, benches):
     size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
     size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
-    candidate_pairs = []
-    for bench in benches:
-        for size in range(size_min, size_max + 1):
-            try:
-                _load_qasm_circuit(bench, size)
-            except Exception:
-                continue
-            candidate_pairs.append((bench, size))
+    candidate_pairs = _collect_candidate_pairs(benches, size_min, size_max)
     if not candidate_pairs:
         return []
     stratified_sizes = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
@@ -199,20 +248,29 @@ def _select_bench_size_pairs(args, benches):
         bench_size_pairs = candidate_pairs[: len(benches)]
     return bench_size_pairs
 
+def _collect_candidate_pairs(benches, size_min, size_max, size_step=1):
+    candidate_pairs = []
+    for bench in benches:
+        for size in range(size_min, size_max + 1, max(1, size_step)):
+            try:
+                _load_qasm_circuit(bench, size)
+            except Exception:
+                continue
+            candidate_pairs.append((bench, size))
+    return candidate_pairs
+
 def _precompute_baseline_cache(args, bench_size_pairs):
-    for bench, size in bench_size_pairs:
-        effective_size_to_reach = size if args.size_to_reach <= 0 else args.size_to_reach
-        baseline_key = (
+    total = len(bench_size_pairs)
+    for idx, (bench, size) in enumerate(bench_size_pairs, start=1):
+        logger.warning(
+            "Baseline precompute progress: %d/%d bench=%s size=%s",
+            idx,
+            total,
             bench,
             size,
-            effective_size_to_reach,
-            args.ideal_size_to_reach,
-            args.budget,
-            args.qos_cost_search,
-            args.metric_mode,
-            args.metrics_baseline,
-            args.metrics_optimization_level,
         )
+        effective_size_to_reach = size if args.size_to_reach <= 0 else args.size_to_reach
+        baseline_key = _baseline_key(bench, size, effective_size_to_reach, args)
         if baseline_key in _QOS_BASELINE_CACHE:
             continue
         qc = _load_qasm_circuit(bench, size)
@@ -257,7 +315,22 @@ def precompute_baseline_cache():
         benches = [b.strip() for b in bench_env.split(",") if b.strip()]
     else:
         benches = [b for b, _label in BENCHES]
-    bench_size_pairs = _select_bench_size_pairs(args, benches)
+    size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
+    size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
+    size_step = int(os.getenv("QOSE_SIZE_STEP", "1"))
+    full_grid = os.getenv("QOSE_PRECOMPUTE_FULL_GRID", "1").strip().lower() in {"1", "true", "yes", "y"}
+    if full_grid:
+        bench_size_pairs = _collect_candidate_pairs(benches, size_min, size_max, size_step)
+    else:
+        bench_size_pairs = _select_bench_size_pairs(args, benches)
+    logger.warning(
+        "Baseline precompute mode=%s pairs=%d size_min=%d size_max=%d size_step=%d",
+        "full_grid" if full_grid else "sampled",
+        len(bench_size_pairs),
+        size_min,
+        size_max,
+        size_step,
+    )
     if bench_size_pairs:
         _precompute_baseline_cache(args, bench_size_pairs)
 
@@ -329,17 +402,7 @@ def _evaluate_impl(program_path):
             )
 
             # Baseline QOS
-            baseline_key = (
-                bench,
-                size,
-                effective_size_to_reach,
-                args.ideal_size_to_reach,
-                args.budget,
-                args.qos_cost_search,
-                args.metric_mode,
-                args.metrics_baseline,
-                args.metrics_optimization_level,
-            )
+            baseline_key = _baseline_key(bench, size, effective_size_to_reach, args)
             baseline = _QOS_BASELINE_CACHE.get(baseline_key)
             if baseline is None:
                 if _baseline_require_cache():
@@ -577,7 +640,9 @@ def _evaluate_impl(program_path):
     avg_cnot = cnot_sum / count
     avg_run_time = run_time_sum / count
     avg_overhead = overhead_sum / count
-    combined_score = -(avg_depth + avg_cnot + avg_overhead + avg_run_time)
+    combined_score, score_mode = _combined_score_from_ratios(
+        avg_depth, avg_cnot, avg_run_time, avg_overhead
+    )
     metrics = {
         "qose_depth": avg_depth,
         "qose_cnot": avg_cnot,
@@ -585,6 +650,7 @@ def _evaluate_impl(program_path):
         "avg_run_time": avg_run_time,
         "combined_score": combined_score,
     }
+    score_meta = _score_metadata(score_mode)
     artifacts = {
         "qose_budget": args.budget,
         "qose_run_sec_avg": (total_run_time / count) if count else 0.0,
@@ -598,6 +664,7 @@ def _evaluate_impl(program_path):
         "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,
         "cases": cases,
     }
+    artifacts.update(score_meta)
     return _round_float_values(metrics), _round_float_values(artifacts)
 
 

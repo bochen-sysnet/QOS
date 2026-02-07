@@ -89,8 +89,8 @@ prompt:
       - qose_cnot: average nonlocal gate ratio (QOSE/QOS)
       - qose_overhead: average circuit-count ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
-      - combined_score (maximize):
-          combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
+      - combined_score (maximize): scoring policy is configured externally and
+        recorded in evaluator artifacts (`score_formula`).
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.
