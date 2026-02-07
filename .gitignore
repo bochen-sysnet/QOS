@@ -17,6 +17,9 @@ __pycache__/
 *.key
 keys/*
 
+# json files
+*.json
+
 # Distribution / packaging
 .Python
 build/

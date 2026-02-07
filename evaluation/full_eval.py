@@ -3,6 +3,7 @@ import csv
 import datetime as dt
 import importlib.util
 import json
+import shlex
 from pathlib import Path
 import multiprocessing as mp
 import logging
@@ -52,6 +53,11 @@ BENCHES = [
 _EVAL_LOGGER = logging.getLogger(__name__)
 _REAL_DRY_RUN = False
 _REAL_DRY_RUN_CALLS = 0
+_RESUME_STATE_VERSION = 1
+
+
+class RealQPUWaitTimeout(RuntimeError):
+    pass
 
 
 def _dry_run_submit(ctx: Dict[str, int], method_ctx: Dict[str, int | str]) -> None:
@@ -88,6 +94,112 @@ def _dry_run_traverse(
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
     return raw.lower() in {"1", "true", "yes", "y"}
+
+
+def _bench_key(size: int, bench: str) -> str:
+    return f"{int(size)}::{bench}"
+
+
+def _safe_float(val, default=0.0):
+    try:
+        if val == "":
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+
+def _safe_int(val, default=0):
+    try:
+        if val == "":
+            return default
+        return int(val)
+    except Exception:
+        return default
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(path)
+
+
+def _write_rows_csv(path: Path, rows: List[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    fieldnames = sorted({k for r in rows for k in r.keys()})
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _resume_signature(args, benches, sizes, methods: List[str]) -> Dict[str, object]:
+    return {
+        "sizes": [int(s) for s in sizes],
+        "benches": [b for b, _ in benches],
+        "methods": list(methods),
+        "with_fidelity": bool(args.with_fidelity),
+        "with_real_fidelity": bool(args.with_real_fidelity),
+        "real_backend": str(args.real_backend),
+        "real_fidelity_shots": int(args.real_fidelity_shots),
+        "metric_mode": str(args.metric_mode),
+        "metrics_baseline": str(args.metrics_baseline),
+        "metrics_optimization_level": int(args.metrics_optimization_level),
+        "cutqc_method": str(args.cutqc_method),
+        "budget": int(args.budget),
+        "size_to_reach": int(args.size_to_reach),
+        "ideal_size_to_reach": int(args.ideal_size_to_reach),
+    }
+
+
+def _load_resume_state(path: Path, signature: Dict[str, object]) -> Optional[Dict[str, object]]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    if int(data.get("version", 0)) != _RESUME_STATE_VERSION:
+        return None
+    if data.get("signature") != signature:
+        return None
+    return data
+
+
+def _save_resume_state(
+    path: Path,
+    signature: Dict[str, object],
+    completed_keys: set[str],
+    rows: List[Dict[str, object]],
+    timing_rows: List[Dict[str, object]],
+    status: str,
+    note: str = "",
+) -> None:
+    payload: Dict[str, object] = {
+        "version": _RESUME_STATE_VERSION,
+        "signature": signature,
+        "completed_keys": sorted(completed_keys),
+        "rows": rows,
+        "timing_rows": timing_rows,
+        "status": status,
+        "note": note,
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    _atomic_write_json(path, payload)
+
+
+def _parse_real_job_timeout_sec() -> int:
+    raw = os.getenv("QOS_REAL_JOB_TIMEOUT_SEC", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 0
 
 TARGET_REL = {
     "depth": {
@@ -761,6 +873,31 @@ def _sampler_result_to_counts(result, shots: int, num_bits: int) -> Dict[str, in
     raise RuntimeError("Unsupported sampler result type for counts extraction.")
 
 
+def _call_with_alarm_timeout(fn: Callable[[], object], timeout_sec: int, timeout_msg: str):
+    if timeout_sec <= 0:
+        return fn()
+    if not hasattr(signal, "SIGALRM"):
+        return fn()
+
+    def _handler(signum, frame):
+        raise TimeoutError(timeout_msg)
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _handler)
+        signal.setitimer(signal.ITIMER_REAL, float(timeout_sec))
+        return fn()
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+        except Exception:
+            pass
+        try:
+            signal.signal(signal.SIGALRM, old_handler)
+        except Exception:
+            pass
+
+
 def _real_counts(
     circuit: QuantumCircuit,
     shots: int,
@@ -800,8 +937,33 @@ def _real_counts(
             method_ctx.get("submitted"),
             method_ctx.get("expected_total"),
         )
-        result = job.result()
+        wait_start = time.perf_counter()
+        timeout_sec = _parse_real_job_timeout_sec()
+        timeout_msg = (
+            f"Real QPU job wait timeout after {timeout_sec}s "
+            f"(method={method_ctx.get('method')} bench={method_ctx.get('bench')} "
+            f"size={method_ctx.get('size')} job_id={job_id})"
+        )
+        result = _call_with_alarm_timeout(job.result, timeout_sec, timeout_msg)
+        elapsed = time.perf_counter() - wait_start
+        method_ctx["completed"] = int(method_ctx.get("completed", 0)) + 1
+        _EVAL_LOGGER.warning(
+            "Real QPU job finished method=%s bench=%s size=%s job_id=%s elapsed_sec=%.2f completed=%s/%s",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            job_id,
+            elapsed,
+            method_ctx.get("completed"),
+            method_ctx.get("expected_total"),
+        )
         return _sampler_result_to_counts(result, shots, tcirc.num_clbits)
+    except TimeoutError as exc:
+        try:
+            job.cancel()
+        except Exception:
+            pass
+        raise RealQPUWaitTimeout(str(exc)) from exc
     except Exception as exc:
         raise RuntimeError(
             "Real-backend execution failed. "
@@ -1837,10 +1999,106 @@ def _summarize(rows: List[Dict[str, object]], methods: List[str]) -> Dict[str, f
     return summary
 
 
-def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], methods: List[str]):
-    all_rows: List[Dict[str, object]] = []
+def _method_prefix(method: str) -> str:
+    if method == "QOS":
+        return "qos"
+    if method == "QOSN":
+        return "qosn"
+    if method == "FrozenQubits":
+        return "fq"
+    if method == "CutQC":
+        return "cutqc"
+    return method.lower()
+
+
+def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
+    for method in methods:
+        prefix = _method_prefix(method)
+        if f"{prefix}_depth" not in row or f"{prefix}_nonlocal" not in row:
+            return False
+        if args.with_fidelity and f"{prefix}_fidelity" not in row:
+            return False
+        if args.with_real_fidelity and f"{prefix}_real_fidelity" not in row:
+            return False
+    if args.with_fidelity and "baseline_fidelity" not in row:
+        return False
+    if args.with_real_fidelity and "baseline_real_fidelity" not in row:
+        return False
+    return True
+
+
+def _restore_row_aggregates(
+    row: Dict[str, object],
+    bench: str,
+    size: int,
+    methods: List[str],
+    rel_depth: Dict[str, Dict[str, float]],
+    rel_nonlocal: Dict[str, Dict[str, float]],
+    fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    real_fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    real_job_counts_by_size: Dict[int, Dict[str, Dict[str, float]]],
+    with_fidelity: bool,
+    with_real_fidelity: bool,
+) -> None:
+    if with_fidelity:
+        fidelity_by_size[size][bench]["Qiskit"] = _safe_float(row.get("baseline_fidelity", ""), 0.0)
+        fidelity_err_by_size[size][bench]["Qiskit"] = _safe_float(
+            row.get("baseline_fidelity_std", ""), 0.0
+        )
+    if with_real_fidelity:
+        real_fidelity_by_size[size][bench]["Qiskit"] = _safe_float(
+            row.get("baseline_real_fidelity", ""), 0.0
+        )
+        real_fidelity_err_by_size[size][bench]["Qiskit"] = _safe_float(
+            row.get("baseline_real_fidelity_std", ""), 0.0
+        )
+    has_job_counts = size in real_job_counts_by_size and bench in real_job_counts_by_size[size]
+    if has_job_counts:
+        real_job_counts_by_size[size][bench]["Qiskit"] = 1.0
+
+    for method in methods:
+        prefix = _method_prefix(method)
+        rel_d_key = f"rel_depth_{prefix}"
+        rel_n_key = f"rel_nonlocal_{prefix}"
+        if rel_d_key in row and row[rel_d_key] != "":
+            rel_depth[bench][method] = _safe_float(row.get(rel_d_key, 0.0), 0.0)
+        if rel_n_key in row and row[rel_n_key] != "":
+            rel_nonlocal[bench][method] = _safe_float(row.get(rel_n_key, 0.0), 0.0)
+        if with_fidelity and f"{prefix}_fidelity" in row:
+            fidelity_by_size[size][bench][method] = _safe_float(
+                row.get(f"{prefix}_fidelity", ""), 0.0
+            )
+            fidelity_err_by_size[size][bench][method] = _safe_float(
+                row.get(f"{prefix}_fidelity_std", ""), 0.0
+            )
+        if with_real_fidelity and f"{prefix}_real_fidelity" in row:
+            real_fidelity_by_size[size][bench][method] = _safe_float(
+                row.get(f"{prefix}_real_fidelity", ""), 0.0
+            )
+            real_fidelity_err_by_size[size][bench][method] = _safe_float(
+                row.get(f"{prefix}_real_fidelity_std", ""), 0.0
+            )
+        num_key = f"{prefix}_num_circuits"
+        if has_job_counts and num_key in row:
+            real_job_counts_by_size[size][bench][method] = float(_safe_int(row.get(num_key, 0), 0))
+
+
+def _run_eval(
+    args,
+    benches,
+    sizes,
+    qose_runs: Optional[Dict[str, Callable]],
+    methods: List[str],
+    initial_rows: Optional[List[Dict[str, object]]] = None,
+    initial_timing_rows: Optional[List[Dict[str, object]]] = None,
+    completed_keys: Optional[set[str]] = None,
+    on_bench_complete: Optional[Callable[[int, str, List[Dict[str, object]], List[Dict[str, object]], set[str]], None]] = None,
+):
+    all_rows: List[Dict[str, object]] = list(initial_rows or [])
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
-    timing_rows = []
+    timing_rows = list(initial_timing_rows or [])
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
@@ -1855,6 +2113,13 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
     run_qosn = "QOSN" in methods
     run_fq = "FrozenQubits" in methods
     run_cutqc = "CutQC" in methods
+    completed_keys = set(completed_keys or set())
+    existing_row_map: Dict[str, Dict[str, object]] = {}
+    for _row in all_rows:
+        try:
+            existing_row_map[_bench_key(int(_row["size"]), str(_row["bench"]))] = _row
+        except Exception:
+            continue
 
     noise = None
     if args.with_fidelity or args.fragment_fidelity_sweep:
@@ -1888,6 +2153,31 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
             }
 
         for bench, _label in benches:
+            bench_key = _bench_key(size, bench)
+            cached_row = existing_row_map.get(bench_key)
+            if (
+                bench_key in completed_keys
+                and cached_row is not None
+                and _resume_row_complete(cached_row, args, methods)
+            ):
+                _restore_row_aggregates(
+                    cached_row,
+                    bench,
+                    size,
+                    methods,
+                    rel_depth,
+                    rel_nonlocal,
+                    fidelity_by_size,
+                    fidelity_err_by_size,
+                    real_fidelity_by_size,
+                    real_fidelity_err_by_size,
+                    real_job_counts_by_size,
+                    bool(args.with_fidelity),
+                    bool(args.with_real_fidelity),
+                )
+                if args.verbose:
+                    print(f"size={size} bench={bench} [resume] skipped", flush=True)
+                continue
             if args.verbose:
                 print(f"size={size} bench={bench}", flush=True)
             bench_start = time.perf_counter()
@@ -2115,11 +2405,13 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
             else:
                 sim_times = {}
                 base_fidelity = ""
+                base_std = ""
                 qos_fidelity = ""
                 qosn_fidelity = ""
                 fq_fidelity = ""
                 cutqc_fidelity = ""
                 qose_fidelity = {}
+                qose_std = {}
                 rel_fidelity = {}
                 rel_fidelity_qos = ""
                 rel_fidelity_qosn = ""
@@ -2203,6 +2495,19 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                         )
                         real_fidelity_by_size[size][bench][method] = real_qose
                         real_fidelity_err_by_size[size][bench][method] = real_qose_std
+            else:
+                real_base = ""
+                real_base_std = ""
+                real_qos = ""
+                real_qos_std = ""
+                real_qosn = ""
+                real_qosn_std = ""
+                real_fq = ""
+                real_fq_std = ""
+                real_cut = ""
+                real_cut_std = ""
+                real_qose: Dict[str, float] = {}
+                real_qose_std: Dict[str, float] = {}
             if args.with_real_fidelity or _REAL_DRY_RUN:
                 real_job_counts_by_size[size][bench]["Qiskit"] = float(
                     sum(_count_real_jobs(c) for c in [qc])
@@ -2240,6 +2545,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                 "baseline_depth": base["depth"],
                 "baseline_nonlocal": base["num_nonlocal_gates"],
                 "baseline_fidelity": base_fidelity,
+                "baseline_fidelity_std": base_std,
+                "baseline_real_fidelity": real_base,
+                "baseline_real_fidelity_std": real_base_std,
                 "baseline_sim_time": qiskit_sim,
             }
 
@@ -2251,6 +2559,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                         "qos_depth": qos_m["depth"],
                         "qos_nonlocal": qos_m["num_nonlocal_gates"],
                         "qos_fidelity": qos_fidelity,
+                        "qos_fidelity_std": qos_std if args.with_fidelity else "",
+                        "qos_real_fidelity": real_qos if args.with_real_fidelity else "",
+                        "qos_real_fidelity_std": real_qos_std if args.with_real_fidelity else "",
                         "qos_sim_time": qos_sim,
                         "qos_num_circuits": qos_num_circuits,
                         "qos_classical_overhead": _safe_ratio(qos_sim, qiskit_sim),
@@ -2268,6 +2579,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                         "qosn_depth": qosn_m["depth"],
                         "qosn_nonlocal": qosn_m["num_nonlocal_gates"],
                         "qosn_fidelity": qosn_fidelity,
+                        "qosn_fidelity_std": qosn_std if args.with_fidelity else "",
+                        "qosn_real_fidelity": real_qosn if args.with_real_fidelity else "",
+                        "qosn_real_fidelity_std": real_qosn_std if args.with_real_fidelity else "",
                         "qosn_sim_time": qosn_sim,
                         "qosn_num_circuits": qosn_num_circuits,
                         "qosn_classical_overhead": _safe_ratio(qosn_sim, qiskit_sim),
@@ -2285,6 +2599,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                         "fq_depth": fq_m["depth"],
                         "fq_nonlocal": fq_m["num_nonlocal_gates"],
                         "fq_fidelity": fq_fidelity,
+                        "fq_fidelity_std": fq_std if args.with_fidelity else "",
+                        "fq_real_fidelity": real_fq if args.with_real_fidelity else "",
+                        "fq_real_fidelity_std": real_fq_std if args.with_real_fidelity else "",
                         "fq_sim_time": fq_sim,
                         "fq_num_circuits": fq_num_circuits,
                         "fq_classical_overhead": _safe_ratio(fq_sim, qiskit_sim),
@@ -2302,6 +2619,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                         "cutqc_depth": cutqc_m["depth"],
                         "cutqc_nonlocal": cutqc_m["num_nonlocal_gates"],
                         "cutqc_fidelity": cutqc_fidelity,
+                        "cutqc_fidelity_std": cutqc_std if args.with_fidelity else "",
+                        "cutqc_real_fidelity": real_cut if args.with_real_fidelity else "",
+                        "cutqc_real_fidelity_std": real_cut_std if args.with_real_fidelity else "",
                         "cutqc_sim_time": cutqc_sim,
                         "cutqc_num_circuits": cutqc_num_circuits,
                         "cutqc_classical_overhead": _safe_ratio(cutqc_sim, qiskit_sim),
@@ -2325,6 +2645,9 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                             f"{prefix}_depth": qose_m["depth"],
                             f"{prefix}_nonlocal": qose_m["num_nonlocal_gates"],
                             f"{prefix}_fidelity": qose_fidelity.get(method, ""),
+                            f"{prefix}_fidelity_std": qose_std.get(method, ""),
+                            f"{prefix}_real_fidelity": real_qose.get(method, "") if args.with_real_fidelity else "",
+                            f"{prefix}_real_fidelity_std": real_qose_std.get(method, "") if args.with_real_fidelity else "",
                             f"{prefix}_sim_time": qose_sim,
                             f"{prefix}_num_circuits": qose_num_circuits,
                             f"{prefix}_classical_overhead": _safe_ratio(qose_sim, qiskit_sim),
@@ -2357,6 +2680,10 @@ def _run_eval(args, benches, sizes, qose_runs: Optional[Dict[str, Callable]], me
                     if args.with_fidelity:
                         row["simulation"] = sim_times.get(method, 0.0)
                     timing_rows.append(row)
+            completed_keys.add(bench_key)
+            existing_row_map[bench_key] = row
+            if on_bench_complete is not None:
+                on_bench_complete(size, bench, all_rows, timing_rows, completed_keys)
             if args.cut_visualization:
                 cut_circuits[(size, bench, "Qiskit")] = [qc]
                 if run_qos and qos_circs is not None:
@@ -2527,6 +2854,12 @@ def main() -> None:
     )
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
     parser.add_argument("--real-backend", default="ibm_torino")
+    parser.add_argument(
+        "--real-job-timeout-sec",
+        type=int,
+        default=0,
+        help="Abort if a single real-QPU job waits longer than this many seconds (0 disables).",
+    )
     parser.add_argument("--fragment-fidelity-sweep", action="store_true")
     parser.add_argument(
         "--fragment-fidelity-shots",
@@ -2614,12 +2947,28 @@ def main() -> None:
         default=str(ROOT / "evaluation" / "plots"),
         help="Output directory for figures and CSV.",
     )
+    parser.add_argument(
+        "--resume-state",
+        default="",
+        help="Path to resume-state JSON. Default: <out-dir>/full_eval_progress.json",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing resume-state and run from scratch.",
+    )
+    parser.add_argument(
+        "--reset-resume",
+        action="store_true",
+        help="Delete existing resume-state before starting.",
+    )
     args = parser.parse_args()
     global _REAL_DRY_RUN
     _REAL_DRY_RUN = bool(args.real_fidelity_dry_run or not args.with_real_fidelity)
     os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
     os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
     os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
+    os.environ["QOS_REAL_JOB_TIMEOUT_SEC"] = str(max(0, int(args.real_job_timeout_sec)))
 
     sizes = [int(s.strip()) for s in args.sizes.split(",") if s.strip()]
     args.fragment_fidelity_shots = [
@@ -2660,7 +3009,66 @@ def main() -> None:
             if method in selected_methods:
                 print(f"Using QOSE program ({method}): {program}", file=sys.stderr)
 
+    resume_state_path = (
+        Path(args.resume_state) if args.resume_state.strip() else out_dir / "full_eval_progress.json"
+    )
+    if args.reset_resume and resume_state_path.exists():
+        resume_state_path.unlink()
+    signature = _resume_signature(args, benches, sizes, selected_methods)
+    initial_rows: List[Dict[str, object]] = []
+    initial_timing_rows: List[Dict[str, object]] = []
+    completed_keys: set[str] = set()
+    if not args.no_resume:
+        loaded = _load_resume_state(resume_state_path, signature)
+        if loaded is not None:
+            initial_rows = list(loaded.get("rows", []))
+            initial_timing_rows = list(loaded.get("timing_rows", []))
+            completed_keys = set(loaded.get("completed_keys", []))
+            print(
+                f"Resume state loaded: {resume_state_path} completed={len(completed_keys)}",
+                flush=True,
+            )
+        else:
+            print(f"Resume state: starting fresh ({resume_state_path})", flush=True)
+    else:
+        print("Resume disabled (--no-resume): starting fresh", flush=True)
+
+    partial_csv_path = out_dir / f"relative_properties_partial{tag_suffix}.csv"
+    partial_timing_path = out_dir / f"timing_partial{tag_suffix}.csv"
+
+    def _on_bench_complete(
+        size: int,
+        bench: str,
+        rows: List[Dict[str, object]],
+        timing: List[Dict[str, object]],
+        completed: set[str],
+    ) -> None:
+        initial_rows[:] = rows
+        initial_timing_rows[:] = timing
+        completed_keys.clear()
+        completed_keys.update(completed)
+        _save_resume_state(
+            resume_state_path,
+            signature,
+            completed,
+            rows,
+            timing,
+            status="running",
+            note=f"completed size={size} bench={bench}",
+        )
+        _write_rows_csv(partial_csv_path, rows)
+        if args.collect_timing and timing:
+            _write_rows_csv(partial_timing_path, timing)
+        print(
+            f"[progress] completed size={size} bench={bench} saved={resume_state_path}",
+            flush=True,
+        )
+
+    resume_cmd = " ".join(shlex.quote(x) for x in [sys.executable] + sys.argv)
+
     if args.sweep:
+        if not args.no_resume:
+            print("Sweep mode: resume-state is ignored for parameter grid search.", flush=True)
         sweep_rows = []
         best = None
         budgets = [int(x) for x in args.sweep_budgets.split(",") if x.strip()]
@@ -2753,18 +3161,49 @@ def main() -> None:
             f" cost_iters={best_cost_iter}"
         )
     else:
-        (
-            all_rows,
-            rel_by_size,
-            timing_rows,
-            fidelity_by_size,
-            fidelity_err_by_size,
-            real_fidelity_by_size,
-            real_fidelity_err_by_size,
-            cut_circuits,
-            fragment_fidelity,
-            real_job_counts_by_size,
-        ) = _run_eval(args, benches, sizes, qose_runs, selected_methods)
+        try:
+            (
+                all_rows,
+                rel_by_size,
+                timing_rows,
+                fidelity_by_size,
+                fidelity_err_by_size,
+                real_fidelity_by_size,
+                real_fidelity_err_by_size,
+                cut_circuits,
+                fragment_fidelity,
+                real_job_counts_by_size,
+            ) = _run_eval(
+                args,
+                benches,
+                sizes,
+                qose_runs,
+                selected_methods,
+                initial_rows=initial_rows,
+                initial_timing_rows=initial_timing_rows,
+                completed_keys=completed_keys,
+                on_bench_complete=_on_bench_complete,
+            )
+        except RealQPUWaitTimeout as exc:
+            _save_resume_state(
+                resume_state_path,
+                signature,
+                completed_keys,
+                initial_rows,
+                initial_timing_rows,
+                status="stalled",
+                note=str(exc),
+            )
+            if initial_rows:
+                _write_rows_csv(partial_csv_path, initial_rows)
+            if args.collect_timing and initial_timing_rows:
+                _write_rows_csv(partial_timing_path, initial_timing_rows)
+            print(f"Stopped due to real-QPU wait timeout: {exc}", file=sys.stderr)
+            print(f"Resume state saved: {resume_state_path}", file=sys.stderr)
+            print("Set a new IBM key, then resume with:", file=sys.stderr)
+            print(resume_cmd, file=sys.stderr)
+            _cleanup_children()
+            return
 
     fidelity_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
     combined_path = _plot_combined(
@@ -2822,8 +3261,23 @@ def main() -> None:
         )
         for path in frag_paths:
             print(f"Wrote fragment fidelity figure: {path}")
+    final_csv_path = out_dir / f"relative_properties_{timestamp}{tag_suffix}.csv"
+    if all_rows:
+        _write_rows_csv(final_csv_path, all_rows)
+        print(f"Wrote relative properties CSV: {final_csv_path}")
+    _save_resume_state(
+        resume_state_path,
+        signature,
+        {_bench_key(int(r["size"]), str(r["bench"])) for r in all_rows if "size" in r and "bench" in r},
+        all_rows,
+        timing_rows,
+        status="done",
+        note="evaluation completed",
+    )
+    print(f"Resume state updated: {resume_state_path}")
     if _REAL_DRY_RUN and _REAL_DRY_RUN_CALLS:
         print(f"Real QPU dry-run sampler_run_calls_total={_REAL_DRY_RUN_CALLS}")
+    print("Full evaluation finished successfully.")
     _cleanup_children()
 
 
