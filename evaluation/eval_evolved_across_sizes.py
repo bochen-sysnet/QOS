@@ -77,6 +77,31 @@ def _restore_env(items: list[tuple[str, str | None]]) -> None:
 def _plot(
     rows: list[dict[str, Any]], output_dir: Path, figure_format: str, run_name: str
 ) -> None:
+    def _annotate_bars(ax, bars, fmt: str = "{:.3f}") -> None:
+        for bar in bars:
+            h = bar.get_height()
+            if h is None:
+                continue
+            x = bar.get_x() + bar.get_width() / 2.0
+            if h >= 0:
+                y = h
+                va = "bottom"
+                dy = 2
+            else:
+                y = h
+                va = "top"
+                dy = -2
+            ax.annotate(
+                fmt.format(h),
+                (x, y),
+                xytext=(0, dy),
+                textcoords="offset points",
+                ha="center",
+                va=va,
+                fontsize=7,
+                rotation=90,
+            )
+
     sizes = [r["size"] for r in rows]
     depth = [r["qose_depth"] for r in rows]
     cnot = [r["qose_cnot"] for r in rows]
@@ -88,23 +113,27 @@ def _plot(
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
 
-    ax1.bar([v - width for v in x], depth, width, label="Depth Ratio")
-    ax1.bar(x, cnot, width, label="CNOT Ratio")
-    ax1.bar([v + width for v in x], run_time, width, label="Time Ratio")
+    depth_bars = ax1.bar([v - width for v in x], depth, width, label="Depth Ratio")
+    cnot_bars = ax1.bar(x, cnot, width, label="CNOT Ratio")
+    time_bars = ax1.bar([v + width for v in x], run_time, width, label="Time Ratio")
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(s) for s in sizes])
     ax1.set_ylabel("Ratio (QOSE / QOS)")
     ax1.set_title("Depth/CNOT/Time Ratio vs Qubit Size")
     ax1.grid(True, axis="y", linestyle="--", alpha=0.35)
     ax1.legend()
+    _annotate_bars(ax1, depth_bars)
+    _annotate_bars(ax1, cnot_bars)
+    _annotate_bars(ax1, time_bars)
 
-    ax2.bar(x, combined, width=0.6, color="#4C72B0")
+    combined_bars = ax2.bar(x, combined, width=0.6, color="#4C72B0")
     ax2.set_xticks(x)
     ax2.set_xticklabels([str(s) for s in sizes])
     ax2.set_xlabel("Qubit Size")
     ax2.set_ylabel("Combined Score")
     ax2.set_title("Combined Score vs Qubit Size")
     ax2.grid(True, axis="y", linestyle="--", alpha=0.35)
+    _annotate_bars(ax2, combined_bars)
 
     pdf_path = output_dir / f"size_sweep_{run_name}.pdf"
     png_path = output_dir / f"size_sweep_{run_name}.png"
