@@ -1236,6 +1236,7 @@ def _real_counts(
                     "circuit_idx": ctx.get("circuit_idx", 1),
                     "fragment_idx": ctx.get("fragment_idx", 1),
                     "inst_idx": ctx.get("inst_idx", 1),
+                    "elapsed_sec": elapsed,
                     "qpu_sec": qpu_sec,
                     "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
                 },
