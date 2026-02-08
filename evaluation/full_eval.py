@@ -1639,7 +1639,9 @@ def _run_mitigator(
         else:
             use_cost_search = bool(methods == [] and use_cost_search_override)
         mitigator_cls = ErrorMitigator
-        if methods == [] and use_cost_search:
+        # Keep timing comparable between QOS and QOSE by default.
+        # Only enable counting/instrumented mitigator when explicit cost-search logging is requested.
+        if methods == [] and use_cost_search and getattr(args, "cost_search_log", "").strip():
             mitigator_cls = _CountingMitigator
         mitigator = mitigator_cls(
             size_to_reach=size_to_reach,
@@ -1656,18 +1658,12 @@ def _run_mitigator(
             mitigator._trace_size = size_label if size_label is not None else qc.num_qubits
             mitigator._trace_method = "QOS"
         try:
-            use_alarm = not (methods == [] or "WC" in methods or "GV" in methods)
-            if use_alarm:
-                signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
-                signal.alarm(args.timeout_sec)
             start = time.perf_counter() if args.collect_timing else 0.0
             q = mitigator.run(q)
-            if args.collect_timing and "total" not in mitigator.timings:
+            if args.collect_timing:
                 mitigator.timings["total"] = time.perf_counter() - start
             if args.collect_timing and hasattr(mitigator, "cost_search_calls"):
                 mitigator.timings["cost_search_calls"] = mitigator.cost_search_calls
-            if use_alarm:
-                signal.alarm(0)
             return (
                 _analyze_qernel(
                     q,
@@ -1678,9 +1674,7 @@ def _run_mitigator(
                 mitigator.timings,
                 _extract_circuits(q),
             )
-        except (ValueError, TimeoutError):
-            if "SIGALRM" in signal.Signals.__members__:
-                signal.alarm(0)
+        except ValueError:
             continue
 
     return (
@@ -1697,7 +1691,7 @@ def _run_mitigator(
 
 def _run_qose(
     qc: QuantumCircuit, args, evolved_run: Callable
-) -> Tuple[Optional[Dict[str, int]], Dict[str, float], List[QuantumCircuit]]:
+) -> Tuple[Dict[str, int], Dict[str, float], List[QuantumCircuit]]:
     q = Qernel(qc.copy())
     BasicAnalysisPass().run(q)
     SupermarqFeaturesAnalysisPass().run(q)
@@ -1711,15 +1705,10 @@ def _run_qose(
         collect_timing=args.collect_timing,
     )
     try:
-        if "SIGALRM" in signal.Signals.__members__:
-            signal.signal(signal.SIGALRM, lambda _s, _f: (_ for _ in ()).throw(TimeoutError()))
-            signal.alarm(args.timeout_sec)
         start = time.perf_counter() if args.collect_timing else 0.0
         q = evolved_run(mitigator, q)
-        if args.collect_timing and "total" not in mitigator.timings:
+        if args.collect_timing:
             mitigator.timings["total"] = time.perf_counter() - start
-        if "SIGALRM" in signal.Signals.__members__:
-            signal.alarm(0)
         return (
             _analyze_qernel(
                 q,
@@ -1730,10 +1719,17 @@ def _run_qose(
             mitigator.timings,
             _extract_circuits(q),
         )
-    except (ValueError, TimeoutError):
-        if "SIGALRM" in signal.Signals.__members__:
-            signal.alarm(0)
-        return None, {}, [qc]
+    except ValueError:
+        return (
+            _analyze_circuit(
+                qc,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            ),
+            {},
+            [qc],
+        )
 
 
 def _relative(value: float, baseline: float) -> float:
@@ -2681,17 +2677,6 @@ def _run_eval(
                         print(f"[progress] size={size} bench={bench} method={method} source=compute", flush=True)
                         qose_t0 = time.perf_counter()
                         qose_m, qose_t, qose_circs = _run_qose(qc, args, qose_runs[method])
-                        if qose_m is None:
-                            if run_qos and qos_m is not None:
-                                qose_m = qos_m
-                                qose_circs = qos_circs
-                            elif run_qosn and qosn_m is not None:
-                                qose_m = qosn_m
-                                qose_circs = qosn_circs
-                            else:
-                                qose_m = base
-                                qose_circs = [qc]
-                            qose_t = {}
                         qose_elapsed = time.perf_counter() - qose_t0
                         _save_method_cache(method_cache_dir, size, bench, method, qose_m, qose_circs)
                     qose_results[method] = {
@@ -3242,7 +3227,6 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=3)
     parser.add_argument("--size-to-reach", type=int, default=0)
     parser.add_argument("--ideal-size-to-reach", type=int, default=2)
-    parser.add_argument("--timeout-sec", type=int, default=45)
     parser.add_argument("--clingo-timeout-sec", type=int, default=0, help="0 disables clingo timeout.")
     parser.add_argument("--max-partition-tries", type=int, default=0, help="0 disables partition-try limit.")
     parser.add_argument(
@@ -3498,7 +3482,8 @@ def main() -> None:
     partial_csv_path = out_dir / f"relative_properties_partial{tag_suffix}.csv"
     partial_timing_path = out_dir / f"timing_partial{tag_suffix}.csv"
     method_cache_dir: Optional[Path] = None
-    if use_cache:
+    use_method_cache = bool(use_cache and args.with_real_fidelity)
+    if use_method_cache:
         method_cache_dir = resume_state_path.with_name(f"{resume_state_path.stem}_method_cache")
         method_cache_dir.mkdir(parents=True, exist_ok=True)
     progress_plot_stamp = f"progress{tag_suffix}" if tag_suffix else "progress"

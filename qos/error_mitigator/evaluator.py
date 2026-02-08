@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import logging
 import numbers
 import os
@@ -27,9 +26,6 @@ logging.getLogger("qiskit.compiler").setLevel(logging.WARNING)
 logging.getLogger("qiskit.passmanager").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-_QOS_BASELINE_CACHE = {}
-_BASELINE_CACHE_LOADED = False
-_BASELINE_CACHE_LOADED_FROM = ()
 _SCORE_MODE_LEGACY = "legacy"
 _SCORE_MODE_PIECEWISE = "piecewise"
 
@@ -78,7 +74,7 @@ def _combined_score_from_ratios(
         struct_delta = 1.0 - ((avg_depth + avg_cnot) / 2.0)
         time_delta = 1.0 - avg_run_time
         slope_pos = 1
-        slope_neg = 2
+        slope_neg = 8
         struct_term = slope_pos * struct_delta if struct_delta >= 0 else slope_neg * struct_delta
         return struct_term + time_delta, mode
     # Legacy score.
@@ -90,125 +86,13 @@ def _score_metadata(mode: str) -> dict[str, str]:
         return {
             "score_formula": (
                 "struct_delta=1-((qose_depth+qose_cnot)/2); time_delta=1-avg_run_time; "
-                "struct_term=1*struct_delta if struct_delta>=0 else 2*struct_delta; "
+                "struct_term=1*struct_delta if struct_delta>=0 else 8*struct_delta; "
                 "combined_score=struct_term+time_delta"
             ),
         }
     return {
         "score_formula": "combined_score=-(qose_depth+qose_cnot+qose_overhead+avg_run_time)",
     }
-
-def _baseline_cache_paths() -> list[str]:
-    raw_paths = os.getenv("QOSE_BASELINE_CACHE_PATHS", "").strip()
-    single_path = os.getenv("QOSE_BASELINE_CACHE_PATH", "").strip()
-    paths: list[str] = []
-    if raw_paths:
-        paths.extend([p.strip() for p in raw_paths.split(",") if p.strip()])
-    if single_path:
-        paths.append(single_path)
-    if not paths:
-        # Default to one shared baseline cache for all runs.
-        paths.append("openevolve_output/baselines/qos_baseline_all.json")
-    # de-dupe while preserving order
-    seen = set()
-    ordered = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            ordered.append(p)
-    return ordered
-
-def _baseline_require_cache() -> bool:
-    raw = os.getenv("QOSE_BASELINE_REQUIRE_CACHE", "").strip().lower()
-    return raw in {"1", "true", "yes", "y"}
-
-def _baseline_key_to_str(key) -> str:
-    return json.dumps(list(key), separators=(",", ":"))
-
-def _normalize_baseline_key_tuple(key_tuple):
-    key = tuple(key_tuple)
-    # Legacy cache key shape:
-    # (bench, size, size_to_reach, ideal_size_to_reach, budget, qos_cost_search,
-    #  metric_mode, metrics_baseline, metrics_optimization_level)
-    if len(key) == 9:
-        return (
-            key[0],
-            key[1],
-            key[2],
-            key[3],
-            key[5],
-            key[7],
-            key[8],
-        )
-    return key
-
-def _baseline_key_from_str(value: str):
-    return _normalize_baseline_key_tuple(json.loads(value))
-
-def _baseline_key(
-    bench,
-    size,
-    effective_size_to_reach,
-    args,
-):
-    # Cache key intentionally excludes budget and metric_mode.
-    return (
-        bench,
-        size,
-        effective_size_to_reach,
-        args.ideal_size_to_reach,
-        args.qos_cost_search,
-        args.metrics_baseline,
-        args.metrics_optimization_level,
-    )
-
-def _load_baseline_cache_from_disk() -> None:
-    global _BASELINE_CACHE_LOADED, _BASELINE_CACHE_LOADED_FROM, _QOS_BASELINE_CACHE
-    paths = tuple(_baseline_cache_paths())
-    if _BASELINE_CACHE_LOADED and _BASELINE_CACHE_LOADED_FROM == paths:
-        return
-    existing_paths = [p for p in paths if p and os.path.exists(p)]
-    if existing_paths:
-        logger.warning("Baseline cache: reusing %s", ", ".join(existing_paths))
-    else:
-        logger.warning(
-            "Baseline cache: no cache file found (%s); will generate on demand",
-            ", ".join(paths) if paths else "<none>",
-        )
-    # Path set changed (e.g., different seed); keep cache isolated per path set.
-    if _BASELINE_CACHE_LOADED_FROM != paths:
-        _QOS_BASELINE_CACHE = {}
-    for path in paths:
-        if not path or not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r") as handle:
-                data = json.load(handle)
-            for key_str, baseline in data.items():
-                try:
-                    _QOS_BASELINE_CACHE[_baseline_key_from_str(key_str)] = baseline
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    _BASELINE_CACHE_LOADED = True
-    _BASELINE_CACHE_LOADED_FROM = paths
-
-def _save_baseline_cache_to_disk() -> None:
-    paths = _baseline_cache_paths()
-    if not paths:
-        return
-    # Prefer an existing path if present; otherwise use the first provided.
-    path = next((p for p in paths if os.path.exists(p)), paths[0])
-    try:
-        dir_name = os.path.dirname(path)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
-        data = {_baseline_key_to_str(k): v for k, v in _QOS_BASELINE_CACHE.items()}
-        with open(path, "w") as handle:
-            json.dump(data, handle)
-    except Exception:
-        pass
 
 def _build_args():
     return SimpleNamespace(
@@ -258,81 +142,6 @@ def _collect_candidate_pairs(benches, size_min, size_max, size_step=1):
                 continue
             candidate_pairs.append((bench, size))
     return candidate_pairs
-
-def _precompute_baseline_cache(args, bench_size_pairs):
-    total = len(bench_size_pairs)
-    for idx, (bench, size) in enumerate(bench_size_pairs, start=1):
-        logger.warning(
-            "Baseline precompute progress: %d/%d bench=%s size=%s",
-            idx,
-            total,
-            bench,
-            size,
-        )
-        effective_size_to_reach = size if args.size_to_reach <= 0 else args.size_to_reach
-        baseline_key = _baseline_key(bench, size, effective_size_to_reach, args)
-        if baseline_key in _QOS_BASELINE_CACHE:
-            continue
-        qc = _load_qasm_circuit(bench, size)
-        qos_q = Qernel(qc.copy())
-        qos_mitigator = ErrorMitigator(
-            size_to_reach=effective_size_to_reach,
-            ideal_size_to_reach=args.ideal_size_to_reach,
-            budget=args.budget,
-            methods=[],
-            use_cost_search=args.qos_cost_search,
-            collect_timing=False,
-        )
-        qos_mitigator._gv_cost_calls = 0
-        qos_mitigator._wc_cost_calls = 0
-        t0 = time.perf_counter()
-        qos_q = qos_mitigator.run(qos_q)
-        qos_run_time = time.perf_counter() - t0
-        qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
-        qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
-        qos_m = _analyze_qernel(
-            qos_q,
-            args.metric_mode,
-            args.metrics_baseline,
-            args.metrics_optimization_level,
-        )
-        qos_circs = _extract_circuits(qos_q)
-        baseline = {
-            "qos_run_time": qos_run_time,
-            "qos_depth": qos_m["depth"],
-            "qos_cnot": qos_m["num_nonlocal_gates"],
-            "qos_gv_calls": qos_gv_calls,
-            "qos_wc_calls": qos_wc_calls,
-            "qos_num_circuits": len(qos_circs),
-        }
-        _QOS_BASELINE_CACHE[baseline_key] = baseline
-    _save_baseline_cache_to_disk()
-
-def precompute_baseline_cache():
-    args = _build_args()
-    bench_env = os.getenv("QOSE_BENCHES", "").strip()
-    if bench_env:
-        benches = [b.strip() for b in bench_env.split(",") if b.strip()]
-    else:
-        benches = [b for b, _label in BENCHES]
-    size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
-    size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
-    size_step = int(os.getenv("QOSE_SIZE_STEP", "1"))
-    full_grid = os.getenv("QOSE_PRECOMPUTE_FULL_GRID", "1").strip().lower() in {"1", "true", "yes", "y"}
-    if full_grid:
-        bench_size_pairs = _collect_candidate_pairs(benches, size_min, size_max, size_step)
-    else:
-        bench_size_pairs = _select_bench_size_pairs(args, benches)
-    logger.warning(
-        "Baseline precompute mode=%s pairs=%d size_min=%d size_max=%d size_step=%d",
-        "full_grid" if full_grid else "sampled",
-        len(bench_size_pairs),
-        size_min,
-        size_max,
-        size_step,
-    )
-    if bench_size_pairs:
-        _precompute_baseline_cache(args, bench_size_pairs)
 
 def _evaluate_impl(program_path):
     # Load candidate
@@ -389,7 +198,6 @@ def _evaluate_impl(program_path):
     overhead_sum = 0.0
     qos_overhead_sum = 0.0
     failure_traces = []
-    _load_baseline_cache_from_disk()
     # Combined score: negative sum of ratios (depth + cnot + time).
     bench_pairs_str = ", ".join(f"({b},{s})" for b, s in bench_size_pairs)
     logger.warning("Evaluating bench/size pairs: %s", bench_pairs_str)
@@ -401,58 +209,38 @@ def _evaluate_impl(program_path):
                 size if args.size_to_reach <= 0 else args.size_to_reach
             )
 
-            # Baseline QOS
-            baseline_key = _baseline_key(bench, size, effective_size_to_reach, args)
-            baseline = _QOS_BASELINE_CACHE.get(baseline_key)
-            if baseline is None:
-                if _baseline_require_cache():
-                    logger.warning(
-                        "Baseline cache miss for bench=%s size=%s; computing baseline anyway",
-                        bench,
-                        size,
-                    )
-                current_stage = "baseline_qos_run"
-                qos_q = Qernel(qc.copy())
-                qos_mitigator = ErrorMitigator(
-                    size_to_reach=effective_size_to_reach,
-                    ideal_size_to_reach=args.ideal_size_to_reach,
-                    budget=args.budget,
-                    methods=[],
-                    use_cost_search=args.qos_cost_search,
-                    collect_timing=False,
-                )
-                qos_mitigator._gv_cost_calls = 0
-                qos_mitigator._wc_cost_calls = 0
-                t0 = time.perf_counter()
-                qos_q = qos_mitigator.run(qos_q)
-                qos_run_time = time.perf_counter() - t0
-                qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
-                qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
-                current_stage = "baseline_qos_analyze"
-                qos_m = _analyze_qernel(
-                    qos_q,
-                    args.metric_mode,
-                    args.metrics_baseline,
-                    args.metrics_optimization_level,
-                )
-                current_stage = "baseline_qos_extract"
-                qos_circs = _extract_circuits(qos_q)
-                baseline = {
-                    "qos_run_time": qos_run_time,
-                    "qos_depth": qos_m["depth"],
-                    "qos_cnot": qos_m["num_nonlocal_gates"],
-                    "qos_gv_calls": qos_gv_calls,
-                    "qos_wc_calls": qos_wc_calls,
-                    "qos_num_circuits": len(qos_circs),
-                }
-                _QOS_BASELINE_CACHE[baseline_key] = baseline
-                _save_baseline_cache_to_disk()
-            qos_run_time = baseline["qos_run_time"]
-            total_qos_gv_calls += baseline["qos_gv_calls"]
-            total_qos_wc_calls += baseline["qos_wc_calls"]
-            qos_depth = baseline["qos_depth"]
-            qos_cnot = baseline["qos_cnot"]
-            qos_num_circuits = baseline["qos_num_circuits"]
+            # Baseline QOS (always compute on demand; no cache read/write in evaluator path)
+            current_stage = "baseline_qos_run"
+            qos_q = Qernel(qc.copy())
+            qos_mitigator = ErrorMitigator(
+                size_to_reach=effective_size_to_reach,
+                ideal_size_to_reach=args.ideal_size_to_reach,
+                budget=args.budget,
+                methods=[],
+                use_cost_search=args.qos_cost_search,
+                collect_timing=False,
+            )
+            qos_mitigator._gv_cost_calls = 0
+            qos_mitigator._wc_cost_calls = 0
+            t0 = time.perf_counter()
+            qos_q = qos_mitigator.run(qos_q)
+            qos_run_time = time.perf_counter() - t0
+            qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
+            qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
+            total_qos_gv_calls += qos_gv_calls
+            total_qos_wc_calls += qos_wc_calls
+            current_stage = "baseline_qos_analyze"
+            qos_m = _analyze_qernel(
+                qos_q,
+                args.metric_mode,
+                args.metrics_baseline,
+                args.metrics_optimization_level,
+            )
+            current_stage = "baseline_qos_extract"
+            qos_circs = _extract_circuits(qos_q)
+            qos_depth = qos_m["depth"]
+            qos_cnot = qos_m["num_nonlocal_gates"]
+            qos_num_circuits = len(qos_circs)
 
             # Evolved QOSE
             current_stage = "qose_analysis"
@@ -737,5 +525,4 @@ def _evaluate_worker(program_path, result_queue):
 
 
 if __name__ == "__main__":
-    if os.getenv("QOSE_PRECOMPUTE_BASELINE", "").strip().lower() in {"1", "true", "yes", "y"}:
-        precompute_baseline_cache()
+    pass
