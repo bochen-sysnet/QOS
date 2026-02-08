@@ -56,6 +56,10 @@ _REAL_DRY_RUN = False
 _REAL_DRY_RUN_CALLS = 0
 _RESUME_STATE_VERSION = 1
 _REAL_JOB_RESULT_CACHE = None
+_IDEAL_RESULT_CACHE = None
+_RUN_QPU_SEC = 0.0
+_RUN_QPU_SEC_KNOWN_JOBS = 0
+_RUN_QPU_SEC_UNKNOWN_JOBS = 0
 
 
 class RealQPUWaitTimeout(RuntimeError):
@@ -146,6 +150,11 @@ def _dry_run_traverse(
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
     return raw.lower() in {"1", "true", "yes", "y"}
+
+
+def _is_real_sim_progress_enabled() -> bool:
+    raw = os.getenv("QOS_REAL_SIM_PROGRESS", "1").strip().lower()
+    return raw in {"1", "true", "yes", "y"}
 
 
 def _bench_key(size: int, bench: str) -> str:
@@ -883,18 +892,86 @@ def _simulate_virtual_counts(
     shots: int,
     noise,
     seed: int,
+    ctx: Optional[Dict[str, int]] = None,
+    method_ctx: Optional[Dict[str, int | str]] = None,
 ) -> Dict[str, int]:
     vc = circuit if isinstance(circuit, VirtualCircuit) else VirtualCircuit(circuit)
     results: Dict = {}
+    frag_work = []
+    total_inst = 0
     for frag, frag_circ in vc.fragment_circuits.items():
         inst_labels = vc.get_instance_labels(frag)
         instantiations = generate_instantiations(frag_circ, inst_labels)
+        frag_work.append((frag, instantiations))
+        total_inst += len(instantiations)
+
+    show_progress = bool(method_ctx) and _is_real_sim_progress_enabled()
+    if show_progress:
+        _EVAL_LOGGER.warning(
+            "Ideal sim start method=%s bench=%s size=%s circuit=%s/%s fragments=%s inst_total=%s shots=%s",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            (ctx or {}).get("circuit_idx", 1),
+            (ctx or {}).get("circuit_total", 1),
+            len(frag_work),
+            total_inst,
+            shots,
+        )
+
+    global_done = 0
+    t_sim_start = time.perf_counter()
+    for frag_idx, (frag, instantiations) in enumerate(frag_work, start=1):
         distrs = []
-        for inst in instantiations:
+        inst_total = len(instantiations)
+        progress_step = max(1, inst_total // 10)
+        t_frag_start = time.perf_counter()
+        for inst_idx, inst in enumerate(instantiations, start=1):
             counts = _simulate_counts(inst, shots, noise, seed)
             distrs.append(QuasiDistr.from_counts(counts))
+            global_done += 1
+            if show_progress and (inst_idx == 1 or inst_idx == inst_total or inst_idx % progress_step == 0):
+                _EVAL_LOGGER.warning(
+                    "Ideal sim progress method=%s bench=%s size=%s fragment=%s/%s inst=%s/%s global=%s/%s",
+                    method_ctx.get("method"),
+                    method_ctx.get("bench"),
+                    method_ctx.get("size"),
+                    frag_idx,
+                    len(frag_work),
+                    inst_idx,
+                    inst_total,
+                    global_done,
+                    total_inst,
+                )
         results[frag] = distrs
+        if show_progress:
+            _EVAL_LOGGER.warning(
+                "Ideal sim fragment done method=%s bench=%s size=%s fragment=%s/%s elapsed_sec=%.2f",
+                method_ctx.get("method"),
+                method_ctx.get("bench"),
+                method_ctx.get("size"),
+                frag_idx,
+                len(frag_work),
+                time.perf_counter() - t_frag_start,
+            )
+    if show_progress:
+        _EVAL_LOGGER.warning(
+            "Ideal sim knit start method=%s bench=%s size=%s",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+        )
+    t_knit_start = time.perf_counter()
     quasi = vc.knit(results, SerialPool())
+    if show_progress:
+        _EVAL_LOGGER.warning(
+            "Ideal sim done method=%s bench=%s size=%s sim_elapsed_sec=%.2f knit_elapsed_sec=%.2f",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            time.perf_counter() - t_sim_start,
+            time.perf_counter() - t_knit_start,
+        )
     return quasi.to_counts(vc._circuit.num_clbits, shots)
 
 
@@ -1043,6 +1120,20 @@ def _job_quantum_seconds(job) -> Optional[float]:
     return None
 
 
+def _ideal_counts_key(
+    shots: int,
+    seed: int,
+    circuit: QuantumCircuit,
+    ctx: Dict[str, int],
+    method_ctx: Dict[str, int | str],
+) -> str:
+    return (
+        f"ideal|shots={shots}|seed={seed}|method={method_ctx.get('method')}|"
+        f"bench={method_ctx.get('bench')}|size={method_ctx.get('size')}|"
+        f"c={ctx.get('circuit_idx',1)}|virtual={int(_has_virtual_ops(circuit))}"
+    )
+
+
 def _real_counts(
     circuit: QuantumCircuit,
     shots: int,
@@ -1113,6 +1204,12 @@ def _real_counts(
         elapsed = time.perf_counter() - wait_start
         method_ctx["completed"] = int(method_ctx.get("completed", 0)) + 1
         qpu_sec = _job_quantum_seconds(job)
+        global _RUN_QPU_SEC, _RUN_QPU_SEC_KNOWN_JOBS, _RUN_QPU_SEC_UNKNOWN_JOBS
+        if qpu_sec is not None:
+            _RUN_QPU_SEC += float(qpu_sec)
+            _RUN_QPU_SEC_KNOWN_JOBS += 1
+        else:
+            _RUN_QPU_SEC_UNKNOWN_JOBS += 1
         _EVAL_LOGGER.warning(
             "Real QPU job finished method=%s bench=%s size=%s job_id=%s elapsed_sec=%.2f qpu_sec=%s completed=%s/%s",
             method_ctx.get("method"),
@@ -1227,14 +1324,45 @@ def _real_fidelity_for_circuit(
     ctx: Dict[str, int],
     method_ctx: Dict[str, int | str],
 ) -> float:
+    global _IDEAL_RESULT_CACHE
     if _REAL_DRY_RUN:
         _dry_run_traverse(circuit, ctx, method_ctx)
         return 0.0
+    ideal_key = _ideal_counts_key(shots, seed, circuit, ctx, method_ctx)
+    ideal = None
+    if _IDEAL_RESULT_CACHE is not None:
+        ideal = _IDEAL_RESULT_CACHE.get(ideal_key)
+        if ideal is not None:
+            _EVAL_LOGGER.warning(
+                "Ideal sim cache-hit method=%s bench=%s size=%s circuit=%s/%s",
+                method_ctx.get("method"),
+                method_ctx.get("bench"),
+                method_ctx.get("size"),
+                ctx.get("circuit_idx", 1),
+                ctx.get("circuit_total", 1),
+            )
+    if ideal is None and _has_virtual_ops(circuit):
+        ideal = _simulate_virtual_counts(circuit, shots, None, seed, ctx=ctx, method_ctx=method_ctx)
+    elif ideal is None:
+        ideal = _simulate_counts(circuit, shots, None, seed)
+    if _IDEAL_RESULT_CACHE is not None and ideal is not None:
+        _IDEAL_RESULT_CACHE.put(
+            ideal_key,
+            ideal,
+            {
+                "kind": "ideal_counts",
+                "shots": shots,
+                "seed": seed,
+                "method": method_ctx.get("method"),
+                "bench": method_ctx.get("bench"),
+                "size": method_ctx.get("size"),
+                "circuit_idx": ctx.get("circuit_idx", 1),
+                "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
+            },
+        )
     if _has_virtual_ops(circuit):
-        ideal = _simulate_virtual_counts(circuit, shots, None, seed)
         noisy = _real_virtual_counts(circuit, shots, backend_name, ctx, method_ctx)
     else:
-        ideal = _simulate_counts(circuit, shots, None, seed)
         noisy = _real_counts(circuit, shots, backend_name, ctx, method_ctx)
     if not ideal or not noisy:
         return 0.0
@@ -3259,8 +3387,11 @@ def main() -> None:
         help="Delete existing resume-state before starting.",
     )
     args = parser.parse_args()
-    global _REAL_DRY_RUN
+    global _REAL_DRY_RUN, _RUN_QPU_SEC, _RUN_QPU_SEC_KNOWN_JOBS, _RUN_QPU_SEC_UNKNOWN_JOBS
     _REAL_DRY_RUN = bool(args.real_fidelity_dry_run or not args.with_real_fidelity)
+    _RUN_QPU_SEC = 0.0
+    _RUN_QPU_SEC_KNOWN_JOBS = 0
+    _RUN_QPU_SEC_UNKNOWN_JOBS = 0
     os.environ["QVM_CLINGO_TIMEOUT_SEC"] = str(args.clingo_timeout_sec)
     os.environ["QVM_MAX_PARTITION_TRIES"] = str(args.max_partition_tries)
     os.environ["QOS_COST_SEARCH_MAX_ITERS"] = str(args.qos_cost_search_max_iters)
@@ -3311,12 +3442,20 @@ def main() -> None:
     if args.reset_resume and resume_state_path.exists():
         resume_state_path.unlink()
     job_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_job_cache.jsonl")
+    ideal_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_ideal_cache.jsonl")
     if args.reset_resume and job_cache_path.exists():
         job_cache_path.unlink()
-    global _REAL_JOB_RESULT_CACHE
+    if args.reset_resume and ideal_cache_path.exists():
+        ideal_cache_path.unlink()
+    global _REAL_JOB_RESULT_CACHE, _IDEAL_RESULT_CACHE
     _REAL_JOB_RESULT_CACHE = _RealJobResultCache(job_cache_path)
+    _IDEAL_RESULT_CACHE = _RealJobResultCache(ideal_cache_path)
     print(
         f"Real-job cache: {job_cache_path} entries={_REAL_JOB_RESULT_CACHE.count()}",
+        flush=True,
+    )
+    print(
+        f"Ideal-sim cache: {ideal_cache_path} entries={_IDEAL_RESULT_CACHE.count()}",
         flush=True,
     )
     signature = _resume_signature(args, benches, sizes, selected_methods)
@@ -3535,6 +3674,12 @@ def main() -> None:
             if args.collect_timing and initial_timing_rows:
                 _write_rows_csv(partial_timing_path, initial_timing_rows)
             print(f"Stopped due to real-QPU wait timeout: {exc}", file=sys.stderr)
+            print(
+                "Accumulated qpu_sec this run (submitted jobs only): "
+                f"{_RUN_QPU_SEC:.2f} "
+                f"(known_jobs={_RUN_QPU_SEC_KNOWN_JOBS}, unknown_jobs={_RUN_QPU_SEC_UNKNOWN_JOBS})",
+                file=sys.stderr,
+            )
             print(f"Resume state saved: {resume_state_path}", file=sys.stderr)
             print("Set a new IBM key, then resume with:", file=sys.stderr)
             print(resume_cmd, file=sys.stderr)
@@ -3618,6 +3763,17 @@ def main() -> None:
             print(f"Real-job cache entries: {_REAL_JOB_RESULT_CACHE.count()}")
         except Exception:
             pass
+    if _IDEAL_RESULT_CACHE is not None:
+        try:
+            print(f"Ideal-sim cache entries: {_IDEAL_RESULT_CACHE.count()}")
+        except Exception:
+            pass
+    if args.with_real_fidelity and not _REAL_DRY_RUN:
+        print(
+            "Accumulated qpu_sec this run (submitted jobs only): "
+            f"{_RUN_QPU_SEC:.2f} "
+            f"(known_jobs={_RUN_QPU_SEC_KNOWN_JOBS}, unknown_jobs={_RUN_QPU_SEC_UNKNOWN_JOBS})"
+        )
     print("Full evaluation finished successfully.")
     _cleanup_children()
 

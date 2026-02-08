@@ -77,8 +77,8 @@ def _combined_score_from_ratios(
         # - and 5% time increase needs ~5% depth/cnot reduction to be > 0
         struct_delta = 1.0 - ((avg_depth + avg_cnot) / 2.0)
         time_delta = 1.0 - avg_run_time
-        slope_pos = 1.1
-        slope_neg = 15.9
+        slope_pos = 1
+        slope_neg = 4
         struct_term = slope_pos * struct_delta if struct_delta >= 0 else slope_neg * struct_delta
         return struct_term + time_delta, mode
     # Legacy score.
@@ -90,7 +90,7 @@ def _score_metadata(mode: str) -> dict[str, str]:
         return {
             "score_formula": (
                 "struct_delta=1-((qose_depth+qose_cnot)/2); time_delta=1-avg_run_time; "
-                "struct_term=1.1*struct_delta if struct_delta>=0 else 15.9*struct_delta; "
+                "struct_term=1*struct_delta if struct_delta>=0 else 4*struct_delta; "
                 "combined_score=struct_term+time_delta"
             ),
         }
