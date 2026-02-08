@@ -3383,6 +3383,14 @@ def main() -> None:
         help="Ignore existing resume-state and run from scratch.",
     )
     parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "Disable resume/job/ideal/method caches for this run "
+            "(no cache files or resume-state writes)."
+        ),
+    )
+    parser.add_argument(
         "--reset-resume",
         action="store_true",
         help="Delete existing resume-state before starting.",
@@ -3440,6 +3448,7 @@ def main() -> None:
     resume_state_path = (
         Path(args.resume_state) if args.resume_state.strip() else out_dir / "full_eval_progress.json"
     )
+    use_cache = not args.no_cache
     if args.reset_resume and resume_state_path.exists():
         resume_state_path.unlink()
     job_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_job_cache.jsonl")
@@ -3449,21 +3458,26 @@ def main() -> None:
     if args.reset_resume and ideal_cache_path.exists():
         ideal_cache_path.unlink()
     global _REAL_JOB_RESULT_CACHE, _IDEAL_RESULT_CACHE
-    _REAL_JOB_RESULT_CACHE = _RealJobResultCache(job_cache_path)
-    _IDEAL_RESULT_CACHE = _RealJobResultCache(ideal_cache_path)
-    print(
-        f"Real-job cache: {job_cache_path} entries={_REAL_JOB_RESULT_CACHE.count()}",
-        flush=True,
-    )
-    print(
-        f"Ideal-sim cache: {ideal_cache_path} entries={_IDEAL_RESULT_CACHE.count()}",
-        flush=True,
-    )
+    if use_cache:
+        _REAL_JOB_RESULT_CACHE = _RealJobResultCache(job_cache_path)
+        _IDEAL_RESULT_CACHE = _RealJobResultCache(ideal_cache_path)
+        print(
+            f"Real-job cache: {job_cache_path} entries={_REAL_JOB_RESULT_CACHE.count()}",
+            flush=True,
+        )
+        print(
+            f"Ideal-sim cache: {ideal_cache_path} entries={_IDEAL_RESULT_CACHE.count()}",
+            flush=True,
+        )
+    else:
+        _REAL_JOB_RESULT_CACHE = None
+        _IDEAL_RESULT_CACHE = None
+        print("Caches disabled (--no-cache): running without persisted caches/resume.", flush=True)
     signature = _resume_signature(args, benches, sizes, selected_methods)
     initial_rows: List[Dict[str, object]] = []
     initial_timing_rows: List[Dict[str, object]] = []
     completed_keys: set[str] = set()
-    if not args.no_resume:
+    if use_cache and not args.no_resume:
         loaded = _load_resume_state(resume_state_path, signature)
         if loaded is not None:
             initial_rows = list(loaded.get("rows", []))
@@ -3476,12 +3490,17 @@ def main() -> None:
         else:
             print(f"Resume state: starting fresh ({resume_state_path})", flush=True)
     else:
-        print("Resume disabled (--no-resume): starting fresh", flush=True)
+        if use_cache:
+            print("Resume disabled (--no-resume): starting fresh", flush=True)
+        else:
+            print("Starting fresh (--no-cache)", flush=True)
 
     partial_csv_path = out_dir / f"relative_properties_partial{tag_suffix}.csv"
     partial_timing_path = out_dir / f"timing_partial{tag_suffix}.csv"
-    method_cache_dir = resume_state_path.with_name(f"{resume_state_path.stem}_method_cache")
-    method_cache_dir.mkdir(parents=True, exist_ok=True)
+    method_cache_dir: Optional[Path] = None
+    if use_cache:
+        method_cache_dir = resume_state_path.with_name(f"{resume_state_path.stem}_method_cache")
+        method_cache_dir.mkdir(parents=True, exist_ok=True)
     progress_plot_stamp = f"progress{tag_suffix}" if tag_suffix else "progress"
     progress_total = len(sizes) * len(benches)
 
@@ -3496,18 +3515,19 @@ def main() -> None:
         initial_timing_rows[:] = timing
         completed_keys.clear()
         completed_keys.update(completed)
-        _save_resume_state(
-            resume_state_path,
-            signature,
-            completed,
-            rows,
-            timing,
-            status="running",
-            note=f"completed size={size} bench={bench}",
-        )
-        _write_rows_csv(partial_csv_path, rows)
-        if args.collect_timing and timing:
-            _write_rows_csv(partial_timing_path, timing)
+        if use_cache:
+            _save_resume_state(
+                resume_state_path,
+                signature,
+                completed,
+                rows,
+                timing,
+                status="running",
+                note=f"completed size={size} bench={bench}",
+            )
+            _write_rows_csv(partial_csv_path, rows)
+            if args.collect_timing and timing:
+                _write_rows_csv(partial_timing_path, timing)
         (
             progress_rel_by_size,
             progress_fidelity_by_size,
@@ -3535,7 +3555,8 @@ def main() -> None:
             fidelity_methods=["Qiskit"] + [m for m in selected_methods if m != "Qiskit"],
         )
         print(
-            f"[progress] completed size={size} bench={bench} total={len(completed)}/{progress_total} saved={resume_state_path}",
+            f"[progress] completed size={size} bench={bench} total={len(completed)}/{progress_total}"
+            + (f" saved={resume_state_path}" if use_cache else ""),
             flush=True,
         )
 
@@ -3661,19 +3682,20 @@ def main() -> None:
                 on_bench_complete=_on_bench_complete,
             )
         except RealQPUWaitTimeout as exc:
-            _save_resume_state(
-                resume_state_path,
-                signature,
-                completed_keys,
-                initial_rows,
-                initial_timing_rows,
-                status="stalled",
-                note=str(exc),
-            )
-            if initial_rows:
-                _write_rows_csv(partial_csv_path, initial_rows)
-            if args.collect_timing and initial_timing_rows:
-                _write_rows_csv(partial_timing_path, initial_timing_rows)
+            if use_cache:
+                _save_resume_state(
+                    resume_state_path,
+                    signature,
+                    completed_keys,
+                    initial_rows,
+                    initial_timing_rows,
+                    status="stalled",
+                    note=str(exc),
+                )
+                if initial_rows:
+                    _write_rows_csv(partial_csv_path, initial_rows)
+                if args.collect_timing and initial_timing_rows:
+                    _write_rows_csv(partial_timing_path, initial_timing_rows)
             print(f"Stopped due to real-QPU wait timeout: {exc}", file=sys.stderr)
             print(
                 "Accumulated qpu_sec this run (submitted jobs only): "
@@ -3681,9 +3703,10 @@ def main() -> None:
                 f"(known_jobs={_RUN_QPU_SEC_KNOWN_JOBS}, unknown_jobs={_RUN_QPU_SEC_UNKNOWN_JOBS})",
                 file=sys.stderr,
             )
-            print(f"Resume state saved: {resume_state_path}", file=sys.stderr)
-            print("Set a new IBM key, then resume with:", file=sys.stderr)
-            print(resume_cmd, file=sys.stderr)
+            if use_cache:
+                print(f"Resume state saved: {resume_state_path}", file=sys.stderr)
+                print("Set a new IBM key, then resume with:", file=sys.stderr)
+                print(resume_cmd, file=sys.stderr)
             _cleanup_children()
             return
 
@@ -3747,16 +3770,17 @@ def main() -> None:
     if all_rows:
         _write_rows_csv(final_csv_path, all_rows)
         print(f"Wrote relative properties CSV: {final_csv_path}")
-    _save_resume_state(
-        resume_state_path,
-        signature,
-        {_bench_key(int(r["size"]), str(r["bench"])) for r in all_rows if "size" in r and "bench" in r},
-        all_rows,
-        timing_rows,
-        status="done",
-        note="evaluation completed",
-    )
-    print(f"Resume state updated: {resume_state_path}")
+    if use_cache:
+        _save_resume_state(
+            resume_state_path,
+            signature,
+            {_bench_key(int(r["size"]), str(r["bench"])) for r in all_rows if "size" in r and "bench" in r},
+            all_rows,
+            timing_rows,
+            status="done",
+            note="evaluation completed",
+        )
+        print(f"Resume state updated: {resume_state_path}")
     if _REAL_DRY_RUN and _REAL_DRY_RUN_CALLS:
         print(f"Real QPU dry-run sampler_run_calls_total={_REAL_DRY_RUN_CALLS}")
     if _REAL_JOB_RESULT_CACHE is not None:
