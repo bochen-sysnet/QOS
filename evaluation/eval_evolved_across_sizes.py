@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
@@ -82,6 +83,11 @@ def _plot(
             h = bar.get_height()
             if h is None:
                 continue
+            try:
+                if not math.isfinite(float(h)):
+                    continue
+            except Exception:
+                continue
             x = bar.get_x() + bar.get_width() / 2.0
             if h >= 0:
                 y = h
@@ -106,25 +112,33 @@ def _plot(
     depth = [r["qose_depth"] for r in rows]
     cnot = [r["qose_cnot"] for r in rows]
     run_time = [r["avg_run_time"] for r in rows]
+    run_time_sum_ratio = [r["qose_over_qos_run_time_sum_ratio"] for r in rows]
     combined = [r["combined_score"] for r in rows]
 
     x = list(range(len(sizes)))
-    width = 0.25
+    width = 0.2
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
 
-    depth_bars = ax1.bar([v - width for v in x], depth, width, label="Depth Ratio")
-    cnot_bars = ax1.bar(x, cnot, width, label="CNOT Ratio")
-    time_bars = ax1.bar([v + width for v in x], run_time, width, label="Time Ratio")
+    depth_bars = ax1.bar([v - 1.5 * width for v in x], depth, width, label="Depth Ratio (QOSE/QOS)")
+    cnot_bars = ax1.bar([v - 0.5 * width for v in x], cnot, width, label="CNOT Ratio (QOSE/QOS)")
+    time_bars = ax1.bar([v + 0.5 * width for v in x], run_time, width, label="Time Ratio (QOSE/QOS, mean)")
+    sum_time_bars = ax1.bar(
+        [v + 1.5 * width for v in x],
+        run_time_sum_ratio,
+        width,
+        label="Time Ratio (QOSE/QOS, sum)",
+    )
     ax1.set_xticks(x)
     ax1.set_xticklabels([str(s) for s in sizes])
-    ax1.set_ylabel("Ratio (QOSE / QOS)")
-    ax1.set_title("Depth/CNOT/Time Ratio vs Qubit Size")
+    ax1.set_ylabel("Ratio")
+    ax1.set_title("Depth/CNOT/Time Ratios vs Qubit Size")
     ax1.grid(True, axis="y", linestyle="--", alpha=0.35)
     ax1.legend()
     _annotate_bars(ax1, depth_bars)
     _annotate_bars(ax1, cnot_bars)
     _annotate_bars(ax1, time_bars)
+    _annotate_bars(ax1, sum_time_bars)
 
     combined_bars = ax2.bar(x, combined, width=0.6, color="#4C72B0")
     ax2.set_xticks(x)
@@ -243,6 +257,12 @@ def main() -> None:
             "combined_score": float(metrics.get("combined_score", float("nan"))),
             "qose_run_sec_avg": float(artifacts.get("qose_run_sec_avg", float("nan"))),
             "qos_run_sec_avg": float(artifacts.get("qos_run_sec_avg", float("nan"))),
+            "qose_over_qos_run_time_sum_ratio": (
+                float(artifacts.get("qose_run_sec_avg", float("nan")))
+                / float(artifacts.get("qos_run_sec_avg", float("nan")))
+                if float(artifacts.get("qos_run_sec_avg", float("nan"))) > 0.0
+                else float("nan")
+            ),
             "eval_elapsed_sec": elapsed,
             "failure_reason": metrics.get("failure_reason", ""),
         }
@@ -274,6 +294,7 @@ def main() -> None:
             "combined_score",
             "qose_run_sec_avg",
             "qos_run_sec_avg",
+            "qose_over_qos_run_time_sum_ratio",
             "eval_elapsed_sec",
             "failure_reason",
         ]
