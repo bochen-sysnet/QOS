@@ -1757,12 +1757,14 @@ def _plot_panel(
     x = np.arange(len(methods))
     width = 0.08
     all_vals: List[float] = []
+    hatch_patterns = ["///", "\\\\\\", "...", "xxx", "+++", "---", "|||", "ooo", "***"]
     for i, (bench, label) in enumerate(benches):
         vals = [rel_data[bench].get(m, np.nan) for m in methods]
         all_vals.extend([v for v in vals if np.isfinite(v)])
         errs = None
         if err_data is not None:
             errs = [err_data.get(bench, {}).get(m, 0.0) for m in methods]
+        hatch = hatch_patterns[i % len(hatch_patterns)]
         if errs and any(e > 0 for e in errs):
             ax.bar(
                 x + (i - len(benches) / 2) * width,
@@ -1772,10 +1774,20 @@ def _plot_panel(
                 yerr=errs,
                 capsize=2,
                 ecolor="black",
-                linewidth=0.5,
+                linewidth=0.6,
+                edgecolor="black",
+                hatch=hatch,
             )
         else:
-            ax.bar(x + (i - len(benches) / 2) * width, vals, width, label=label)
+            ax.bar(
+                x + (i - len(benches) / 2) * width,
+                vals,
+                width,
+                label=label,
+                linewidth=0.6,
+                edgecolor="black",
+                hatch=hatch,
+            )
 
     if show_avg:
         max_val = max(all_vals) if all_vals else 0.0
@@ -1795,13 +1807,14 @@ def _plot_panel(
                 f"avg {avg:.2f}",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=10,
             )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(methods)
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    ax.set_xticklabels(methods, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.tick_params(axis="y", labelsize=11)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
 
 
@@ -2418,6 +2431,225 @@ def _build_progress_maps_from_rows(
         (real_fidelity_by_size if with_real_fidelity else None),
         (real_fidelity_err_by_size if with_real_fidelity else None),
     )
+
+
+def _read_rows_csv(path: Path) -> List[Dict[str, object]]:
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        return [dict(row) for row in reader]
+
+
+def _plot_timing_total_panel(
+    ax,
+    timing_rows: List[Dict[str, object]],
+    size: int,
+    methods: List[str],
+    title: str,
+) -> None:
+    skip_stages = {"bench", "size", "method", "total", "overall", "simulation", "cost_search_calls"}
+
+    def _row_total(row: Dict[str, object]) -> float:
+        if "total" in row:
+            try:
+                return float(row["total"])
+            except (TypeError, ValueError):
+                return 0.0
+        total = 0.0
+        for key, value in row.items():
+            if key in skip_stages:
+                continue
+            try:
+                total += float(value)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    x = np.arange(len(methods))
+    totals: List[float] = []
+    hatch_patterns = ["///", "\\\\\\", "...", "xxx", "+++", "---", "|||", "ooo", "***"]
+    for method in methods:
+        method_rows = [r for r in timing_rows if _safe_int(r.get("size", 0), -1) == size and r.get("method") == method]
+        vals = [_row_total(r) for r in method_rows]
+        totals.append(sum(vals) / max(1, len(vals)))
+    for idx, total in enumerate(totals):
+        ax.bar(
+            x[idx],
+            total,
+            hatch=hatch_patterns[idx % len(hatch_patterns)],
+            edgecolor="black",
+            linewidth=0.6,
+        )
+    ax.set_title(title, fontsize=14)
+    ax.set_ylabel("Seconds", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods, fontsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    for idx, total in enumerate(totals):
+        ax.text(x[idx], total, f"{total:.2f}s", ha="center", va="bottom", fontsize=9)
+
+
+def _reorder_methods_qos_last(methods: List[str]) -> List[str]:
+    ordered = [m for m in methods if m not in {"QOS", "CutQC"}]
+    if "CutQC" in methods:
+        ordered.append("CutQC")
+    if "QOS" in methods:
+        ordered.append("QOS")
+    return ordered
+
+
+def _plot_cached_panels(
+    *,
+    simtiming_csv: Path,
+    real_torino_csv: Path,
+    real_marrakesh_csv: Path,
+    timing_csv: Path,
+    out_dir: Path,
+    timestamp: str,
+    tag: str,
+    sizes: List[int],
+    methods: List[str],
+) -> List[Path]:
+    plt = _import_matplotlib()
+    benches = BENCHES
+    methods = _reorder_methods_qos_last([m for m in methods if m != "Qiskit"])
+    fidelity_methods = ["Qiskit"] + methods
+    tag_suffix = f"_{tag}" if tag else ""
+    panel_tag = f"{timestamp}{tag_suffix}"
+
+    sim_rows = _read_rows_csv(simtiming_csv)
+    torino_rows = _read_rows_csv(real_torino_csv)
+    marrakesh_rows = _read_rows_csv(real_marrakesh_csv)
+    timing_rows = _read_rows_csv(timing_csv)
+
+    sim_rel_by_size, sim_fid_by_size, sim_fid_err_by_size, _, _ = _build_progress_maps_from_rows(
+        sim_rows,
+        benches,
+        sizes,
+        methods,
+        with_fidelity=True,
+        with_real_fidelity=False,
+    )
+    _, _, _, tor_real_by_size, tor_real_err_by_size = _build_progress_maps_from_rows(
+        torino_rows,
+        benches,
+        sizes,
+        methods,
+        with_fidelity=False,
+        with_real_fidelity=True,
+    )
+    _, _, _, mar_real_by_size, mar_real_err_by_size = _build_progress_maps_from_rows(
+        marrakesh_rows,
+        benches,
+        sizes,
+        methods,
+        with_fidelity=False,
+        with_real_fidelity=True,
+    )
+
+    timing_methods = [m for m in methods if any(_safe_int(r.get("size", 0), -1) in sizes and r.get("method") == m for r in timing_rows)]
+    if not timing_methods:
+        raise RuntimeError(
+            f"No timing rows for requested methods={methods} in {timing_csv}."
+        )
+
+    out_paths: List[Path] = []
+
+    # Figure 1: depth / CNOT in one row (12-depth, 12-cnot, 24-depth, 24-cnot).
+    fig, axes = plt.subplots(1, len(sizes) * 2, figsize=(6.2 * len(sizes) * 2, 4.0))
+    axes = np.array(axes).reshape(1, len(sizes) * 2)
+    for idx, size in enumerate(sizes):
+        rel_depth, rel_nonlocal = sim_rel_by_size[size]
+        _plot_panel(
+            axes[0, idx * 2],
+            f"Depth - {size} qubits (lower is better)",
+            rel_depth,
+            benches,
+            methods,
+            "Relative to Qiskit",
+            show_avg=True,
+        )
+        _plot_panel(
+            axes[0, idx * 2 + 1],
+            f"Number of CNOT gates - {size} qubits (lower is better)",
+            rel_nonlocal,
+            benches,
+            methods,
+            "Relative to Qiskit",
+            show_avg=True,
+        )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=11, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    depth_cnot_path = out_dir / f"relative_properties_panels_depth_cnot_{panel_tag}.pdf"
+    fig.savefig(depth_cnot_path)
+    plt.close(fig)
+    out_paths.append(depth_cnot_path)
+
+    # Figure 2: real fidelity Torino / Marrakesh in one row.
+    fig, axes = plt.subplots(1, len(sizes) * 2, figsize=(6.2 * len(sizes) * 2, 4.0))
+    axes = np.array(axes).reshape(1, len(sizes) * 2)
+    for idx, size in enumerate(sizes):
+        _plot_panel(
+            axes[0, idx * 2],
+            f"Real Hellinger fidelity - {size} qubits (Torino)",
+            tor_real_by_size.get(size, {}),
+            benches,
+            fidelity_methods,
+            "Fidelity",
+            err_data=(tor_real_err_by_size or {}).get(size, {}),
+            show_avg=True,
+        )
+        _plot_panel(
+            axes[0, idx * 2 + 1],
+            f"Real Hellinger fidelity - {size} qubits (Marrakesh)",
+            mar_real_by_size.get(size, {}),
+            benches,
+            fidelity_methods,
+            "Fidelity",
+            err_data=(mar_real_err_by_size or {}).get(size, {}),
+            show_avg=True,
+        )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=11, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    real_path = out_dir / f"relative_properties_panels_real_fidelity_{panel_tag}.pdf"
+    fig.savefig(real_path)
+    plt.close(fig)
+    out_paths.append(real_path)
+
+    # Figure 3: sim fidelity + timing in one row.
+    fig, axes = plt.subplots(1, len(sizes) * 2, figsize=(6.2 * len(sizes) * 2, 4.0))
+    axes = np.array(axes).reshape(1, len(sizes) * 2)
+    for idx, size in enumerate(sizes):
+        _plot_panel(
+            axes[0, idx * 2],
+            f"Hellinger fidelity - {size} qubits (higher is better)",
+            (sim_fid_by_size or {}).get(size, {}),
+            benches,
+            fidelity_methods,
+            "Fidelity",
+            err_data=(sim_fid_err_by_size or {}).get(size, {}),
+            show_avg=True,
+        )
+        _plot_timing_total_panel(
+            axes[0, idx * 2 + 1],
+            timing_rows,
+            size,
+            timing_methods,
+            f"Total Timing (Avg) - {size} qubits",
+        )
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=11, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    sim_timing_path = out_dir / f"relative_properties_panels_sim_fidelity_timing_{panel_tag}.pdf"
+    fig.savefig(sim_timing_path)
+    plt.close(fig)
+    out_paths.append(sim_timing_path)
+
+    return out_paths
 
 
 def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
@@ -3379,7 +3611,79 @@ def main() -> None:
         action="store_true",
         help="Delete existing resume-state before starting.",
     )
+    parser.add_argument(
+        "--plot-cached-panels",
+        action="store_true",
+        help="Plot 1x4 cached panel figures from existing CSV outputs, then exit.",
+    )
+    parser.add_argument(
+        "--panel-simtiming-csv",
+        default="",
+        help="CSV with depth/CNOT/sim-fidelity rows (e.g. relative_properties_*_simtiming.csv).",
+    )
+    parser.add_argument(
+        "--panel-real-torino-csv",
+        default="",
+        help="CSV with Torino real-fidelity rows (e.g. relative_properties_*_real.csv).",
+    )
+    parser.add_argument(
+        "--panel-real-marrakesh-csv",
+        default="",
+        help="CSV with Marrakesh real-fidelity rows (e.g. relative_properties_*_real_marrakesh.csv).",
+    )
+    parser.add_argument(
+        "--panel-timing-csv",
+        default="",
+        help="CSV with timing rows (e.g. timing_partial_*_simtiming.csv or --timing-csv output).",
+    )
+    parser.add_argument(
+        "--panel-sizes",
+        default="12,24",
+        help="Comma-separated qubit sizes for panel plotting mode.",
+    )
+    parser.add_argument(
+        "--panel-methods",
+        default="QOS,CutQC,FrozenQubits",
+        help="Comma-separated methods for panel plotting mode.",
+    )
     args = parser.parse_args()
+
+    if args.plot_cached_panels:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sizes = [int(s.strip()) for s in str(args.panel_sizes).split(",") if s.strip()]
+        methods = [m.strip() for m in str(args.panel_methods).split(",") if m.strip()]
+        if not sizes:
+            raise RuntimeError("--panel-sizes is empty.")
+        if not methods:
+            raise RuntimeError("--panel-methods is empty.")
+        required = {
+            "--panel-simtiming-csv": args.panel_simtiming_csv,
+            "--panel-real-torino-csv": args.panel_real_torino_csv,
+            "--panel-real-marrakesh-csv": args.panel_real_marrakesh_csv,
+            "--panel-timing-csv": args.panel_timing_csv,
+        }
+        missing = [flag for flag, path in required.items() if not str(path).strip()]
+        if missing:
+            raise RuntimeError(
+                "Missing required args for --plot-cached-panels: " + ", ".join(missing)
+            )
+        out_paths = _plot_cached_panels(
+            simtiming_csv=Path(args.panel_simtiming_csv),
+            real_torino_csv=Path(args.panel_real_torino_csv),
+            real_marrakesh_csv=Path(args.panel_real_marrakesh_csv),
+            timing_csv=Path(args.panel_timing_csv),
+            out_dir=out_dir,
+            timestamp=timestamp,
+            tag=args.tag.strip(),
+            sizes=sizes,
+            methods=methods,
+        )
+        for path in out_paths:
+            print(f"Wrote figure: {path}")
+        return
+
     global _REAL_DRY_RUN, _RUN_QPU_SEC, _RUN_QPU_SEC_KNOWN_JOBS, _RUN_QPU_SEC_UNKNOWN_JOBS
     _REAL_DRY_RUN = bool(args.real_fidelity_dry_run or not args.with_real_fidelity)
     _RUN_QPU_SEC = 0.0
