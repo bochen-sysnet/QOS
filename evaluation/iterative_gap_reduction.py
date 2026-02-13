@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -138,20 +139,52 @@ def _predict_model_with_objective(
     x_test: np.ndarray,
     objective: str = "mae",
 ) -> np.ndarray:
+    pred, _, _ = _predict_model_with_objective_timed(
+        model=model,
+        x_train=x_train,
+        y_train=y_train,
+        x_test=x_test,
+        objective=objective,
+    )
+    return pred
+
+
+def _predict_model_with_objective_timed(
+    model: Pipeline,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    objective: str = "mae",
+) -> tuple[np.ndarray, float, float]:
     if objective == "corr":
+        train_t0 = time.perf_counter()
         y_fit = _rank_transform_target(y_train)
         model.fit(x_train, y_fit)
-        pred_test = np.asarray(model.predict(x_test), dtype=float)
         pred_train = np.asarray(model.predict(x_train), dtype=float)
         if pred_train.size >= 2 and float(np.std(pred_train)) > 0.0:
             cov = float(np.cov(pred_train, y_train, ddof=0)[0, 1])
             var = float(np.var(pred_train))
             a = cov / var if var > 0.0 else 0.0
             b = float(np.mean(y_train) - a * np.mean(pred_train))
-            return a * pred_test + b
-        return np.full_like(pred_test, float(np.mean(y_train)), dtype=float)
+        else:
+            a = 0.0
+            b = float(np.mean(y_train))
+        train_sec = time.perf_counter() - train_t0
+
+        test_t0 = time.perf_counter()
+        pred_test_raw = np.asarray(model.predict(x_test), dtype=float)
+        pred_test = a * pred_test_raw + b
+        test_sec = time.perf_counter() - test_t0
+        return pred_test, train_sec, test_sec
+
+    train_t0 = time.perf_counter()
     model.fit(x_train, y_train)
-    return np.asarray(model.predict(x_test), dtype=float)
+    train_sec = time.perf_counter() - train_t0
+
+    test_t0 = time.perf_counter()
+    pred = np.asarray(model.predict(x_test), dtype=float)
+    test_sec = time.perf_counter() - test_t0
+    return pred, train_sec, test_sec
 
 
 def _subset_cv_score(
@@ -508,6 +541,7 @@ def _build_corr_selected_feature_rows(
     selection_rows: list[dict[str, Any]],
     top_k: int,
 ) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
+    train_t0 = time.perf_counter()
     case_csv = output_dir / "gen_seed323_full63_case_metrics.csv"
     case_rows = _read_csv(case_csv)
     if not case_rows:
@@ -580,7 +614,9 @@ def _build_corr_selected_feature_rows(
         selected_ranked = ranking
     selected_ranked = selected_ranked[:top_k]
     selected_pairs = [(str(r["bench"]), int(r["size"])) for r in selected_ranked]
+    selection_train_latency_sec = time.perf_counter() - train_t0
 
+    test_t0 = time.perf_counter()
     out_rows, filled, unfilled = _build_feature_rows_from_selected_pairs(
         rows=rows,
         case_rows=case_rows,
@@ -602,8 +638,13 @@ def _build_corr_selected_feature_rows(
                 "abs_corr": _safe_float(r.get("abs_corr")),
                 "corr": _safe_float(r.get("corr")),
                 "support": int(_safe_float(r.get("support"), default=0)),
+                "latency_train_sec": selection_train_latency_sec,
+                "latency_test_sec": 0.0,  # populated after table construction
             }
         )
+    selection_test_latency_sec = time.perf_counter() - test_t0
+    for row in selection_table:
+        row["latency_test_sec"] = selection_test_latency_sec
 
     return out_rows, filled, unfilled, selection_table
 
@@ -616,6 +657,7 @@ def _build_ml_selected_feature_rows(
     random_state: int,
     selector_objective: str = "mae",
 ) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
+    train_t0 = time.perf_counter()
     case_csv = output_dir / "gen_seed323_full63_case_metrics.csv"
     case_rows = _read_csv(case_csv)
     if not case_rows:
@@ -787,7 +829,9 @@ def _build_ml_selected_feature_rows(
         )
 
     selected_pairs = [pairs[i] for i in selected_indices]
+    selection_train_latency_sec = time.perf_counter() - train_t0
 
+    test_t0 = time.perf_counter()
     out_rows, filled, unfilled = _build_feature_rows_from_selected_pairs(
         rows=rows,
         case_rows=case_rows,
@@ -811,8 +855,13 @@ def _build_ml_selected_feature_rows(
                 "abs_corr": _safe_float(r.get("abs_corr")),
                 "cv_obj_if_selected": _safe_float(loss_lookup.get(key)),
                 "support": int(_safe_float(r.get("support"), default=0)),
+                "latency_train_sec": selection_train_latency_sec,
+                "latency_test_sec": 0.0,  # populated after table construction
             }
         )
+    selection_test_latency_sec = time.perf_counter() - test_t0
+    for row in selection_table:
+        row["latency_test_sec"] = selection_test_latency_sec
 
     return out_rows, filled, unfilled, selection_table
 
@@ -824,6 +873,7 @@ def _build_ml_importance_selected_feature_rows(
     top_k: int,
     random_state: int,
 ) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
+    train_t0 = time.perf_counter()
     case_csv = output_dir / "gen_seed323_full63_case_metrics.csv"
     case_rows = _read_csv(case_csv)
     if not case_rows:
@@ -931,7 +981,9 @@ def _build_ml_importance_selected_feature_rows(
     )
     selected_ranked = ranking[:top_k]
     selected_pairs = [(str(r["bench"]), int(r["size"])) for r in selected_ranked]
+    selection_train_latency_sec = time.perf_counter() - train_t0
 
+    test_t0 = time.perf_counter()
     out_rows, filled, unfilled = _build_feature_rows_from_selected_pairs(
         rows=rows,
         case_rows=case_rows,
@@ -952,8 +1004,13 @@ def _build_ml_importance_selected_feature_rows(
                 "selected_rank": rank_lookup.get(key, ""),
                 "importance": _safe_float(r.get("importance")),
                 "support": int(_safe_float(r.get("support"), default=0)),
+                "latency_train_sec": selection_train_latency_sec,
+                "latency_test_sec": 0.0,  # populated after table construction
             }
         )
+    selection_test_latency_sec = time.perf_counter() - test_t0
+    for row in selection_table:
+        row["latency_test_sec"] = selection_test_latency_sec
     return out_rows, filled, unfilled, selection_table
 
 
@@ -1064,18 +1121,24 @@ def _iterative_eval(
         for model_name, model in model_defs:
             pred = float("nan")
             err_msg = ""
+            predict_train_latency_sec = float("nan")
+            predict_test_latency_sec = float("nan")
             try:
-                pred = float(
-                    _predict_model_with_objective(
-                        model,
-                        x_train,
-                        y_train,
-                        x_test,
-                        objective=model_objective,
-                    )[0]
+                pred_arr, predict_train_latency_sec, predict_test_latency_sec = _predict_model_with_objective_timed(
+                    model,
+                    x_train,
+                    y_train,
+                    x_test,
+                    objective=model_objective,
                 )
+                pred = float(pred_arr[0])
             except Exception as exc:
                 err_msg = str(exc)
+            pred_latency_sec = (
+                predict_train_latency_sec + predict_test_latency_sec
+                if not (math.isnan(predict_train_latency_sec) or math.isnan(predict_test_latency_sec))
+                else float("nan")
+            )
             model_gap = abs(pred - y_actual) if not (math.isnan(pred) or math.isnan(y_actual)) else float("nan")
             gap_reduction = (
                 selected_gap - model_gap
@@ -1096,6 +1159,13 @@ def _iterative_eval(
                     "predicted_full_score_piecewise": pred,
                     "model_gap_abs": model_gap,
                     "gap_reduction_abs": gap_reduction,
+                    "selector_mode": "artifacts",
+                    "selection_latency_sec": float("nan"),
+                    "selection_train_latency_sec": float("nan"),
+                    "selection_test_latency_sec": float("nan"),
+                    "predict_latency_sec": pred_latency_sec,
+                    "predict_train_latency_sec": predict_train_latency_sec,
+                    "predict_test_latency_sec": predict_test_latency_sec,
                     "model_objective": model_objective,
                     "error": err_msg,
                 }
@@ -1151,6 +1221,7 @@ def _iterative_eval_ml_rolling(
             )
 
         chosen_mode = mode
+        selection_t0 = time.perf_counter()
         if mode == "auto":
             candidates = ["corr", "ml_importance", "ml"]
             scored: list[tuple[float, str, list[dict[str, Any]], list[dict[str, Any]]]] = []
@@ -1167,6 +1238,34 @@ def _iterative_eval_ml_rolling(
             _, chosen_mode, feature_rows_k, selection_table_k = scored[0]
         else:
             feature_rows_k, _, _, selection_table_k = _build_by_mode(chosen_mode)
+        selection_latency_sec = time.perf_counter() - selection_t0
+        selection_train_latency_sec = _safe_float(
+            next(
+                (
+                    r.get("latency_train_sec")
+                    for r in selection_table_k
+                    if not math.isnan(_safe_float(r.get("latency_train_sec")))
+                ),
+                float("nan"),
+            )
+        )
+        selection_test_latency_sec = _safe_float(
+            next(
+                (
+                    r.get("latency_test_sec")
+                    for r in selection_table_k
+                    if not math.isnan(_safe_float(r.get("latency_test_sec")))
+                ),
+                float("nan"),
+            )
+        )
+        if math.isnan(selection_train_latency_sec) and math.isnan(selection_test_latency_sec):
+            selection_train_latency_sec = selection_latency_sec
+            selection_test_latency_sec = 0.0
+        elif math.isnan(selection_train_latency_sec):
+            selection_train_latency_sec = max(0.0, selection_latency_sec - selection_test_latency_sec)
+        elif math.isnan(selection_test_latency_sec):
+            selection_test_latency_sec = max(0.0, selection_latency_sec - selection_train_latency_sec)
 
         feature_map = {str(r.get("program_id", "")): r for r in feature_rows_k}
         train_rows = [
@@ -1198,18 +1297,24 @@ def _iterative_eval_ml_rolling(
         for model_name, model in model_defs:
             pred = float("nan")
             err_msg = ""
+            predict_train_latency_sec = float("nan")
+            predict_test_latency_sec = float("nan")
             try:
-                pred = float(
-                    _predict_model_with_objective(
-                        model,
-                        x_train,
-                        y_train,
-                        x_test,
-                        objective=model_objective,
-                    )[0]
+                pred_arr, predict_train_latency_sec, predict_test_latency_sec = _predict_model_with_objective_timed(
+                    model,
+                    x_train,
+                    y_train,
+                    x_test,
+                    objective=model_objective,
                 )
+                pred = float(pred_arr[0])
             except Exception as exc:
                 err_msg = str(exc)
+            pred_latency_sec = (
+                predict_train_latency_sec + predict_test_latency_sec
+                if not (math.isnan(predict_train_latency_sec) or math.isnan(predict_test_latency_sec))
+                else float("nan")
+            )
             model_gap = (
                 abs(pred - y_actual)
                 if not (math.isnan(pred) or math.isnan(y_actual))
@@ -1235,6 +1340,12 @@ def _iterative_eval_ml_rolling(
                     "model_gap_abs": model_gap,
                     "gap_reduction_abs": gap_reduction,
                     "selector_mode": chosen_mode,
+                    "selection_latency_sec": selection_latency_sec,
+                    "selection_train_latency_sec": selection_train_latency_sec,
+                    "selection_test_latency_sec": selection_test_latency_sec,
+                    "predict_latency_sec": pred_latency_sec,
+                    "predict_train_latency_sec": predict_train_latency_sec,
+                    "predict_test_latency_sec": predict_test_latency_sec,
                     "model_objective": model_objective,
                     "error": err_msg,
                 }
@@ -1607,6 +1718,42 @@ def _selector_compare_summary(
             return float("nan"), len(yt)
         return _pearson_corr(yt, yp), len(yt)
 
+    def _latency_after(
+        records: list[dict[str, Any]],
+        field: str,
+        kmin: int,
+        require_selector: str | None = None,
+        dedupe_by_k: bool = False,
+    ) -> tuple[float, int]:
+        vals: list[float] = []
+        if dedupe_by_k:
+            seen_k: set[int] = set()
+            for r in records:
+                k = int(_safe_float(r.get("k_index"), default=-1))
+                if k < kmin or k in seen_k:
+                    continue
+                if require_selector is not None and str(r.get("selector_mode", "")) != require_selector:
+                    continue
+                v = _safe_float(r.get(field))
+                if math.isnan(v):
+                    continue
+                seen_k.add(k)
+                vals.append(v * 1000.0)
+        else:
+            for r in records:
+                k = int(_safe_float(r.get("k_index"), default=-1))
+                if k < kmin:
+                    continue
+                if require_selector is not None and str(r.get("selector_mode", "")) != require_selector:
+                    continue
+                v = _safe_float(r.get(field))
+                if math.isnan(v):
+                    continue
+                vals.append(v * 1000.0)
+        if not vals:
+            return float("nan"), 0
+        return float(np.mean(vals)), len(vals)
+
     for selector_name, by_obj in selector_records.items():
         for objective_name, recs in by_obj.items():
             if not recs:
@@ -1669,6 +1816,79 @@ def _selector_compare_summary(
                             "count": cmn,
                         }
                     )
+                # Latency metrics (ms): train/test for correlation selector and ML predictor.
+                corr_train_ms, corr_train_n = _latency_after(
+                    recs,
+                    field="selection_train_latency_sec",
+                    kmin=w,
+                    require_selector="corr",
+                    dedupe_by_k=True,
+                )
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "latency_ms",
+                        "warmup_kmin": w,
+                        "method": "corr_select_train",
+                        "value": corr_train_ms,
+                        "count": corr_train_n,
+                    }
+                )
+                corr_test_ms, corr_test_n = _latency_after(
+                    recs,
+                    field="selection_test_latency_sec",
+                    kmin=w,
+                    require_selector="corr",
+                    dedupe_by_k=True,
+                )
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "latency_ms",
+                        "warmup_kmin": w,
+                        "method": "corr_select_test",
+                        "value": corr_test_ms,
+                        "count": corr_test_n,
+                    }
+                )
+                ml_train_ms, ml_train_n = _latency_after(
+                    recs,
+                    field="predict_train_latency_sec",
+                    kmin=w,
+                    require_selector=None,
+                    dedupe_by_k=False,
+                )
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "latency_ms",
+                        "warmup_kmin": w,
+                        "method": "ml_predict_train",
+                        "value": ml_train_ms,
+                        "count": ml_train_n,
+                    }
+                )
+                ml_test_ms, ml_test_n = _latency_after(
+                    recs,
+                    field="predict_test_latency_sec",
+                    kmin=w,
+                    require_selector=None,
+                    dedupe_by_k=False,
+                )
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "latency_ms",
+                        "warmup_kmin": w,
+                        "method": "ml_predict_test",
+                        "value": ml_test_ms,
+                        "count": ml_test_n,
+                    }
+                )
     return rows_out
 
 
@@ -1727,7 +1947,7 @@ def _plot_selector_triplet(
     if warmups[0] != 0:
         warmups = [0] + warmups
 
-    fig, axes = plt.subplots(len(available), 3, figsize=(24.0, 5.8 * len(available)), squeeze=False)
+    fig, axes = plt.subplots(len(available), 4, figsize=(31.0, 5.8 * len(available)), squeeze=False)
 
     title_fs = 16
     label_fs = 14
@@ -1895,6 +2115,88 @@ def _plot_selector_triplet(
             ncol=2,
             loc="best",
         )
+
+        # Col 4: latency bars (train/test for correlation selection and ML prediction).
+        ax3 = axes[row_idx, 3]
+        sel_train_by_k: dict[int, float] = {}
+        sel_test_by_k: dict[int, float] = {}
+        for r in recs_mae:
+            if str(r.get("selector_mode", "")) != "corr":
+                continue
+            k = int(_safe_float(r.get("k_index"), default=-1))
+            v_train = _safe_float(r.get("selection_train_latency_sec"))
+            v_test = _safe_float(r.get("selection_test_latency_sec"))
+            if k < 0:
+                continue
+            if not math.isnan(v_train):
+                sel_train_by_k[k] = v_train
+            if not math.isnan(v_test):
+                sel_test_by_k[k] = v_test
+        pred_train_vals = [
+            _safe_float(r.get("predict_train_latency_sec"))
+            for r in recs_mae
+            if not math.isnan(_safe_float(r.get("predict_train_latency_sec")))
+        ]
+        pred_test_vals = [
+            _safe_float(r.get("predict_test_latency_sec"))
+            for r in recs_mae
+            if not math.isnan(_safe_float(r.get("predict_test_latency_sec")))
+        ]
+        corr_select_train_ms = (
+            float(np.mean(np.array(list(sel_train_by_k.values()), dtype=float)) * 1000.0)
+            if sel_train_by_k
+            else float("nan")
+        )
+        corr_select_test_ms = (
+            float(np.mean(np.array(list(sel_test_by_k.values()), dtype=float)) * 1000.0)
+            if sel_test_by_k
+            else float("nan")
+        )
+        ml_predict_train_ms = (
+            float(np.mean(np.array(pred_train_vals, dtype=float)) * 1000.0)
+            if pred_train_vals
+            else float("nan")
+        )
+        ml_predict_test_ms = (
+            float(np.mean(np.array(pred_test_vals, dtype=float)) * 1000.0)
+            if pred_test_vals
+            else float("nan")
+        )
+        latency_labels = [
+            "corr_train",
+            "corr_test",
+            "ml_train",
+            "ml_test",
+        ]
+        latency_vals = [
+            corr_select_train_ms,
+            corr_select_test_ms,
+            ml_predict_train_ms,
+            ml_predict_test_ms,
+        ]
+        x3 = np.arange(len(latency_labels))
+        bars3 = ax3.bar(
+            x3,
+            [0.0 if math.isnan(v) else v for v in latency_vals],
+            color=["tab:purple", "tab:pink", "tab:green", "tab:olive"],
+            alpha=0.9,
+        )
+        for b, v in zip(bars3, latency_vals):
+            label = "n/a" if math.isnan(v) else f"{v:.2f} ms"
+            ax3.text(
+                b.get_x() + b.get_width() / 2.0,
+                b.get_height() + 0.01 * max(1.0, b.get_height()),
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=ann_fs,
+            )
+        ax3.set_xticks(x3)
+        ax3.set_xticklabels(latency_labels, fontsize=tick_fs)
+        ax3.set_title(f"{row_title}: Latency (Average Across k)", fontsize=title_fs)
+        ax3.set_ylabel("Latency (ms)", fontsize=label_fs)
+        ax3.grid(axis="y", alpha=0.2)
+        ax3.tick_params(axis="y", labelsize=tick_fs)
 
     fig.tight_layout()
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -2226,6 +2528,12 @@ def main() -> None:
             "model_gap_abs",
             "gap_reduction_abs",
             "selector_mode",
+            "selection_latency_sec",
+            "selection_train_latency_sec",
+            "selection_test_latency_sec",
+            "predict_latency_sec",
+            "predict_train_latency_sec",
+            "predict_test_latency_sec",
             "model_objective",
             "error",
         ],
