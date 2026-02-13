@@ -11,6 +11,73 @@ _TRACE_QUEUE = None
 _COST_TIMEOUT_SENTINEL = 10**9
 
 
+class CostResult(tuple):
+    __slots__ = ()
+
+    def __new__(cls, cost: int, timed_out: bool):
+        return super().__new__(cls, (int(cost), bool(timed_out)))
+
+    @property
+    def cost(self) -> int:
+        return int(self[0])
+
+    @property
+    def timed_out(self) -> bool:
+        return bool(self[1])
+
+    def _coerce_other(self, other):
+        if isinstance(other, CostResult):
+            return float(other.cost)
+        if isinstance(other, tuple) and len(other) >= 1:
+            try:
+                return float(other[0])
+            except Exception:
+                return NotImplemented
+        try:
+            return float(other)
+        except Exception:
+            return NotImplemented
+
+    def __float__(self) -> float:
+        return float(self.cost)
+
+    def __int__(self) -> int:
+        return int(self.cost)
+
+    def __bool__(self) -> bool:
+        return bool(self.cost)
+
+    def __lt__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) < rhs
+
+    def __le__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) <= rhs
+
+    def __gt__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) > rhs
+
+    def __ge__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) >= rhs
+
+    def __eq__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return False
+        return float(self.cost) == rhs
+
+
 def _emit_trace(event: dict) -> None:
     if _TRACE_QUEUE is None:
         return
@@ -257,7 +324,7 @@ def compute_gv_cost(
                 "sec": (-1.0 if timed_out else gv_sec),
             }
         )
-    return gv_cost, timed_out
+    return CostResult(gv_cost, timed_out)
 
 
 def compute_wc_cost(
@@ -278,7 +345,7 @@ def compute_wc_cost(
                 "sec": (-1.0 if timed_out else wc_sec),
             }
         )
-    return wc_cost, timed_out
+    return CostResult(wc_cost, timed_out)
 
 
 def _cost_search_worker(mitigator, q, size_to_reach, budget, result_queue, trace_queue):
