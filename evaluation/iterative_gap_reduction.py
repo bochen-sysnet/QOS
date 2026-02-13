@@ -119,11 +119,47 @@ def _models(random_state: int) -> list[tuple[str, Pipeline]]:
     ]
 
 
-def _subset_cv_mae(
+def _rank_transform_target(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    n = int(y.shape[0])
+    if n <= 1:
+        return np.zeros_like(y, dtype=float)
+    order = np.argsort(y, kind="mergesort")
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(n, dtype=float)
+    ranks /= float(n - 1)
+    return ranks
+
+
+def _predict_model_with_objective(
+    model: Pipeline,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_test: np.ndarray,
+    objective: str = "mae",
+) -> np.ndarray:
+    if objective == "corr":
+        y_fit = _rank_transform_target(y_train)
+        model.fit(x_train, y_fit)
+        pred_test = np.asarray(model.predict(x_test), dtype=float)
+        pred_train = np.asarray(model.predict(x_train), dtype=float)
+        if pred_train.size >= 2 and float(np.std(pred_train)) > 0.0:
+            cov = float(np.cov(pred_train, y_train, ddof=0)[0, 1])
+            var = float(np.var(pred_train))
+            a = cov / var if var > 0.0 else 0.0
+            b = float(np.mean(y_train) - a * np.mean(pred_train))
+            return a * pred_test + b
+        return np.full_like(pred_test, float(np.mean(y_train)), dtype=float)
+    model.fit(x_train, y_train)
+    return np.asarray(model.predict(x_test), dtype=float)
+
+
+def _subset_cv_score(
     X: np.ndarray,
     y: np.ndarray,
     cols: list[int],
     random_state: int,
+    selector_objective: str = "mae",
 ) -> float:
     if X.ndim != 2 or y.ndim != 1 or not cols:
         return float("inf")
@@ -136,19 +172,35 @@ def _subset_cv_mae(
         return float("inf")
     kf = KFold(n_splits=n_splits, shuffle=False)
     errs: list[float] = []
+    corrs: list[float] = []
     model = _build_pipeline(Ridge(alpha=1.0, random_state=random_state), use_scaler=True)
     Xs = X[:, cols]
     for train_idx, test_idx in kf.split(Xs):
         try:
-            model.fit(Xs[train_idx], y[train_idx])
-            pred = model.predict(Xs[test_idx])
+            pred = _predict_model_with_objective(
+                model,
+                Xs[train_idx],
+                y[train_idx],
+                Xs[test_idx],
+                objective=selector_objective,
+            )
         except Exception:
             return float("inf")
         y_true = y[test_idx]
-        for p, t in zip(pred, y_true):
-            if math.isnan(float(p)) or math.isnan(float(t)):
-                continue
-            errs.append(abs(float(p) - float(t)))
+        if selector_objective == "corr":
+            c = _pearson_corr([float(v) for v in y_true], [float(v) for v in pred])
+            if math.isnan(c):
+                return float("inf")
+            corrs.append(float(c))
+        else:
+            for p, t in zip(pred, y_true):
+                if math.isnan(float(p)) or math.isnan(float(t)):
+                    continue
+                errs.append(abs(float(p) - float(t)))
+    if selector_objective == "corr":
+        if not corrs:
+            return float("inf")
+        return float(1.0 - np.mean(corrs))
     if not errs:
         return float("inf")
     return float(np.mean(errs))
@@ -562,6 +614,7 @@ def _build_ml_selected_feature_rows(
     selection_rows: list[dict[str, Any]],
     top_k: int,
     random_state: int,
+    selector_objective: str = "mae",
 ) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
     case_csv = output_dir / "gen_seed323_full63_case_metrics.csv"
     case_rows = _read_csv(case_csv)
@@ -697,7 +750,13 @@ def _build_ml_selected_feature_rows(
                 continue
             cols = tuple(sorted(selected_indices + [idx]))
             if cols not in cache_loss:
-                cache_loss[cols] = _subset_cv_mae(X, y, list(cols), random_state=random_state)
+                cache_loss[cols] = _subset_cv_score(
+                    X,
+                    y,
+                    list(cols),
+                    random_state=random_state,
+                    selector_objective=selector_objective,
+                )
             loss = cache_loss[cols]
             if loss < best_loss:
                 best_loss = loss
@@ -750,7 +809,7 @@ def _build_ml_selected_feature_rows(
                 "selected": 1 if key in selected_key else 0,
                 "selected_rank": rank_lookup.get(key, ""),
                 "abs_corr": _safe_float(r.get("abs_corr")),
-                "cv_mae_if_selected": _safe_float(loss_lookup.get(key)),
+                "cv_obj_if_selected": _safe_float(loss_lookup.get(key)),
                 "support": int(_safe_float(r.get("support"), default=0)),
             }
         )
@@ -902,6 +961,7 @@ def _selector_cv_score_from_feature_rows(
     feature_rows: list[dict[str, Any]],
     train_base: list[dict[str, Any]],
     random_state: int,
+    selector_objective: str = "mae",
 ) -> float:
     feature_map = {str(r.get("program_id", "")): r for r in feature_rows}
     train_rows = [
@@ -939,17 +999,33 @@ def _selector_cv_score_from_feature_rows(
         ),
     ]
     errs: list[float] = []
+    corrs: list[float] = []
     for tr_idx, te_idx in kf.split(X):
         for build in model_builders:
             try:
                 m = build()
-                m.fit(X[tr_idx], y[tr_idx])
-                pred = m.predict(X[te_idx])
+                pred = _predict_model_with_objective(
+                    m,
+                    X[tr_idx],
+                    y[tr_idx],
+                    X[te_idx],
+                    objective=selector_objective,
+                )
             except Exception:
                 return float("inf")
-            for p, t in zip(pred, y[te_idx]):
-                if not (math.isnan(float(p)) or math.isnan(float(t))):
-                    errs.append(abs(float(p) - float(t)))
+            if selector_objective == "corr":
+                c = _pearson_corr([float(v) for v in y[te_idx]], [float(v) for v in pred])
+                if math.isnan(c):
+                    return float("inf")
+                corrs.append(float(c))
+            else:
+                for p, t in zip(pred, y[te_idx]):
+                    if not (math.isnan(float(p)) or math.isnan(float(t))):
+                        errs.append(abs(float(p) - float(t)))
+    if selector_objective == "corr":
+        if not corrs:
+            return float("inf")
+        return float(1.0 - np.mean(corrs))
     if not errs:
         return float("inf")
     return float(np.mean(errs))
@@ -962,7 +1038,11 @@ def _feature_columns(rows: list[dict[str, Any]]) -> list[str]:
     return sorted(c for c in all_cols if c.startswith("sel_"))
 
 
-def _iterative_eval(rows: list[dict[str, Any]], random_state: int) -> list[dict[str, Any]]:
+def _iterative_eval(
+    rows: list[dict[str, Any]],
+    random_state: int,
+    model_objective: str = "mae",
+) -> list[dict[str, Any]]:
     rows = sorted(rows, key=_order_key)
     feature_cols = _feature_columns(rows)
     model_defs = _models(random_state)
@@ -985,8 +1065,15 @@ def _iterative_eval(rows: list[dict[str, Any]], random_state: int) -> list[dict[
             pred = float("nan")
             err_msg = ""
             try:
-                model.fit(x_train, y_train)
-                pred = float(model.predict(x_test)[0])
+                pred = float(
+                    _predict_model_with_objective(
+                        model,
+                        x_train,
+                        y_train,
+                        x_test,
+                        objective=model_objective,
+                    )[0]
+                )
             except Exception as exc:
                 err_msg = str(exc)
             model_gap = abs(pred - y_actual) if not (math.isnan(pred) or math.isnan(y_actual)) else float("nan")
@@ -1009,6 +1096,7 @@ def _iterative_eval(rows: list[dict[str, Any]], random_state: int) -> list[dict[
                     "predicted_full_score_piecewise": pred,
                     "model_gap_abs": model_gap,
                     "gap_reduction_abs": gap_reduction,
+                    "model_objective": model_objective,
                     "error": err_msg,
                 }
             )
@@ -1021,6 +1109,8 @@ def _iterative_eval_ml_rolling(
     top_k: int,
     random_state: int,
     selector_mode: str = "corr",
+    selector_objective: str = "mae",
+    model_objective: str = "mae",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows = sorted(rows, key=_order_key)
     model_defs = _models(random_state)
@@ -1043,6 +1133,7 @@ def _iterative_eval_ml_rolling(
                     selection_rows=train_base,
                     top_k=top_k,
                     random_state=random_state,
+                    selector_objective=selector_objective,
                 )
             if selector == "ml_importance":
                 return _build_ml_importance_selected_feature_rows(
@@ -1069,6 +1160,7 @@ def _iterative_eval_ml_rolling(
                     feature_rows=rows_c,
                     train_base=train_base,
                     random_state=random_state,
+                    selector_objective=selector_objective,
                 )
                 scored.append((score_c, cand, rows_c, sel_c))
             scored.sort(key=lambda t: (t[0], t[1]))
@@ -1107,8 +1199,15 @@ def _iterative_eval_ml_rolling(
             pred = float("nan")
             err_msg = ""
             try:
-                model.fit(x_train, y_train)
-                pred = float(model.predict(x_test)[0])
+                pred = float(
+                    _predict_model_with_objective(
+                        model,
+                        x_train,
+                        y_train,
+                        x_test,
+                        objective=model_objective,
+                    )[0]
+                )
             except Exception as exc:
                 err_msg = str(exc)
             model_gap = (
@@ -1136,6 +1235,7 @@ def _iterative_eval_ml_rolling(
                     "model_gap_abs": model_gap,
                     "gap_reduction_abs": gap_reduction,
                     "selector_mode": chosen_mode,
+                    "model_objective": model_objective,
                     "error": err_msg,
                 }
             )
@@ -1150,8 +1250,8 @@ def _iterative_eval_ml_rolling(
             criterion_value = _safe_float(s.get("abs_corr"))
             criterion_name = "abs_corr"
             if math.isnan(criterion_value):
-                criterion_value = _safe_float(s.get("cv_mae_if_selected"))
-                criterion_name = "cv_mae_if_selected"
+                criterion_value = _safe_float(s.get("cv_obj_if_selected"))
+                criterion_name = "cv_obj_if_selected"
             selected_rows.append(
                 {
                     "k_index": k + 1,
@@ -1456,23 +1556,119 @@ def _warmup_summary(records: list[dict[str, Any]], warmups: list[int]) -> list[d
 
 
 def _selector_compare_summary(
-    selector_records: dict[str, list[dict[str, Any]]],
+    selector_records: dict[str, dict[str, list[dict[str, Any]]]],
     warmups: list[int],
 ) -> list[dict[str, Any]]:
+    if not warmups:
+        warmups = [0, 2, 6, 10]
+    warmups = sorted(set(warmups))
+    if warmups[0] != 0:
+        warmups = [0] + warmups
+
     rows_out: list[dict[str, Any]] = []
-    for selector_name, recs in selector_records.items():
-        warm = _warmup_summary(recs, warmups)
-        for r in warm:
-            rows_out.append(
-                {
-                    "selector": selector_name,
-                    "warmup_kmin": int(_safe_float(r.get("warmup_kmin"), default=0)),
-                    "method": str(r.get("method", "")),
-                    "mean_abs_diff": _safe_float(r.get("mean_abs_diff")),
-                    "std_abs_diff": _safe_float(r.get("std_abs_diff")),
-                    "count": int(_safe_float(r.get("count"), default=0)),
-                }
-            )
+
+    def _extract_series(records: list[dict[str, Any]]):
+        model_names = sorted({str(r.get("model", "")) for r in records if str(r.get("model", ""))})
+        k_vals = sorted({int(_safe_float(r.get("k_index"), default=-1)) for r in records if int(_safe_float(r.get("k_index"), default=-1)) >= 0})
+        selected: list[float] = []
+        actual: list[float] = []
+        pred_by_model: dict[str, list[float]] = {m: [] for m in model_names}
+        gap_by_model: dict[str, list[float]] = {m: [] for m in model_names}
+        for k in k_vals:
+            rows_k = [r for r in records if int(_safe_float(r.get("k_index"), default=-1)) == k]
+            selected.append(next((_safe_float(r.get("selected_score_piecewise")) for r in rows_k), float("nan")))
+            actual.append(next((_safe_float(r.get("actual_full_score_piecewise")) for r in rows_k), float("nan")))
+            for m in model_names:
+                row = next((r for r in rows_k if str(r.get("model", "")) == m), None)
+                pred_by_model[m].append(_safe_float(row.get("predicted_full_score_piecewise")) if row else float("nan"))
+                gap_by_model[m].append(_safe_float(row.get("model_gap_abs")) if row else float("nan"))
+        return model_names, k_vals, selected, actual, pred_by_model, gap_by_model
+
+    def _mean_abs_after(vals: list[float], k_vals: list[int], kmin: int) -> tuple[float, int]:
+        picked = [v for i, v in enumerate(vals) if i < len(k_vals) and k_vals[i] >= kmin and not math.isnan(v)]
+        if not picked:
+            return float("nan"), 0
+        return float(np.mean(picked)), len(picked)
+
+    def _corr_after(y_true: list[float], y_pred: list[float], k_vals: list[int], kmin: int) -> tuple[float, int]:
+        n = min(len(y_true), len(y_pred), len(k_vals))
+        yt: list[float] = []
+        yp: list[float] = []
+        for i in range(n):
+            if k_vals[i] < kmin:
+                continue
+            tv = y_true[i]
+            pv = y_pred[i]
+            if math.isnan(tv) or math.isnan(pv):
+                continue
+            yt.append(tv)
+            yp.append(pv)
+        if len(yt) < 2:
+            return float("nan"), len(yt)
+        return _pearson_corr(yt, yp), len(yt)
+
+    for selector_name, by_obj in selector_records.items():
+        for objective_name, recs in by_obj.items():
+            if not recs:
+                continue
+            model_names, k_vals, selected, actual, pred_by_model, gap_by_model = _extract_series(recs)
+            baseline_gap = [
+                abs(s - a) if not (math.isnan(s) or math.isnan(a)) else float("nan")
+                for s, a in zip(selected, actual)
+            ]
+            for w in warmups:
+                # MAE metric
+                m, c = _mean_abs_after(baseline_gap, k_vals, w)
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "mae",
+                        "warmup_kmin": w,
+                        "method": "baseline_selected",
+                        "value": m,
+                        "count": c,
+                    }
+                )
+                for model_name in model_names:
+                    m2, c2 = _mean_abs_after(gap_by_model.get(model_name, []), k_vals, w)
+                    rows_out.append(
+                        {
+                            "selector": selector_name,
+                            "objective": objective_name,
+                            "metric": "mae",
+                            "warmup_kmin": w,
+                            "method": model_name,
+                            "value": m2,
+                            "count": c2,
+                        }
+                    )
+                # Correlation metric
+                cbase, cn = _corr_after(actual, selected, k_vals, w)
+                rows_out.append(
+                    {
+                        "selector": selector_name,
+                        "objective": objective_name,
+                        "metric": "corr",
+                        "warmup_kmin": w,
+                        "method": "baseline_selected",
+                        "value": cbase,
+                        "count": cn,
+                    }
+                )
+                for model_name in model_names:
+                    cm, cmn = _corr_after(actual, pred_by_model.get(model_name, []), k_vals, w)
+                    rows_out.append(
+                        {
+                            "selector": selector_name,
+                            "objective": objective_name,
+                            "metric": "corr",
+                            "warmup_kmin": w,
+                            "method": model_name,
+                            "value": cm,
+                            "count": cmn,
+                        }
+                    )
     return rows_out
 
 
@@ -1508,7 +1704,7 @@ def _selector_metrics_by_k(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _plot_selector_triplet(
-    selector_records: dict[str, list[dict[str, Any]]],
+    selector_records: dict[str, dict[str, list[dict[str, Any]]]],
     out_pdf: Path,
     warmups: list[int],
 ) -> None:
@@ -1517,164 +1713,188 @@ def _plot_selector_triplet(
         "artifacts_selection": "Artifacts Selection",
         "corr_selection": "Correlation Selection",
     }
-    available = [s for s in selector_order if s in selector_records and selector_records[s]]
+    available = [
+        s
+        for s in selector_order
+        if s in selector_records and selector_records[s].get("mae", [])
+    ]
     if not available:
         return
 
-    fig, axes = plt.subplots(len(available), 5, figsize=(28.0, 4.4 * len(available)), squeeze=False)
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
     if warmups[0] != 0:
         warmups = [0] + warmups
 
+    fig, axes = plt.subplots(len(available), 3, figsize=(24.0, 5.8 * len(available)), squeeze=False)
+
+    title_fs = 16
+    label_fs = 14
+    tick_fs = 12
+    legend_fs = 11
+    ann_fs = 11
+
+    def _corr_after(y_true: list[float], y_pred: list[float], k_vals: list[int], kmin: int) -> float:
+        yt: list[float] = []
+        yp: list[float] = []
+        n = min(len(y_true), len(y_pred), len(k_vals))
+        for i in range(n):
+            if k_vals[i] < kmin:
+                continue
+            tv = y_true[i]
+            pv = y_pred[i]
+            if math.isnan(tv) or math.isnan(pv):
+                continue
+            yt.append(tv)
+            yp.append(pv)
+        return _pearson_corr(yt, yp)
+
+    def _mean_abs_after(values: list[float], k_vals: list[int], kmin: int) -> float:
+        picked: list[float] = []
+        n = min(len(values), len(k_vals))
+        for i in range(n):
+            if k_vals[i] < kmin:
+                continue
+            v = values[i]
+            if not math.isnan(v):
+                picked.append(v)
+        if not picked:
+            return float("nan")
+        return float(np.mean(picked))
+
     for row_idx, selector_name in enumerate(available):
-        recs = selector_records[selector_name]
-        m = _selector_metrics_by_k(recs)
-        model_names = m["models"]
-        k_vals = m["k_vals"]
-        selected_scores = m["selected_score_by_k"]
-        actual_scores = m["actual_score_by_k"]
-        gap_by_model = m["gap_by_model"]
-        pred_by_model = m["pred_by_model"]
+        by_obj = selector_records.get(selector_name, {})
+        recs_mae = by_obj.get("mae", [])
+        if not recs_mae:
+            continue
 
-        warm = _warmup_summary(recs, warmups)
-        mean_by_method = {
-            str(r["method"]): _safe_float(r["mean_abs_diff"])
-            for r in warm
-            if int(_safe_float(r.get("warmup_kmin"), default=-1)) == 0
-        }
-        best_model = min(
-            (
-                name
-                for name in model_names
-                if not math.isnan(_safe_float(mean_by_method.get(name)))
-            ),
-            key=lambda name: _safe_float(mean_by_method.get(name)),
-            default=model_names[0] if model_names else "",
-        )
+        mae_m = _selector_metrics_by_k(recs_mae)
+        mae_models = mae_m["models"]
+        color_map: dict[str, Any] = {"baseline_selected": "tab:gray"}
+        for i, model_name in enumerate(mae_models):
+            color_map[model_name] = plt.get_cmap("tab10")(i % 10)
 
-        selected_gap_by_k: list[float] = []
-        for idx in range(len(k_vals)):
-            s = selected_scores[idx] if idx < len(selected_scores) else float("nan")
-            a = actual_scores[idx] if idx < len(actual_scores) else float("nan")
-            if math.isnan(s) or math.isnan(a):
-                selected_gap = float("nan")
-            else:
-                selected_gap = abs(s - a)
-            selected_gap_by_k.append(selected_gap)
+        row_title = selector_titles.get(selector_name, selector_name)
 
-        ax_traj = axes[row_idx, 0]
-        ax_traj.plot(k_vals, selected_scores, marker="o", linewidth=1.8, color="black", label="selected")
-        ax_traj.plot(k_vals, actual_scores, marker="o", linewidth=1.8, color="tab:red", label="all-circuits")
-        if best_model:
-            ax_traj.plot(
-                k_vals,
-                pred_by_model.get(best_model, []),
-                marker="o",
-                linewidth=1.6,
-                linestyle="--",
-                color="tab:blue",
-                label=f"pred:{best_model}",
+        # Col 1: bar plot of corr(selected, global) vs warmup.
+        ax0 = axes[row_idx, 0]
+        corr_vals = [
+            _corr_after(
+                mae_m["actual_score_by_k"],
+                mae_m["selected_score_by_k"],
+                mae_m["k_vals"],
+                w,
             )
-        ax_traj.set_title(f"{selector_titles.get(selector_name, selector_name)}: Score Trajectory")
-        ax_traj.set_xlabel("k")
-        ax_traj.set_ylabel("Piecewise score")
-        ax_traj.grid(alpha=0.2)
-        ax_traj.legend(frameon=False, fontsize=8)
-
-        ax_gap = axes[row_idx, 1]
-        for name in model_names:
-            ax_gap.plot(k_vals, gap_by_model.get(name, []), marker="o", linewidth=1.4, linestyle="--", label=name)
-        ax_gap.set_title(f"{selector_titles.get(selector_name, selector_name)}: |pred-all|")
-        ax_gap.set_xlabel("k")
-        ax_gap.set_ylabel("Absolute diff")
-        ax_gap.grid(alpha=0.2)
-        ax_gap.legend(frameon=False, fontsize=8, ncol=2)
-
-        ax_corr = axes[row_idx, 2]
-        corr_labels = ["baseline"] + model_names
-        corr_vals = [_pearson_corr(actual_scores, selected_scores)]
-        corr_vals.extend(_pearson_corr(actual_scores, pred_by_model.get(name, [])) for name in model_names)
-        corr_plot_vals = [0.0 if math.isnan(v) else v for v in corr_vals]
-        bars = ax_corr.bar(
-            corr_labels,
-            corr_plot_vals,
-            color=["tab:gray"] + ["tab:blue"] * len(model_names),
+            for w in warmups
+        ]
+        x0 = np.arange(len(warmups))
+        bars0 = ax0.bar(
+            x0,
+            [0.0 if math.isnan(v) else v for v in corr_vals],
+            color="tab:blue",
             alpha=0.9,
         )
-        for b, v in zip(bars, corr_vals):
-            ax_corr.text(
+        for b, v in zip(bars0, corr_vals):
+            label = "nan" if math.isnan(v) else f"{v:.2f}"
+            h = b.get_height()
+            ax0.text(
                 b.get_x() + b.get_width() / 2.0,
-                b.get_height() + (0.02 if b.get_height() >= 0 else -0.06),
-                "nan" if math.isnan(v) else f"{v:.2f}",
+                h + (0.03 if h >= 0 else -0.06),
+                label,
                 ha="center",
-                va="bottom" if b.get_height() >= 0 else "top",
-                fontsize=7,
+                va="bottom" if h >= 0 else "top",
+                fontsize=ann_fs,
             )
-        ax_corr.set_title(f"{selector_titles.get(selector_name, selector_name)}: Corr")
-        ax_corr.set_ylabel("Pearson r")
-        ax_corr.set_ylim(-1.05, 1.05)
-        ax_corr.grid(axis="y", alpha=0.2)
-        ax_corr.tick_params(axis="x", labelrotation=25, labelsize=7)
+        ax0.set_xticks(x0)
+        ax0.set_xticklabels([str(w) for w in warmups], fontsize=tick_fs)
+        ax0.set_title(f"{row_title}: Corr(selected, global) vs Warmup", fontsize=title_fs)
+        ax0.set_xlabel("Warmup k_min", fontsize=label_fs)
+        ax0.set_ylabel("Pearson r", fontsize=label_fs)
+        ax0.set_ylim(-1.05, 1.05)
+        ax0.grid(alpha=0.2)
+        ax0.tick_params(axis="y", labelsize=tick_fs)
 
-        ax_stats = axes[row_idx, 3]
-        stat_labels = ["baseline"] + model_names
-        stat_series = [selected_gap_by_k] + [gap_by_model.get(name, []) for name in model_names]
-        stat_means: list[float] = []
-        stat_stds: list[float] = []
-        for vals in stat_series:
-            arr = np.array(vals, dtype=float)
-            arr = arr[~np.isnan(arr)]
-            if arr.size == 0:
-                stat_means.append(float("nan"))
-                stat_stds.append(float("nan"))
-            else:
-                stat_means.append(float(np.mean(arr)))
-                stat_stds.append(float(np.std(arr)))
-        bar_x = np.arange(len(stat_labels))
-        ax_stats.bar(
-            bar_x,
-            [0.0 if math.isnan(v) else v for v in stat_means],
-            yerr=[0.0 if math.isnan(v) else v for v in stat_stds],
-            capsize=3,
-            color=["tab:gray"] + ["tab:blue"] * len(model_names),
-            alpha=0.9,
+        # Col 2: original MAE-vs-warmup line plot.
+        ax1 = axes[row_idx, 1]
+        mae_baseline_gap = [
+            abs(s - a) if not (math.isnan(s) or math.isnan(a)) else float("nan")
+            for s, a in zip(mae_m["selected_score_by_k"], mae_m["actual_score_by_k"])
+        ]
+        baseline_curve = [
+            _mean_abs_after(mae_baseline_gap, mae_m["k_vals"], w)
+            for w in warmups
+        ]
+        ax1.plot(
+            warmups,
+            baseline_curve,
+            marker="o",
+            linewidth=2.4,
+            color="tab:gray",
+            label="baseline_selected",
         )
-        ax_stats.set_xticks(bar_x)
-        ax_stats.set_xticklabels(stat_labels, rotation=25, fontsize=7)
-        ax_stats.set_title(f"{selector_titles.get(selector_name, selector_name)}: Mean±Std")
-        ax_stats.set_ylabel("|method-all|")
-        ax_stats.grid(axis="y", alpha=0.2)
-
-        ax_warm = axes[row_idx, 4]
-        for method in ["baseline_selected"] + model_names:
-            ys = [
-                _safe_float(
-                    next(
-                        (
-                            r.get("mean_abs_diff")
-                            for r in warm
-                            if str(r.get("method", "")) == method
-                            and int(_safe_float(r.get("warmup_kmin"), default=-1)) == w
-                        ),
-                        float("nan"),
-                    )
-                )
+        for model_name in mae_models:
+            curve = [
+                _mean_abs_after(mae_m["gap_by_model"].get(model_name, []), mae_m["k_vals"], w)
                 for w in warmups
             ]
-            ax_warm.plot(
+            ax1.plot(
                 warmups,
-                ys,
+                curve,
                 marker="o",
-                linewidth=1.8 if method == "baseline_selected" else 1.4,
-                label=method,
+                linewidth=1.8,
+                linestyle="--",
+                color=color_map.get(model_name),
+                label=model_name,
             )
-        ax_warm.set_title(f"{selector_titles.get(selector_name, selector_name)}: Warmup")
-        ax_warm.set_xlabel("k_min")
-        ax_warm.set_ylabel("Mean |method-all|")
-        ax_warm.grid(alpha=0.2)
-        ax_warm.legend(frameon=False, fontsize=8, ncol=2)
+        ax1.set_title(f"{row_title}: MAE vs Warmup", fontsize=title_fs)
+        ax1.set_xlabel("Warmup k_min", fontsize=label_fs)
+        ax1.set_ylabel("Mean |pred - global|", fontsize=label_fs)
+        ax1.grid(alpha=0.2)
+        ax1.tick_params(axis="both", labelsize=tick_fs)
+        ax1.legend(frameon=False, fontsize=legend_fs, ncol=2, loc="best")
+
+        # Col 3: bar plot of mean |method-global| across all k (k=2,3,...)
+        ax2 = axes[row_idx, 2]
+        method_labels = ["baseline_selected"] + list(mae_models)
+        method_vals: list[float] = []
+        for method in method_labels:
+            vals = mae_baseline_gap if method == "baseline_selected" else mae_m["gap_by_model"].get(method, [])
+            arr = np.array(vals, dtype=float)
+            arr = arr[~np.isnan(arr)]
+            method_vals.append(float(np.mean(arr)) if arr.size > 0 else float("nan"))
+        x1 = np.arange(len(method_labels))
+        bars1 = ax2.bar(
+            x1,
+            [0.0 if math.isnan(v) else v for v in method_vals],
+            color=[color_map.get(m, "tab:blue") for m in method_labels],
+            alpha=0.9,
+        )
+        for b, v in zip(bars1, method_vals):
+            label = "nan" if math.isnan(v) else f"{v:.3f}"
+            ax2.text(
+                b.get_x() + b.get_width() / 2.0,
+                b.get_height() + 0.01,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=ann_fs,
+            )
+        ax2.set_xticks(x1)
+        ax2.set_xticklabels(method_labels, rotation=20, fontsize=tick_fs)
+        ax2.set_title(f"{row_title}: Mean |method-global| Across All k", fontsize=title_fs)
+        ax2.set_xlabel("Method (MAE-trained predictors)", fontsize=label_fs)
+        ax2.set_ylabel("Mean absolute diff", fontsize=label_fs)
+        ax2.grid(axis="y", alpha=0.2)
+        ax2.tick_params(axis="y", labelsize=tick_fs)
+        ax2.legend(
+            bars1,
+            method_labels,
+            frameon=False,
+            fontsize=legend_fs,
+            ncol=2,
+            loc="best",
+        )
 
     fig.tight_layout()
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -1811,6 +2031,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ml-selector-objective",
+        default="mae",
+        choices=["mae", "corr"],
+        help=(
+            "When ml_greedy_cv/auto is used: objective for selector search. "
+            "'mae' minimizes CV MAE; 'corr' maximizes CV Pearson correlation."
+        ),
+    )
+    parser.add_argument(
         "--min-full-cases",
         type=int,
         default=63,
@@ -1899,6 +2128,7 @@ def main() -> None:
         f"(min_full_cases={args.min_full_cases}, include_failed={args.include_failed}, "
         f"selection_mode={args.selection_mode}, "
         f"ml_selector_variant={args.ml_selector_variant}, "
+        f"ml_selector_objective={args.ml_selector_objective}, "
         f"selected_filled={n_filled}, selected_unfilled={n_failed}, "
         f"skipped_migrant_no_artifacts={n_skipped_migrant_no_artifacts})"
     )
@@ -1925,20 +2155,27 @@ def main() -> None:
             top_k=args.ml_selected_cases,
             random_state=args.seed,
             selector_mode=args.ml_selector_variant,
+            selector_objective=args.ml_selector_objective,
+            model_objective="mae",
         )
         recs = recs_main
         if args.compare_selectors:
-            recs_corr, _ = _iterative_eval_ml_rolling(
+            warmups = _parse_int_list(args.warmups)
+            compare_records: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+            recs_corr_mae, _ = _iterative_eval_ml_rolling(
                 filtered,
                 output_dir=output_dir,
                 top_k=args.ml_selected_cases,
                 random_state=args.seed,
                 selector_mode="corr",
+                selector_objective=args.ml_selector_objective,
+                model_objective="mae",
             )
-            warmups = _parse_int_list(args.warmups)
-            compare_records: dict[str, list[dict[str, Any]]] = {
-                "corr_selection": recs_corr,
+            compare_records["corr_selection"] = {
+                "mae": recs_corr_mae,
             }
+
             # Artifacts selection can be unavailable if program artifacts are missing.
             artifacts_feature_rows, _, _, _ = _build_selected_feature_rows(rows, output_dir, program_dir)
             artifacts_filtered = []
@@ -1951,8 +2188,14 @@ def main() -> None:
                     continue
                 artifacts_filtered.append(row)
             if len(artifacts_filtered) >= 2:
-                recs_artifacts = _iterative_eval(artifacts_filtered, random_state=args.seed)
-                compare_records["artifacts_selection"] = recs_artifacts
+                recs_artifacts_mae = _iterative_eval(
+                    artifacts_filtered,
+                    random_state=args.seed,
+                    model_objective="mae",
+                )
+                compare_records["artifacts_selection"] = {
+                    "mae": recs_artifacts_mae,
+                }
 
             compare_summary_rows = _selector_compare_summary(compare_records, warmups)
             compare_csv = output_dir / f"iterative_gap_reduction_{args.tag}_selector_compare.csv"
@@ -1961,7 +2204,7 @@ def main() -> None:
             _write_csv(
                 compare_csv,
                 compare_summary_rows,
-                ["selector", "warmup_kmin", "method", "mean_abs_diff", "std_abs_diff", "count"],
+                ["selector", "objective", "metric", "warmup_kmin", "method", "value", "count"],
             )
     else:
         recs = _iterative_eval(filtered, random_state=args.seed)
@@ -1983,6 +2226,7 @@ def main() -> None:
             "model_gap_abs",
             "gap_reduction_abs",
             "selector_mode",
+            "model_objective",
             "error",
         ],
     )
