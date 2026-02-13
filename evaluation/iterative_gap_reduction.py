@@ -1569,8 +1569,6 @@ def _plot(records: list[dict[str, Any]], out_pdf: Path, warmups: list[int]) -> N
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
-    if warmups[0] != 0:
-        warmups = [0] + warmups
 
     def _mean_after_warmup(values: list[float], kmin: int) -> float:
         picked: list[float] = []
@@ -1605,8 +1603,6 @@ def _warmup_summary(records: list[dict[str, Any]], warmups: list[int]) -> list[d
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
-    if warmups[0] != 0:
-        warmups = [0] + warmups
 
     model_names = sorted({str(r["model"]) for r in records})
     k_vals = sorted({int(r["k_index"]) for r in records})
@@ -1673,8 +1669,6 @@ def _selector_compare_summary(
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
-    if warmups[0] != 0:
-        warmups = [0] + warmups
 
     rows_out: list[dict[str, Any]] = []
 
@@ -1927,6 +1921,10 @@ def _plot_selector_triplet(
     selector_records: dict[str, dict[str, list[dict[str, Any]]]],
     out_pdf: Path,
     warmups: list[int],
+    selector_base_rows: dict[str, list[dict[str, Any]]],
+    output_dir: Path,
+    ml_selected_cases: int,
+    random_state: int,
 ) -> None:
     selector_order = ["artifacts_selection", "corr_selection"]
     selector_titles = {
@@ -1944,10 +1942,8 @@ def _plot_selector_triplet(
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
-    if warmups[0] != 0:
-        warmups = [0] + warmups
 
-    fig, axes = plt.subplots(len(available), 4, figsize=(31.0, 5.8 * len(available)), squeeze=False)
+    fig, axes = plt.subplots(len(available), 5, figsize=(39.0, 5.8 * len(available)), squeeze=False)
 
     title_fs = 16
     label_fs = 14
@@ -1982,6 +1978,99 @@ def _plot_selector_triplet(
         if not picked:
             return float("nan")
         return float(np.mean(picked))
+
+    def _frozen_mae_curves(selector_name: str) -> dict[str, list[float]]:
+        base_rows = sorted(selector_base_rows.get(selector_name, []), key=_order_key)
+        if not base_rows:
+            return {}
+
+        model_defs = {name: model for name, model in _models(random_state)}
+        model_names = sorted(model_defs.keys())
+        curves: dict[str, list[float]] = {"baseline_selected": []}
+        for name in model_names:
+            curves[name] = []
+
+        n_all = len(base_rows)
+        for w in warmups:
+            anchor_k = max(2, int(w))
+            train_size = anchor_k - 1
+            if train_size < 1:
+                train_size = 1
+            if train_size >= n_all:
+                curves["baseline_selected"].append(float("nan"))
+                for name in model_names:
+                    curves[name].append(float("nan"))
+                continue
+
+            if selector_name == "corr_selection":
+                feature_rows, _, _, _ = _build_corr_selected_feature_rows(
+                    rows=base_rows,
+                    output_dir=output_dir,
+                    selection_rows=base_rows[:train_size],
+                    top_k=ml_selected_cases,
+                )
+                feature_rows = sorted(feature_rows, key=_order_key)
+            else:
+                feature_rows = base_rows
+
+            train_rows = feature_rows[:train_size]
+            test_rows = feature_rows[train_size:]
+            if not train_rows or not test_rows:
+                curves["baseline_selected"].append(float("nan"))
+                for name in model_names:
+                    curves[name].append(float("nan"))
+                continue
+
+            baseline_diffs: list[float] = []
+            for r in test_rows:
+                y_actual = _safe_float(r.get("full_score_piecewise"))
+                y_selected = _safe_float(r.get("selected_score_piecewise"))
+                if math.isnan(y_actual) or math.isnan(y_selected):
+                    continue
+                baseline_diffs.append(abs(y_selected - y_actual))
+            curves["baseline_selected"].append(
+                float(np.mean(baseline_diffs)) if baseline_diffs else float("nan")
+            )
+
+            feature_cols = _feature_columns(train_rows + test_rows)
+            if not feature_cols:
+                for name in model_names:
+                    curves[name].append(float("nan"))
+                continue
+
+            x_train = np.array(
+                [[_safe_float(r.get(c)) for c in feature_cols] for r in train_rows],
+                dtype=float,
+            )
+            y_train = np.array(
+                [_safe_float(r.get("full_score_piecewise")) for r in train_rows],
+                dtype=float,
+            )
+            x_test = np.array(
+                [[_safe_float(r.get(c)) for c in feature_cols] for r in test_rows],
+                dtype=float,
+            )
+            y_test = np.array(
+                [_safe_float(r.get("full_score_piecewise")) for r in test_rows],
+                dtype=float,
+            )
+
+            for name in model_names:
+                try:
+                    model = model_defs[name]
+                    pred, _, _ = _predict_model_with_objective_timed(
+                        model=model,
+                        x_train=x_train,
+                        y_train=y_train,
+                        x_test=x_test,
+                        objective="mae",
+                    )
+                    diffs = np.abs(pred - y_test)
+                    diffs = diffs[~np.isnan(diffs)]
+                    curves[name].append(float(np.mean(diffs)) if diffs.size > 0 else float("nan"))
+                except Exception:
+                    curves[name].append(float("nan"))
+        return curves
 
     for row_idx, selector_name in enumerate(available):
         by_obj = selector_records.get(selector_name, {})
@@ -2198,6 +2287,35 @@ def _plot_selector_triplet(
         ax3.grid(axis="y", alpha=0.2)
         ax3.tick_params(axis="y", labelsize=tick_fs)
 
+        # Col 5: frozen-at-k behavior (train once at k, test on all >=k).
+        ax4 = axes[row_idx, 4]
+        frozen_curves = _frozen_mae_curves(selector_name)
+        if frozen_curves:
+            ax4.plot(
+                warmups,
+                frozen_curves.get("baseline_selected", [float("nan")] * len(warmups)),
+                marker="o",
+                linewidth=2.4,
+                color="tab:gray",
+                label="baseline_selected",
+            )
+            for model_name in mae_models:
+                ax4.plot(
+                    warmups,
+                    frozen_curves.get(model_name, [float("nan")] * len(warmups)),
+                    marker="o",
+                    linewidth=1.8,
+                    linestyle="--",
+                    color=color_map.get(model_name),
+                    label=model_name,
+                )
+        ax4.set_title(f"{row_title}: Frozen @k MAE vs Warmup", fontsize=title_fs)
+        ax4.set_xlabel("Warmup k_min", fontsize=label_fs)
+        ax4.set_ylabel("Mean |pred - global|", fontsize=label_fs)
+        ax4.grid(alpha=0.2)
+        ax4.tick_params(axis="both", labelsize=tick_fs)
+        ax4.legend(frameon=False, fontsize=legend_fs, ncol=2, loc="best")
+
     fig.tight_layout()
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_pdf)
@@ -2256,8 +2374,6 @@ def _plot_selector_compare(
     if not warmups:
         warmups = [0, 2, 6, 10]
     warmups = sorted(set(warmups))
-    if warmups[0] != 0:
-        warmups = [0] + warmups
 
     # Show best method under each selector across warmups.
     corr_best = []
@@ -2464,6 +2580,9 @@ def main() -> None:
         if args.compare_selectors:
             warmups = _parse_int_list(args.warmups)
             compare_records: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            selector_base_rows: dict[str, list[dict[str, Any]]] = {
+                "corr_selection": list(filtered),
+            }
 
             recs_corr_mae, _ = _iterative_eval_ml_rolling(
                 filtered,
@@ -2498,10 +2617,19 @@ def main() -> None:
                 compare_records["artifacts_selection"] = {
                     "mae": recs_artifacts_mae,
                 }
+                selector_base_rows["artifacts_selection"] = list(artifacts_filtered)
 
             compare_summary_rows = _selector_compare_summary(compare_records, warmups)
             compare_csv = output_dir / f"iterative_gap_reduction_{args.tag}_selector_compare.csv"
-            _plot_selector_triplet(compare_records, out_pdf, warmups)
+            _plot_selector_triplet(
+                compare_records,
+                out_pdf,
+                warmups,
+                selector_base_rows=selector_base_rows,
+                output_dir=output_dir,
+                ml_selected_cases=args.ml_selected_cases,
+                random_state=args.seed,
+            )
             used_selector_compare_figure = True
             _write_csv(
                 compare_csv,
