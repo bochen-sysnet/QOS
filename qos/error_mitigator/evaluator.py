@@ -26,7 +26,6 @@ from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
 logging.getLogger("qiskit").setLevel(logging.WARNING)
@@ -46,6 +45,23 @@ _SURROGATE_FEATURE_COLUMNS = [
     "sample_avg_run_time",
     "sample_combined_score_raw",
 ]
+
+
+def _pearson_corr(xs: list[float], ys: list[float]) -> float:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return float("nan")
+    x_arr = [float(v) for v in xs]
+    y_arr = [float(v) for v in ys]
+    x_mean = sum(x_arr) / len(x_arr)
+    y_mean = sum(y_arr) / len(y_arr)
+    x_centered = [v - x_mean for v in x_arr]
+    y_centered = [v - y_mean for v in y_arr]
+    num = sum(a * b for a, b in zip(x_centered, y_centered))
+    den_x = sum(a * a for a in x_centered) ** 0.5
+    den_y = sum(b * b for b in y_centered) ** 0.5
+    if den_x <= 1e-12 or den_y <= 1e-12:
+        return float("nan")
+    return num / (den_x * den_y)
 
 def _is_eval_verbose() -> bool:
     raw = os.getenv("QOS_EVAL_VERBOSE", os.getenv("QOS_VERBOSE", ""))
@@ -91,6 +107,10 @@ def _surrogate_meta_json(csv_path: Path) -> Path:
     if raw:
         return Path(raw)
     return csv_path.with_suffix(csv_path.suffix + ".meta.json")
+
+
+def _surrogate_cases_csv(state_csv: Path) -> Path:
+    return state_csv.with_suffix(state_csv.suffix + ".cases.csv")
 
 
 def _program_hash(program_path: str) -> str:
@@ -159,7 +179,46 @@ def _append_surrogate_row(csv_path: Path, row: dict) -> None:
         lock.close()
 
 
+def _append_surrogate_case_rows(csv_path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    lock = _with_file_lock(csv_path.with_suffix(csv_path.suffix + ".lock"))
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = csv_path.exists()
+        fields = [
+            "program_hash",
+            "timestamp_sec",
+            "bench",
+            "size",
+            "depth_ratio",
+            "cnot_ratio",
+            "time_ratio",
+            "overhead_ratio",
+            "case_score_piecewise",
+            "case_score_legacy",
+            "global_combined_score",
+            "score_mode",
+        ]
+        with csv_path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not file_exists:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fields})
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
 def _load_surrogate_rows(csv_path: Path) -> list[dict]:
+    if not csv_path.exists():
+        return []
+    with csv_path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _load_surrogate_case_rows(csv_path: Path) -> list[dict]:
     if not csv_path.exists():
         return []
     with csv_path.open(newline="") as f:
@@ -175,10 +234,10 @@ def _safe_float(value, default=float("nan")):
         return default
 
 
-def _fit_surrogate_models(rows: list[dict], ml_model_name: str):
+def _fit_surrogate_model(rows: list[dict], ml_model_name: str):
     labeled = [r for r in rows if not (str(r.get("global_combined_score", "")).strip() in {"", "nan"})]
     if len(labeled) < _surrogate_min_train_rows():
-        return None, None, len(labeled)
+        return None, len(labeled)
 
     x = []
     y = []
@@ -192,10 +251,7 @@ def _fit_surrogate_models(rows: list[dict], ml_model_name: str):
         x.append(feat)
         y.append(target)
     if len(x) < _surrogate_min_train_rows():
-        return None, None, len(x)
-
-    corr_model = LinearRegression()
-    corr_model.fit([[row[4]] for row in x], y)  # use raw sampled score only
+        return None, len(x)
 
     if ml_model_name == "random_forest":
         est = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
@@ -208,28 +264,199 @@ def _fit_surrogate_models(rows: list[dict], ml_model_name: str):
         ]
     )
     ml_model.fit(x, y)
-    return corr_model, ml_model, len(x)
+    return ml_model, len(x)
 
 
-def _predict_surrogate_scores(
-    corr_model, ml_model, sample_features: dict
-) -> tuple[float, float]:
+def _predict_surrogate_score(
+    ml_model, sample_features: dict
+) -> float:
     feat = [_safe_float(sample_features.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
     if any(v != v for v in feat):
-        return float("nan"), float("nan")
-    pred_corr = float("nan")
-    pred_ml = float("nan")
-    try:
-        if corr_model is not None:
-            pred_corr = float(corr_model.predict([[feat[4]]])[0])
-    except Exception:
-        pred_corr = float("nan")
+        return float("nan")
     try:
         if ml_model is not None:
-            pred_ml = float(ml_model.predict([feat])[0])
+            return float(ml_model.predict([feat])[0])
     except Exception:
-        pred_ml = float("nan")
-    return pred_corr, pred_ml
+        return float("nan")
+    return float("nan")
+
+
+def _dedupe_surrogate_rows_latest(rows: list[dict]) -> list[dict]:
+    latest_labeled: dict[str, dict] = {}
+    latest_labeled_ts: dict[str, float] = {}
+    latest_any: dict[str, dict] = {}
+    latest_any_ts: dict[str, float] = {}
+    for r in rows:
+        pid = str(r.get("program_hash", "")).strip()
+        if not pid:
+            continue
+        ts = _safe_float(r.get("timestamp_sec"), default=0.0)
+        if pid not in latest_any or ts >= latest_any_ts.get(pid, float("-inf")):
+            latest_any[pid] = r
+            latest_any_ts[pid] = ts
+        labeled = not str(r.get("global_combined_score", "")).strip() in {"", "nan"}
+        if labeled and (pid not in latest_labeled or ts >= latest_labeled_ts.get(pid, float("-inf"))):
+            latest_labeled[pid] = r
+            latest_labeled_ts[pid] = ts
+    out = []
+    for pid in latest_any:
+        out.append(latest_labeled.get(pid, latest_any[pid]))
+    return out
+
+
+def _dedupe_case_rows_latest(rows: list[dict]) -> list[dict]:
+    latest: dict[tuple[str, str, int], dict] = {}
+    latest_ts: dict[tuple[str, str, int], float] = {}
+    for r in rows:
+        pid = str(r.get("program_hash", "")).strip()
+        bench = str(r.get("bench", "")).strip()
+        if not pid or not bench:
+            continue
+        try:
+            size = int(float(r.get("size", "nan")))
+        except Exception:
+            continue
+        key = (pid, bench, size)
+        ts = _safe_float(r.get("timestamp_sec"), default=0.0)
+        if key not in latest or ts >= latest_ts.get(key, float("-inf")):
+            latest[key] = r
+            latest_ts[key] = ts
+    return list(latest.values())
+
+
+def _sample_pairs_target_count(benches: list[str]) -> int:
+    samples_per_bench = int(os.getenv("QOSE_SAMPLES_PER_BENCH", "1"))
+    if samples_per_bench <= 0:
+        raise ValueError("QOSE_SAMPLES_PER_BENCH must be >= 1")
+    return max(1, len(benches) * samples_per_bench)
+
+
+def _select_bench_size_pairs_by_correlation(
+    benches: list[str],
+    candidate_pairs: list[tuple[str, int]],
+    state_rows: list[dict],
+    case_rows: list[dict],
+) -> tuple[list[tuple[str, int]], list[dict]]:
+    target_k = _sample_pairs_target_count(benches)
+    labeled = [
+        r
+        for r in _dedupe_surrogate_rows_latest(state_rows)
+        if not str(r.get("global_combined_score", "")).strip() in {"", "nan"}
+    ]
+    if len(labeled) < _surrogate_min_train_rows():
+        return [], []
+
+    y_by_program: dict[str, float] = {}
+    for r in labeled:
+        pid = str(r.get("program_hash", "")).strip()
+        y = _safe_float(r.get("global_combined_score"))
+        if pid and y == y:
+            y_by_program[pid] = y
+    if len(y_by_program) < _surrogate_min_train_rows():
+        return [], []
+
+    pair_pid_score: dict[tuple[str, int], dict[str, float]] = {}
+    score_col = "case_score_piecewise" if _score_mode() == _SCORE_MODE_PIECEWISE else "case_score_legacy"
+    for r in _dedupe_case_rows_latest(case_rows):
+        pid = str(r.get("program_hash", "")).strip()
+        bench = str(r.get("bench", "")).strip()
+        try:
+            size = int(float(r.get("size", "nan")))
+        except Exception:
+            continue
+        if pid not in y_by_program:
+            continue
+        x = _safe_float(r.get(score_col))
+        if x != x:
+            continue
+        pair_pid_score.setdefault((bench, size), {})[pid] = x
+
+    ranking = []
+    candidate_set = set(candidate_pairs)
+    for pair in candidate_pairs:
+        pid_to_score = pair_pid_score.get(pair, {})
+        xs = []
+        ys = []
+        for pid, y in y_by_program.items():
+            x = pid_to_score.get(pid)
+            if x is None:
+                continue
+            xs.append(float(x))
+            ys.append(float(y))
+        corr = _pearson_corr(xs, ys)
+        ranking.append(
+            {
+                "bench": pair[0],
+                "size": pair[1],
+                "corr": corr,
+                "abs_corr": abs(corr) if corr == corr else float("nan"),
+                "support": len(xs),
+            }
+        )
+
+    ranking.sort(
+        key=lambda r: (
+            -_safe_float(r.get("abs_corr"), default=-1.0),
+            -int(_safe_float(r.get("support"), default=0)),
+            str(r.get("bench", "")),
+            int(_safe_float(r.get("size"), default=0)),
+        )
+    )
+    selected = []
+    for row in ranking:
+        pair = (str(row["bench"]), int(row["size"]))
+        if pair in candidate_set:
+            selected.append(pair)
+        if len(selected) >= target_k:
+            break
+    return selected, ranking
+
+
+def _build_surrogate_case_rows(
+    program_hash: str,
+    timestamp_sec: float,
+    cases: list[dict],
+    global_combined_score,
+    score_mode: str,
+) -> list[dict]:
+    out = []
+    for case in cases:
+        qos_depth = _safe_float(case.get("qos_depth"))
+        qose_depth = _safe_float(case.get("qose_depth"))
+        qos_cnot = _safe_float(case.get("qos_cnot"))
+        qose_cnot = _safe_float(case.get("qose_cnot"))
+        qos_time = _safe_float(case.get("qos_run_sec"))
+        qose_time = _safe_float(case.get("qose_run_sec"))
+        qos_over = _safe_float(case.get("qos_num_circuits"))
+        qose_over = _safe_float(case.get("qose_num_circuits"))
+        if any(v != v for v in [qos_depth, qose_depth, qos_cnot, qose_cnot, qos_time, qose_time, qos_over, qose_over]):
+            continue
+        depth_ratio = _safe_ratio(qose_depth, qos_depth)
+        cnot_ratio = _safe_ratio(qose_cnot, qos_cnot)
+        time_ratio = _safe_ratio(qose_time, qos_time)
+        overhead_ratio = _safe_ratio(qose_over, qos_over)
+        struct_delta = 1.0 - ((depth_ratio + cnot_ratio) / 2.0)
+        time_delta = 1.0 - time_ratio
+        struct_term = struct_delta if struct_delta >= 0 else 8.0 * struct_delta
+        case_piecewise = struct_term + time_delta
+        case_legacy = -(depth_ratio + cnot_ratio + overhead_ratio + time_ratio)
+        out.append(
+            {
+                "program_hash": program_hash,
+                "timestamp_sec": timestamp_sec,
+                "bench": str(case.get("bench", "")),
+                "size": int(_safe_float(case.get("size"), default=0)),
+                "depth_ratio": depth_ratio,
+                "cnot_ratio": cnot_ratio,
+                "time_ratio": time_ratio,
+                "overhead_ratio": overhead_ratio,
+                "case_score_piecewise": case_piecewise,
+                "case_score_legacy": case_legacy,
+                "global_combined_score": global_combined_score,
+                "score_mode": score_mode,
+            }
+        )
+    return out
 
 logger.setLevel(logging.INFO if _is_eval_verbose() else logging.WARNING)
 
@@ -656,8 +883,47 @@ def _evaluate_impl(program_path):
     if unknown:
         return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
 
+    surrogate_enabled = _surrogate_enabled()
+    surrogate_warmup_iters = _surrogate_warmup_iters()
+    surrogate_model_name = _surrogate_ml_model_name()
+    state_csv = _surrogate_state_csv()
+    meta_json = _surrogate_meta_json(state_csv)
+    cases_csv = _surrogate_cases_csv(state_csv)
+    program_hash = _program_hash(program_path)
+
+    size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
+    size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
+    candidate_pairs = _collect_candidate_pairs(benches, size_min, size_max)
+    if not candidate_pairs:
+        return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
+
+    corr_selection_used = False
+    corr_selection_support = 0
+    corr_selection_top_abs_corr = float("nan")
+    corr_ranking = []
+
     try:
-        sample_pairs = _select_bench_size_pairs(args, benches)
+        sample_pairs: list[tuple[str, int]] = []
+        if surrogate_enabled:
+            state_rows = _load_surrogate_rows(state_csv)
+            case_rows = _load_surrogate_case_rows(cases_csv)
+            sample_pairs, corr_ranking = _select_bench_size_pairs_by_correlation(
+                benches=benches,
+                candidate_pairs=candidate_pairs,
+                state_rows=state_rows,
+                case_rows=case_rows,
+            )
+            if sample_pairs:
+                corr_selection_used = True
+                if corr_ranking:
+                    corr_selection_support = int(
+                        _safe_float(corr_ranking[0].get("support"), default=0)
+                    )
+                    corr_selection_top_abs_corr = _safe_float(
+                        corr_ranking[0].get("abs_corr")
+                    )
+        if not sample_pairs:
+            sample_pairs = _select_bench_size_pairs(args, benches)
     except ValueError as exc:
         return {"combined_score": -1000.0}, {"info": str(exc)}
     if not sample_pairs:
@@ -684,22 +950,15 @@ def _evaluate_impl(program_path):
         "sample_combined_score_raw": sample_combined_raw,
     }
 
-    surrogate_enabled = _surrogate_enabled()
-    surrogate_warmup_iters = _surrogate_warmup_iters()
-    surrogate_model_name = _surrogate_ml_model_name()
-    state_csv = _surrogate_state_csv()
-    meta_json = _surrogate_meta_json(state_csv)
-    program_hash = _program_hash(program_path)
-
     full_eval_claimed = False
     full_eval_claim_index = 0
     global_combined_score = float("nan")
     global_num_cases = 0
     surrogate_source = "sample_raw"
-    predicted_corr = float("nan")
     predicted_ml = float("nan")
     surrogate_train_rows = 0
     full_eval_error = ""
+    timestamp_sec = time.time()
 
     if surrogate_enabled:
         full_eval_claimed, full_eval_claim_index = _claim_warmup_slot(
@@ -707,19 +966,24 @@ def _evaluate_impl(program_path):
             warmup_iters=surrogate_warmup_iters,
         )
         if full_eval_claimed:
-            size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
-            size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
-            full_pairs = _collect_candidate_pairs(benches, size_min, size_max)
-            if full_pairs:
+            if candidate_pairs:
                 full_res = _evaluate_bench_size_pairs(
                     evolved_cost_search=evolved_cost_search,
                     args=args,
-                    bench_size_pairs=full_pairs,
-                    include_cases=False,
+                    bench_size_pairs=candidate_pairs,
+                    include_cases=True,
                 )
                 if full_res.get("ok", False):
                     global_combined_score = float(full_res["combined_score_raw"])
                     global_num_cases = int(full_res.get("num_cases", 0))
+                    case_rows_to_save = _build_surrogate_case_rows(
+                        program_hash=program_hash,
+                        timestamp_sec=timestamp_sec,
+                        cases=full_res.get("cases", []),
+                        global_combined_score=global_combined_score,
+                        score_mode=score_mode,
+                    )
+                    _append_surrogate_case_rows(cases_csv, case_rows_to_save)
                 else:
                     full_eval_error = str(full_res.get("error", "Full evaluation failed"))
             else:
@@ -729,7 +993,7 @@ def _evaluate_impl(program_path):
             state_csv,
             {
                 "program_hash": program_hash,
-                "timestamp_sec": time.time(),
+                "timestamp_sec": timestamp_sec,
                 "sample_qose_depth": sample_features["sample_qose_depth"],
                 "sample_qose_cnot": sample_features["sample_qose_cnot"],
                 "sample_qose_overhead": sample_features["sample_qose_overhead"],
@@ -741,12 +1005,11 @@ def _evaluate_impl(program_path):
                 "score_mode": score_mode,
             },
         )
-        train_rows = _load_surrogate_rows(state_csv)
-        corr_model, ml_model, surrogate_train_rows = _fit_surrogate_models(
+        train_rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
+        ml_model, surrogate_train_rows = _fit_surrogate_model(
             train_rows, ml_model_name=surrogate_model_name
         )
-        predicted_corr, predicted_ml = _predict_surrogate_scores(
-            corr_model=corr_model,
+        predicted_ml = _predict_surrogate_score(
             ml_model=ml_model,
             sample_features=sample_features,
         )
@@ -757,9 +1020,6 @@ def _evaluate_impl(program_path):
     elif predicted_ml == predicted_ml:
         combined_score_final = predicted_ml
         surrogate_source = "ml_predict"
-    elif predicted_corr == predicted_corr:
-        combined_score_final = predicted_corr
-        surrogate_source = "corr_predict"
     else:
         combined_score_final = sample_combined_raw
         surrogate_source = "sample_raw"
@@ -776,8 +1036,6 @@ def _evaluate_impl(program_path):
     }
     if global_combined_score == global_combined_score:
         metrics["combined_score_global"] = float(global_combined_score)
-    if predicted_corr == predicted_corr:
-        metrics["combined_score_pred_corr"] = float(predicted_corr)
     if predicted_ml == predicted_ml:
         metrics["combined_score_pred_ml"] = float(predicted_ml)
 
@@ -799,14 +1057,22 @@ def _evaluate_impl(program_path):
         "surrogate_ml_model": surrogate_model_name,
         "surrogate_train_rows": surrogate_train_rows,
         "surrogate_state_csv": str(state_csv),
+        "surrogate_cases_csv": str(cases_csv),
         "surrogate_meta_json": str(meta_json),
         "surrogate_full_eval_claimed": full_eval_claimed,
         "surrogate_full_eval_claim_index": full_eval_claim_index,
         "surrogate_full_eval_num_cases": global_num_cases,
         "surrogate_full_eval_error": full_eval_error,
+        "sample_selection_mode": (
+            "correlation" if corr_selection_used else "seeded_random"
+        ),
+        "sample_selection_count": len(sample_pairs),
+        "sample_selection_pairs": [
+            {"bench": bench, "size": size} for bench, size in sample_pairs
+        ],
+        "sample_corr_selection_support_top": corr_selection_support,
+        "sample_corr_selection_top_abs_corr": corr_selection_top_abs_corr,
     }
-    if predicted_corr == predicted_corr:
-        artifacts["surrogate_pred_corr"] = predicted_corr
     if predicted_ml == predicted_ml:
         artifacts["surrogate_pred_ml"] = predicted_ml
     if global_combined_score == global_combined_score:
@@ -815,7 +1081,6 @@ def _evaluate_impl(program_path):
     artifacts["combined_score_used_formula"] = (
         "if global_full_eval available: use global_combined_score; "
         "else if ml model available: use ml prediction from sampled features; "
-        "else if corr model available: use corr prediction from sampled raw score; "
         "else use sampled combined_score_raw"
     )
     return _round_float_values(metrics), _round_float_values(artifacts)

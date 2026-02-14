@@ -99,9 +99,10 @@ prompt:
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize): evaluator score used by evolution ranking.
         It uses global full-eval score during warmup, then surrogate prediction.
+        Sampled circuits are selected by correlation with global score (from warmup history).
       - combined_score_sample_raw: sampled-circuit score from the base formula
         (kept for diagnostics; not used for ranking once surrogate is active).
-      - combined_score_global / combined_score_pred_ml / combined_score_pred_corr:
+      - combined_score_global / combined_score_pred_ml:
         optional diagnostic fields from evaluator when available.
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
