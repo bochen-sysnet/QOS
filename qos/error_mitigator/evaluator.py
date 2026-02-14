@@ -24,9 +24,11 @@ from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAna
 from qos.error_mitigator.optimiser import GVOptimalDecompositionPass, OptimalWireCuttingPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 logging.getLogger("qiskit").setLevel(logging.WARNING)
 logging.getLogger("qiskit.transpiler").setLevel(logging.WARNING)
@@ -87,6 +89,18 @@ def _surrogate_ml_model_name() -> str:
     return os.getenv("QOSE_SURROGATE_ML_MODEL", "random_forest").strip().lower()
 
 
+def _surrogate_prediction_enabled() -> bool:
+    return _env_bool("QOSE_SURROGATE_USE_ML_PREDICTION", True)
+
+
+def _surrogate_refit_every() -> int:
+    return max(0, int(os.getenv("QOSE_SURROGATE_REFIT_EVERY", "10")))
+
+
+def _surrogate_plot_every() -> int:
+    return max(0, int(os.getenv("QOSE_SURROGATE_MODEL_PLOT_EVERY", "5")))
+
+
 def _surrogate_min_train_rows() -> int:
     return max(
         2,
@@ -113,6 +127,20 @@ def _surrogate_cases_csv(state_csv: Path) -> Path:
     return state_csv.with_suffix(state_csv.suffix + ".cases.csv")
 
 
+def _surrogate_model_compare_csv(state_csv: Path) -> Path:
+    raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_CSV", "").strip()
+    if raw:
+        return Path(raw)
+    return state_csv.with_suffix(state_csv.suffix + ".model_compare.csv")
+
+
+def _surrogate_model_compare_pdf(state_csv: Path) -> Path:
+    raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_PDF", "").strip()
+    if raw:
+        return Path(raw)
+    return state_csv.with_suffix(state_csv.suffix + ".model_compare.pdf")
+
+
 def _program_hash(program_path: str) -> str:
     try:
         data = Path(program_path).read_bytes()
@@ -128,29 +156,76 @@ def _with_file_lock(lock_path: Path):
     return f
 
 
-def _claim_warmup_slot(meta_json: Path, warmup_iters: int) -> tuple[bool, int]:
-    if warmup_iters <= 0:
-        return False, 0
+def _load_meta_json(meta_json: Path) -> dict:
+    if meta_json.exists():
+        try:
+            return json.loads(meta_json.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _update_meta_json(meta_json: Path, updater):
     lock = _with_file_lock(meta_json.with_suffix(meta_json.suffix + ".lock"))
     try:
-        if meta_json.exists():
-            try:
-                meta = json.loads(meta_json.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-        else:
-            meta = {}
-        claimed = int(meta.get("full_eval_claimed", 0))
-        if claimed < warmup_iters:
-            claimed += 1
-            meta["full_eval_claimed"] = claimed
-            meta_json.parent.mkdir(parents=True, exist_ok=True)
-            meta_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            return True, claimed
-        return False, claimed
+        meta = _load_meta_json(meta_json)
+        meta = updater(meta) or meta
+        meta_json.parent.mkdir(parents=True, exist_ok=True)
+        meta_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return meta
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
+
+
+def _claim_full_eval_slot(
+    meta_json: Path,
+    warmup_iters: int,
+    refit_every: int,
+) -> tuple[bool, int, int, str]:
+    """
+    Returns:
+      should_full_eval, full_eval_claim_index, eval_index, reason
+    """
+    result = {
+        "should": False,
+        "full_idx": 0,
+        "eval_idx": 0,
+        "reason": "",
+    }
+
+    def _update(meta: dict) -> dict:
+        eval_count = int(meta.get("eval_count", 0)) + 1
+        full_claimed = int(meta.get("full_eval_claimed", 0))
+        should = False
+        reason = ""
+
+        if full_claimed < warmup_iters:
+            full_claimed += 1
+            should = True
+            reason = "warmup"
+        elif refit_every > 0 and eval_count > warmup_iters:
+            if ((eval_count - warmup_iters) % refit_every) == 0:
+                full_claimed += 1
+                should = True
+                reason = "periodic_refit"
+
+        meta["eval_count"] = eval_count
+        meta["full_eval_claimed"] = full_claimed
+        meta["last_full_eval_reason"] = reason
+        result["should"] = should
+        result["full_idx"] = full_claimed
+        result["eval_idx"] = eval_count
+        result["reason"] = reason
+        return meta
+
+    _update_meta_json(meta_json, _update)
+    return (
+        bool(result["should"]),
+        int(result["full_idx"]),
+        int(result["eval_idx"]),
+        str(result["reason"]),
+    )
 
 
 def _append_surrogate_row(csv_path: Path, row: dict) -> None:
@@ -234,42 +309,126 @@ def _safe_float(value, default=float("nan")):
         return default
 
 
-def _fit_surrogate_model(rows: list[dict], ml_model_name: str):
-    labeled = [r for r in rows if not (str(r.get("global_combined_score", "")).strip() in {"", "nan"})]
-    if len(labeled) < _surrogate_min_train_rows():
-        return None, len(labeled)
+def _build_pipeline(estimator, use_scaler: bool) -> Pipeline:
+    steps = [("imputer", SimpleImputer(strategy="median"))]
+    if use_scaler:
+        steps.append(("scaler", StandardScaler()))
+    steps.append(("model", estimator))
+    return Pipeline(steps)
 
+
+def _surrogate_model_factories(random_state: int = 42):
+    return {
+        "ridge": lambda: _build_pipeline(
+            Ridge(alpha=1.0, random_state=random_state), use_scaler=True
+        ),
+        "elasticnet": lambda: _build_pipeline(
+            ElasticNet(
+                alpha=0.005,
+                l1_ratio=0.5,
+                max_iter=20000,
+                random_state=random_state,
+            ),
+            use_scaler=True,
+        ),
+        "random_forest": lambda: _build_pipeline(
+            RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1),
+            use_scaler=False,
+        ),
+        "extra_trees": lambda: _build_pipeline(
+            ExtraTreesRegressor(n_estimators=500, random_state=random_state, n_jobs=-1),
+            use_scaler=False,
+        ),
+        "gradient_boosting": lambda: _build_pipeline(
+            GradientBoostingRegressor(random_state=random_state), use_scaler=False
+        ),
+    }
+
+
+def _prepare_surrogate_xy(rows: list[dict]) -> tuple[list[list[float]], list[float], list[float]]:
     x = []
     y = []
-    for r in labeled:
+    ts = []
+    for r in rows:
         feat = [_safe_float(r.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
-        if any(val != val for val in feat):
-            continue
         target = _safe_float(r.get("global_combined_score"))
-        if target != target:
+        t = _safe_float(r.get("timestamp_sec"), default=0.0)
+        if any(v != v for v in feat) or target != target:
             continue
         x.append(feat)
         y.append(target)
+        ts.append(t)
+    order = sorted(range(len(x)), key=lambda i: ts[i])
+    return [x[i] for i in order], [y[i] for i in order], [ts[i] for i in order]
+
+
+def _rolling_one_step_mae(
+    x: list[list[float]],
+    y: list[float],
+    model_factory,
+    min_train: int,
+) -> tuple[float, int]:
+    if len(x) <= max(1, min_train):
+        return float("nan"), 0
+    errs = []
+    for i in range(min_train, len(x)):
+        try:
+            model = model_factory()
+            model.fit(x[:i], y[:i])
+            pred = float(model.predict([x[i]])[0])
+            errs.append(abs(pred - y[i]))
+        except Exception:
+            continue
+    if not errs:
+        return float("nan"), 0
+    return float(sum(errs) / len(errs)), len(errs)
+
+
+def _compute_surrogate_model_stats(rows: list[dict]) -> tuple[dict[str, dict], int]:
+    x, y, _ = _prepare_surrogate_xy(rows)
+    min_train = _surrogate_min_train_rows()
+    factories = _surrogate_model_factories()
+    stats = {}
+    for name, factory in factories.items():
+        mae, nsteps = _rolling_one_step_mae(x, y, factory, min_train=min_train)
+        stats[name] = {
+            "rolling_mae": mae,
+            "rolling_steps": nsteps,
+        }
+    return stats, len(x)
+
+
+def _choose_best_surrogate_model(stats: dict[str, dict], fallback: str) -> str:
+    best_name = ""
+    best_mae = float("inf")
+    for name, d in stats.items():
+        mae = _safe_float(d.get("rolling_mae"))
+        steps = int(_safe_float(d.get("rolling_steps"), default=0))
+        if mae != mae or steps <= 0:
+            continue
+        if mae < best_mae:
+            best_mae = mae
+            best_name = name
+    if best_name:
+        return best_name
+    return fallback
+
+
+def _fit_surrogate_model(rows: list[dict], ml_model_name: str):
+    x, y, _ = _prepare_surrogate_xy(rows)
     if len(x) < _surrogate_min_train_rows():
         return None, len(x)
-
-    if ml_model_name == "random_forest":
-        est = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
-    else:
-        est = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
-    ml_model = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", est),
-        ]
-    )
-    ml_model.fit(x, y)
-    return ml_model, len(x)
+    factories = _surrogate_model_factories()
+    model_name = ml_model_name if ml_model_name in factories else "random_forest"
+    try:
+        model = factories[model_name]()
+        model.fit(x, y)
+        return model, len(x)
+    except Exception:
+        return None, len(x)
 
 
-def _predict_surrogate_score(
-    ml_model, sample_features: dict
-) -> float:
+def _predict_surrogate_score(ml_model, sample_features: dict) -> float:
     feat = [_safe_float(sample_features.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
     if any(v != v for v in feat):
         return float("nan")
@@ -279,6 +438,58 @@ def _predict_surrogate_score(
     except Exception:
         return float("nan")
     return float("nan")
+
+
+def _write_model_compare_csv(path: Path, stats: dict[str, dict], eval_index: int, warmup_iters: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["model", "rolling_mae", "rolling_steps", "eval_index", "warmup_iters"]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for name in sorted(stats.keys()):
+            s = stats[name]
+            w.writerow(
+                {
+                    "model": name,
+                    "rolling_mae": s.get("rolling_mae", ""),
+                    "rolling_steps": s.get("rolling_steps", ""),
+                    "eval_index": eval_index,
+                    "warmup_iters": warmup_iters,
+                }
+            )
+
+
+def _write_model_compare_pdf(path: Path, stats: dict[str, dict], selected_model: str, eval_index: int):
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    labels = sorted(stats.keys())
+    vals = [_safe_float(stats[m].get("rolling_mae")) for m in labels]
+    valid = [(l, v) for l, v in zip(labels, vals) if v == v]
+    if not valid:
+        return
+    labels = [l for l, _ in valid]
+    vals = [v for _, v in valid]
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
+    colors = ["tab:orange" if l == selected_model else "tab:blue" for l in labels]
+    bars = ax.bar(labels, vals, color=colors)
+    ax.set_ylabel("Mean abs diff (rolling one-step)")
+    ax.set_title(f"Surrogate Model Compare @ eval {eval_index}")
+    ax.grid(axis="y", alpha=0.3)
+    for b, v in zip(bars, vals):
+        ax.text(
+            b.get_x() + b.get_width() / 2.0,
+            b.get_height(),
+            f"{v:.4f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
 
 
 def _dedupe_surrogate_rows_latest(rows: list[dict]) -> list[dict]:
@@ -322,6 +533,40 @@ def _dedupe_case_rows_latest(rows: list[dict]) -> list[dict]:
             latest[key] = r
             latest_ts[key] = ts
     return list(latest.values())
+
+
+def _refresh_surrogate_model_selection(
+    state_csv: Path,
+    meta_json: Path,
+    eval_index: int,
+    warmup_iters: int,
+    write_plot: bool,
+) -> tuple[str, dict[str, dict], int]:
+    rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
+    stats, labeled_count = _compute_surrogate_model_stats(rows)
+    fallback = _surrogate_ml_model_name()
+    selected = _choose_best_surrogate_model(stats, fallback=fallback)
+
+    def _update(meta: dict) -> dict:
+        meta["selected_ml_model"] = selected
+        meta["selected_ml_model_updated_eval"] = int(eval_index)
+        meta["labeled_rows"] = int(labeled_count)
+        meta["model_compare_stats"] = stats
+        meta["model_compare_warmup_iters"] = int(warmup_iters)
+        return meta
+
+    _update_meta_json(meta_json, _update)
+
+    if write_plot:
+        csv_path = _surrogate_model_compare_csv(state_csv)
+        pdf_path = _surrogate_model_compare_pdf(state_csv)
+        _write_model_compare_csv(
+            csv_path, stats=stats, eval_index=eval_index, warmup_iters=warmup_iters
+        )
+        _write_model_compare_pdf(
+            pdf_path, stats=stats, selected_model=selected, eval_index=eval_index
+        )
+    return selected, stats, labeled_count
 
 
 def _sample_pairs_target_count(benches: list[str]) -> int:
@@ -884,12 +1129,31 @@ def _evaluate_impl(program_path):
         return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
 
     surrogate_enabled = _surrogate_enabled()
+    surrogate_prediction_enabled = _surrogate_prediction_enabled()
     surrogate_warmup_iters = _surrogate_warmup_iters()
+    surrogate_refit_every = _surrogate_refit_every()
+    surrogate_plot_every = _surrogate_plot_every()
     surrogate_model_name = _surrogate_ml_model_name()
     state_csv = _surrogate_state_csv()
     meta_json = _surrogate_meta_json(state_csv)
     cases_csv = _surrogate_cases_csv(state_csv)
     program_hash = _program_hash(program_path)
+
+    full_eval_claimed = False
+    full_eval_claim_index = 0
+    eval_index = 0
+    full_eval_reason = ""
+    if surrogate_enabled:
+        (
+            full_eval_claimed,
+            full_eval_claim_index,
+            eval_index,
+            full_eval_reason,
+        ) = _claim_full_eval_slot(
+            meta_json=meta_json,
+            warmup_iters=surrogate_warmup_iters,
+            refit_every=surrogate_refit_every,
+        )
 
     size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
     size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
@@ -950,8 +1214,6 @@ def _evaluate_impl(program_path):
         "sample_combined_score_raw": sample_combined_raw,
     }
 
-    full_eval_claimed = False
-    full_eval_claim_index = 0
     global_combined_score = float("nan")
     global_num_cases = 0
     surrogate_source = "sample_raw"
@@ -959,12 +1221,12 @@ def _evaluate_impl(program_path):
     surrogate_train_rows = 0
     full_eval_error = ""
     timestamp_sec = time.time()
+    selected_model_name = surrogate_model_name
+    model_compare_stats = {}
+    model_compare_labeled_rows = 0
+    wrote_model_compare_plot = False
 
     if surrogate_enabled:
-        full_eval_claimed, full_eval_claim_index = _claim_warmup_slot(
-            meta_json=meta_json,
-            warmup_iters=surrogate_warmup_iters,
-        )
         if full_eval_claimed:
             if candidate_pairs:
                 full_res = _evaluate_bench_size_pairs(
@@ -1005,19 +1267,31 @@ def _evaluate_impl(program_path):
                 "score_mode": score_mode,
             },
         )
-        train_rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
-        ml_model, surrogate_train_rows = _fit_surrogate_model(
-            train_rows, ml_model_name=surrogate_model_name
-        )
-        predicted_ml = _predict_surrogate_score(
-            ml_model=ml_model,
-            sample_features=sample_features,
-        )
+        if surrogate_prediction_enabled:
+            should_write_model_plot = (
+                surrogate_plot_every > 0 and eval_index > 0 and (eval_index % surrogate_plot_every == 0)
+            )
+            selected_model_name, model_compare_stats, model_compare_labeled_rows = _refresh_surrogate_model_selection(
+                state_csv=state_csv,
+                meta_json=meta_json,
+                eval_index=eval_index,
+                warmup_iters=surrogate_warmup_iters,
+                write_plot=should_write_model_plot,
+            )
+            wrote_model_compare_plot = should_write_model_plot
+            train_rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
+            ml_model, surrogate_train_rows = _fit_surrogate_model(
+                train_rows, ml_model_name=selected_model_name
+            )
+            predicted_ml = _predict_surrogate_score(
+                ml_model=ml_model,
+                sample_features=sample_features,
+            )
 
     if global_combined_score == global_combined_score:
         combined_score_final = global_combined_score
         surrogate_source = "global_full_eval"
-    elif predicted_ml == predicted_ml:
+    elif surrogate_prediction_enabled and predicted_ml == predicted_ml:
         combined_score_final = predicted_ml
         surrogate_source = "ml_predict"
     else:
@@ -1031,15 +1305,12 @@ def _evaluate_impl(program_path):
         "avg_run_time": float(sample_res["avg_run_time"]),
         # Final score used by evolution for ranking/comparison.
         "combined_score": float(combined_score_final),
-        # Keep original sampled score for analysis.
-        "combined_score_sample_raw": float(sample_combined_raw),
     }
-    if global_combined_score == global_combined_score:
-        metrics["combined_score_global"] = float(global_combined_score)
-    if predicted_ml == predicted_ml:
-        metrics["combined_score_pred_ml"] = float(predicted_ml)
 
-    artifacts = {
+    score_source_mode = "prediction" if surrogate_source == "ml_predict" else "raw"
+    selection_mode = "correlation" if corr_selection_used else "random"
+
+    summary = {
         "qose_budget": args.budget,
         "qose_run_sec_avg": sample_res["qose_run_sec_avg"],
         "qos_run_sec_avg": sample_res["qos_run_sec_avg"],
@@ -1050,39 +1321,15 @@ def _evaluate_impl(program_path):
         "qos_depth_avg": sample_res["qos_depth_avg"],
         "qos_cnot_avg": sample_res["qos_cnot_avg"],
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
-        "cases": sample_res["cases"],
-        "combined_score_source": surrogate_source,
-        "surrogate_enabled": surrogate_enabled,
-        "surrogate_warmup_iters": surrogate_warmup_iters,
-        "surrogate_ml_model": surrogate_model_name,
-        "surrogate_train_rows": surrogate_train_rows,
-        "surrogate_state_csv": str(state_csv),
-        "surrogate_cases_csv": str(cases_csv),
-        "surrogate_meta_json": str(meta_json),
-        "surrogate_full_eval_claimed": full_eval_claimed,
-        "surrogate_full_eval_claim_index": full_eval_claim_index,
-        "surrogate_full_eval_num_cases": global_num_cases,
-        "surrogate_full_eval_error": full_eval_error,
-        "sample_selection_mode": (
-            "correlation" if corr_selection_used else "seeded_random"
-        ),
-        "sample_selection_count": len(sample_pairs),
-        "sample_selection_pairs": [
-            {"bench": bench, "size": size} for bench, size in sample_pairs
-        ],
-        "sample_corr_selection_support_top": corr_selection_support,
-        "sample_corr_selection_top_abs_corr": corr_selection_top_abs_corr,
+        # Minimal surrogate transparency for evolution prompt.
+        "qose_selection_mode": selection_mode,
+        "qose_score_source": score_source_mode,
     }
-    if predicted_ml == predicted_ml:
-        artifacts["surrogate_pred_ml"] = predicted_ml
-    if global_combined_score == global_combined_score:
-        artifacts["surrogate_global_score"] = global_combined_score
-    artifacts.update(score_meta)
-    artifacts["combined_score_used_formula"] = (
-        "if global_full_eval available: use global_combined_score; "
-        "else if ml model available: use ml prediction from sampled features; "
-        "else use sampled combined_score_raw"
-    )
+    summary.update(score_meta)
+    artifacts = {
+        "summary": summary,
+        "cases": sample_res["cases"],
+    }
     return _round_float_values(metrics), _round_float_values(artifacts)
 
 

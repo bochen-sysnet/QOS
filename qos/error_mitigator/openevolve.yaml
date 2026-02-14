@@ -100,10 +100,9 @@ prompt:
       - combined_score (maximize): evaluator score used by evolution ranking.
         It uses global full-eval score during warmup, then surrogate prediction.
         Sampled circuits are selected by correlation with global score (from warmup history).
-      - combined_score_sample_raw: sampled-circuit score from the base formula
-        (kept for diagnostics; not used for ranking once surrogate is active).
-      - combined_score_global / combined_score_pred_ml:
-        optional diagnostic fields from evaluator when available.
+        During warmup, evaluator compares multiple ML regressors by rolling one-step
+        mean absolute error and auto-selects the best model.
+        After warmup, evaluator performs periodic full-eval recalibration.
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.
@@ -111,10 +110,17 @@ prompt:
     We provide the execution outputs of the last program executed by the evaluator. 
     Use them to diagnose decisions. Details of the execution outputs are as follows:
 
-    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (summary):
+    EXECUTION OUTPUTS PROVIDED BY EVALUATOR:
+      - Artifacts are organized as:
+        * artifacts["summary"]: aggregate/run-level metrics
+        * artifacts["cases"]: list of per-(bench,size) case metrics
+
+    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (artifacts["summary"]):
       - qose_budget: budget used for all cases
       - qose_run_sec_avg: average runtime of evolved mitigator
       - qos_run_sec_avg: average runtime of baseline QOS
+      - qose_selection_mode: "random" or "correlation"
+      - qose_score_source: "raw" or "prediction"
       - gv_cost_calls_total: total GV cost calls (evolved)
       - wc_cost_calls_total: total WC cost calls (evolved)
       - qos_gv_cost_calls_total: total GV cost calls (baseline)
@@ -122,7 +128,7 @@ prompt:
       - qos_depth_avg: average absolute depth of baseline circuits
       - qos_cnot_avg: average absolute nonlocal gate count of baseline circuits
 
-    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (per case):
+    EXECUTION OUTPUTS PROVIDED BY EVALUATOR (artifacts["cases"] per case):
       - input_features: static circuit features (depth, qubits, gates, etc.)
         num_connected_components, number_instructions, num_measurements, num_cnot_gates,
         program_communication, liveness, parallelism, measurement, entanglement_ratio, critical_depth

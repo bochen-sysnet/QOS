@@ -8,7 +8,7 @@ from qos.error_mitigator.analyser import *
 from qos.error_mitigator.optimiser import *
 
 _TRACE_QUEUE = None
-_COST_TIMEOUT_SENTINEL = 10**9
+_COST_TIMEOUT_SENTINEL = 10**2
 
 
 class CostResult(tuple):

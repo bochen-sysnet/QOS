@@ -22,6 +22,7 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
   OPENEVOLVE_INCLUDE_PEER_ARTIFACTS Enable peer (top/diverse/inspire) execution outputs
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
+  QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir
@@ -46,6 +47,12 @@ fi
 PROFILE="$1"
 OUTPUT_DIR="$2"
 shift 2
+
+# Default surrogate cache location: per-evolution output directory.
+# This keeps correlation/prediction state isolated by run unless explicitly overridden.
+if [[ -z "${QOSE_SURROGATE_STATE_CSV:-}" ]]; then
+  export QOSE_SURROGATE_STATE_CSV="$OUTPUT_DIR/qose_surrogate_state.csv"
+fi
 
 export OPENEVOLVE_NUM_TOP_PROGRAMS="${OPENEVOLVE_NUM_TOP_PROGRAMS:-3}"
 export OPENEVOLVE_NUM_DIVERSE_PROGRAMS="${OPENEVOLVE_NUM_DIVERSE_PROGRAMS:-2}"
