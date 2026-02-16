@@ -115,6 +115,10 @@ done
 # Default config uses env variables for base/model/key.
 CONFIG_PATH="qos/error_mitigator/openevolve.yaml"
 
+# Keep a copy of the evolve config in the output directory for reproducibility.
+mkdir -p "$OUTPUT_DIR"
+cp -f "$CONFIG_PATH" "$OUTPUT_DIR/openevolve_config.yaml"
+
 # Load API key from file if provided and OPENAI_API_KEY is unset.
 if [[ -z "${OPENAI_API_KEY:-}" && -n "${OPENAI_API_KEY_FILE:-}" ]]; then
   if [[ -f "$OPENAI_API_KEY_FILE" ]]; then

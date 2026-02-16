@@ -97,10 +97,6 @@ def _surrogate_refit_every() -> int:
     return max(0, int(os.getenv("QOSE_SURROGATE_REFIT_EVERY", "10")))
 
 
-def _surrogate_plot_every() -> int:
-    return max(0, int(os.getenv("QOSE_SURROGATE_MODEL_PLOT_EVERY", "5")))
-
-
 def _surrogate_min_train_rows() -> int:
     return max(
         2,
@@ -139,6 +135,13 @@ def _surrogate_model_compare_pdf(state_csv: Path) -> Path:
     if raw:
         return Path(raw)
     return state_csv.with_suffix(state_csv.suffix + ".model_compare.pdf")
+
+
+def _surrogate_selection_csv(state_csv: Path) -> Path:
+    raw = os.getenv("QOSE_SURROGATE_SELECTION_CSV", "").strip()
+    if raw:
+        return Path(raw)
+    return state_csv.with_suffix(state_csv.suffix + ".selection.csv")
 
 
 def _program_hash(program_path: str) -> str:
@@ -234,6 +237,7 @@ def _append_surrogate_row(csv_path: Path, row: dict) -> None:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         file_exists = csv_path.exists()
         fields = [
+            "eval_index",
             "program_hash",
             "timestamp_sec",
             "sample_qose_depth",
@@ -281,6 +285,34 @@ def _append_surrogate_case_rows(csv_path: Path, rows: list[dict]) -> None:
                 writer.writeheader()
             for row in rows:
                 writer.writerow({k: row.get(k, "") for k in fields})
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
+def _append_surrogate_selection_row(csv_path: Path, row: dict) -> None:
+    lock = _with_file_lock(csv_path.with_suffix(csv_path.suffix + ".lock"))
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = csv_path.exists()
+        fields = [
+            "eval_index",
+            "timestamp_sec",
+            "program_hash",
+            "selection_mode",
+            "score_source",
+            "sample_count",
+            "sample_pairs_json",
+            "corr_support",
+            "corr_top_abs_corr",
+            "full_eval_claimed",
+            "full_eval_reason",
+        ]
+        with csv_path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fields})
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
@@ -348,18 +380,22 @@ def _surrogate_model_factories(random_state: int = 42):
 def _prepare_surrogate_xy(rows: list[dict]) -> tuple[list[list[float]], list[float], list[float]]:
     x = []
     y = []
-    ts = []
+    order_key = []
     for r in rows:
         feat = [_safe_float(r.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
         target = _safe_float(r.get("global_combined_score"))
         t = _safe_float(r.get("timestamp_sec"), default=0.0)
+        eval_idx = _safe_float(r.get("eval_index"), default=float("nan"))
         if any(v != v for v in feat) or target != target:
             continue
         x.append(feat)
         y.append(target)
-        ts.append(t)
-    order = sorted(range(len(x)), key=lambda i: ts[i])
-    return [x[i] for i in order], [y[i] for i in order], [ts[i] for i in order]
+        if eval_idx == eval_idx:
+            order_key.append((int(eval_idx), t))
+        else:
+            order_key.append((10**12, t))
+    order = sorted(range(len(x)), key=lambda i: order_key[i])
+    return [x[i] for i in order], [y[i] for i in order], [float(order_key[i][1]) for i in order]
 
 
 def _rolling_one_step_mae(
@@ -440,53 +476,464 @@ def _predict_surrogate_score(ml_model, sample_features: dict) -> float:
     return float("nan")
 
 
-def _write_model_compare_csv(path: Path, stats: dict[str, dict], eval_index: int, warmup_iters: int):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["model", "rolling_mae", "rolling_steps", "eval_index", "warmup_iters"]
-    with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for name in sorted(stats.keys()):
-            s = stats[name]
-            w.writerow(
+def _score_from_case_subset(case_map: dict, pairs: list[tuple[str, int]]) -> dict | None:
+    if not case_map or not pairs:
+        return None
+    selected = [case_map[p] for p in pairs if p in case_map]
+    if not selected:
+        return None
+    depth = sum(_safe_float(v.get("depth_ratio")) for v in selected) / len(selected)
+    cnot = sum(_safe_float(v.get("cnot_ratio")) for v in selected) / len(selected)
+    over = sum(_safe_float(v.get("overhead_ratio")) for v in selected) / len(selected)
+    run = sum(_safe_float(v.get("time_ratio")) for v in selected) / len(selected)
+    combined, _ = _combined_score_from_ratios(depth, cnot, run, over)
+    return {
+        "sample_qose_depth": depth,
+        "sample_qose_cnot": cnot,
+        "sample_qose_overhead": over,
+        "sample_avg_run_time": run,
+        "sample_combined_score_raw": combined,
+    }
+
+
+def _select_random_pairs_from_case_map(
+    case_map: dict,
+    benches: list[str],
+    samples_per_bench: int,
+) -> list[tuple[str, int]]:
+    if not case_map:
+        return []
+    size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
+    stratified = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
+    distinct_sizes = os.getenv("QOSE_DISTINCT_SIZES_PER_BENCH", "1").strip().lower() in {"1", "true", "yes", "y"}
+    sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
+    sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
+    rng = random.Random(sample_seed)
+
+    bench_to_sizes: dict[str, set[int]] = {}
+    for bench, size in case_map:
+        bench_to_sizes.setdefault(str(bench), set()).add(int(size))
+
+    picked: list[tuple[str, int]] = []
+    for bench in benches:
+        all_sizes = sorted(bench_to_sizes.get(bench, set()))
+        if not all_sizes:
+            continue
+        sample_pool = all_sizes
+        if stratified:
+            parity_sizes = [s for s in all_sizes if (s - size_min) % 2 == 0]
+            if parity_sizes:
+                sample_pool = parity_sizes
+        if distinct_sizes and len(sample_pool) < samples_per_bench and len(all_sizes) >= samples_per_bench:
+            sample_pool = all_sizes
+        if distinct_sizes and len(sample_pool) >= samples_per_bench:
+            chosen = rng.sample(sample_pool, samples_per_bench)
+        else:
+            chosen = [rng.choice(sample_pool) for _ in range(max(1, samples_per_bench))]
+        picked.extend((bench, int(s)) for s in chosen)
+    return picked
+
+
+def _corr_selection_for_target(
+    target_case_map: dict,
+    history_events: list[dict],
+    all_case_by_pid: dict,
+    target_k: int,
+) -> tuple[list[tuple[str, int]], list[dict]]:
+    if not target_case_map or target_k <= 0:
+        return [], []
+    latest_history: dict[str, dict] = {}
+    for ev in history_events:
+        pid = str(ev.get("program_hash", "")).strip()
+        if pid:
+            latest_history[pid] = ev
+    if len(latest_history) < _surrogate_min_train_rows():
+        return [], []
+
+    y_by_pid = {
+        pid: _safe_float(ev.get("global_combined_score"))
+        for pid, ev in latest_history.items()
+        if _safe_float(ev.get("global_combined_score")) == _safe_float(ev.get("global_combined_score"))
+    }
+    if len(y_by_pid) < _surrogate_min_train_rows():
+        return [], []
+
+    ranking = []
+    for pair in sorted(target_case_map.keys(), key=lambda p: (str(p[0]), int(p[1]))):
+        xs = []
+        ys = []
+        for pid, y in y_by_pid.items():
+            case_map = all_case_by_pid.get(pid, {})
+            case = case_map.get(pair)
+            if not case:
+                continue
+            score = _safe_float(case.get("case_score"))
+            if score != score:
+                continue
+            xs.append(score)
+            ys.append(y)
+        corr = _pearson_corr(xs, ys)
+        ranking.append(
+            {
+                "bench": pair[0],
+                "size": pair[1],
+                "corr": corr,
+                "abs_corr": abs(corr) if corr == corr else float("nan"),
+                "support": len(xs),
+            }
+        )
+
+    ranking.sort(
+        key=lambda r: (
+            -_safe_float(r.get("abs_corr"), default=-1.0),
+            -int(_safe_float(r.get("support"), default=0)),
+            str(r.get("bench", "")),
+            int(_safe_float(r.get("size"), default=0)),
+        )
+    )
+    selected = []
+    for row in ranking:
+        selected.append((str(row["bench"]), int(row["size"])))
+        if len(selected) >= target_k:
+            break
+    return selected, ranking
+
+
+def _extract_eval_events(rows: list[dict]) -> list[dict]:
+    latest_by_eval: dict[int, dict] = {}
+    latest_ts: dict[int, float] = {}
+    for i, r in enumerate(rows):
+        ts = _safe_float(r.get("timestamp_sec"), default=float(i))
+        try:
+            eval_idx = int(float(r.get("eval_index")))
+        except Exception:
+            eval_idx = i + 1
+        pid = str(r.get("program_hash", "")).strip()
+        if not pid:
+            continue
+        global_score = _safe_float(r.get("global_combined_score"))
+        event = {
+            "eval_index": eval_idx,
+            "timestamp_sec": ts,
+            "program_hash": pid,
+            "global_combined_score": global_score,
+            "sample_qose_depth": _safe_float(r.get("sample_qose_depth")),
+            "sample_qose_cnot": _safe_float(r.get("sample_qose_cnot")),
+            "sample_qose_overhead": _safe_float(r.get("sample_qose_overhead")),
+            "sample_avg_run_time": _safe_float(r.get("sample_avg_run_time")),
+            "sample_combined_score_raw": _safe_float(r.get("sample_combined_score_raw")),
+        }
+        if eval_idx not in latest_by_eval or ts >= latest_ts.get(eval_idx, float("-inf")):
+            latest_by_eval[eval_idx] = event
+            latest_ts[eval_idx] = ts
+    ordered = sorted(latest_by_eval.values(), key=lambda r: (int(r["eval_index"]), float(r["timestamp_sec"])))
+    return ordered
+
+
+def _build_case_maps(case_rows: list[dict]) -> dict[str, dict]:
+    by_pid: dict[str, dict] = {}
+    score_col = "case_score_piecewise" if _score_mode() == _SCORE_MODE_PIECEWISE else "case_score_legacy"
+    for r in _dedupe_case_rows_latest(case_rows):
+        pid = str(r.get("program_hash", "")).strip()
+        bench = str(r.get("bench", "")).strip()
+        try:
+            size = int(float(r.get("size")))
+        except Exception:
+            continue
+        if not pid or not bench:
+            continue
+        by_pid.setdefault(pid, {})[(bench, size)] = {
+            "depth_ratio": _safe_float(r.get("depth_ratio")),
+            "cnot_ratio": _safe_float(r.get("cnot_ratio")),
+            "time_ratio": _safe_float(r.get("time_ratio")),
+            "overhead_ratio": _safe_float(r.get("overhead_ratio")),
+            "case_score": _safe_float(r.get(score_col)),
+        }
+    return by_pid
+
+
+def _compute_surrogate_accuracy_trace(
+    state_rows: list[dict],
+    case_rows: list[dict],
+    freeze_after_eval: int,
+    retrain_every: int,
+) -> list[dict]:
+    events = _extract_eval_events(state_rows)
+    if not events:
+        return []
+    case_by_pid = _build_case_maps(case_rows)
+    samples_per_bench = max(1, int(os.getenv("QOSE_SAMPLES_PER_BENCH", "1")))
+    model_factories = _surrogate_model_factories()
+    min_train = _surrogate_min_train_rows()
+
+    replay = []
+    for idx, ev in enumerate(events):
+        pid = ev["program_hash"]
+        target_case_map = case_by_pid.get(pid, {})
+        if not target_case_map:
+            continue
+        benches = [b for b, _ in BENCHES if any(pair[0] == b for pair in target_case_map.keys())]
+        target_k = max(1, len(benches) * samples_per_bench) if benches else max(1, samples_per_bench)
+        history = replay[:idx]
+        corr_pairs, corr_rank = _corr_selection_for_target(
+            target_case_map=target_case_map,
+            history_events=history,
+            all_case_by_pid=case_by_pid,
+            target_k=target_k,
+        )
+        random_pairs = _select_random_pairs_from_case_map(
+            case_map=target_case_map,
+            benches=benches or sorted({b for b, _ in target_case_map.keys()}),
+            samples_per_bench=samples_per_bench,
+        )
+        replay.append(
+            {
+                **ev,
+                "corr_pairs": corr_pairs,
+                "corr_summary": _score_from_case_subset(target_case_map, corr_pairs),
+                "random_summary": _score_from_case_subset(target_case_map, random_pairs),
+                "corr_support": int(_safe_float(corr_rank[0].get("support"), default=0)) if corr_rank else 0,
+                "corr_top_abs_corr": _safe_float(corr_rank[0].get("abs_corr")) if corr_rank else float("nan"),
+            }
+        )
+
+    if not replay:
+        return []
+
+    trace_rows = []
+    running = {}
+    baseline_names = ["baseline_random_no_pred", "baseline_corr_no_pred"]
+    for name in baseline_names + sorted(model_factories.keys()):
+        running[name] = {"sum": 0.0, "count": 0, "model": None, "last_fit_eval": None}
+
+    for i, ev in enumerate(replay):
+        eval_idx = int(ev["eval_index"])
+        global_score = _safe_float(ev["global_combined_score"])
+        is_rolling_refit = (
+            eval_idx > freeze_after_eval
+            and retrain_every > 0
+            and ((eval_idx - freeze_after_eval) % retrain_every == 0)
+        )
+        phase = "rolling" if (eval_idx <= freeze_after_eval or is_rolling_refit) else "frozen"
+
+        for bname, summary_key in [
+            ("baseline_random_no_pred", "random_summary"),
+            ("baseline_corr_no_pred", "corr_summary"),
+        ]:
+            pred = float("nan")
+            summ = ev.get(summary_key)
+            if summ:
+                pred = _safe_float(summ.get("sample_combined_score_raw"))
+            abs_err = abs(pred - global_score) if pred == pred and global_score == global_score else float("nan")
+            if abs_err == abs_err:
+                running[bname]["sum"] += abs_err
+                running[bname]["count"] += 1
+            running_mae = (
+                running[bname]["sum"] / running[bname]["count"] if running[bname]["count"] > 0 else float("nan")
+            )
+            trace_rows.append(
                 {
-                    "model": name,
-                    "rolling_mae": s.get("rolling_mae", ""),
-                    "rolling_steps": s.get("rolling_steps", ""),
-                    "eval_index": eval_index,
-                    "warmup_iters": warmup_iters,
+                    "eval_index": eval_idx,
+                    "program_hash": ev["program_hash"],
+                    "method": bname,
+                    "phase": phase,
+                    "global_combined_score": global_score,
+                    "predicted_score": pred,
+                    "abs_err": abs_err,
+                    "running_mae": running_mae,
+                    "train_rows": 0,
                 }
             )
 
+        for mname, factory in sorted(model_factories.items()):
+            current_summary = ev.get("corr_summary")
+            pred = float("nan")
+            train_rows = 0
+            if current_summary:
+                latest_train: dict[str, dict] = {}
+                for prev in replay[:i]:
+                    if not prev.get("corr_summary"):
+                        continue
+                    latest_train[prev["program_hash"]] = prev
+                train_events = sorted(
+                    latest_train.values(),
+                    key=lambda r: (int(r["eval_index"]), float(r["timestamp_sec"])),
+                )
+                train_rows = len(train_events)
+                if train_rows >= min_train:
+                    x_train = [
+                        [_safe_float(te["corr_summary"].get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
+                        for te in train_events
+                    ]
+                    y_train = [_safe_float(te.get("global_combined_score")) for te in train_events]
+                    x_cur = [[_safe_float(current_summary.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]]
+                    if all(v == v for row_vals in x_train for v in row_vals) and all(v == v for v in y_train) and all(
+                        v == v for v in x_cur[0]
+                    ):
+                        state = running[mname]
+                        if eval_idx <= freeze_after_eval:
+                            model = factory()
+                            model.fit(x_train, y_train)
+                            state["model"] = model
+                            state["last_fit_eval"] = eval_idx
+                        else:
+                            model = state.get("model")
+                            last_fit_eval = state.get("last_fit_eval")
+                            need_refit = model is None
+                            if (not need_refit) and retrain_every > 0 and last_fit_eval is not None:
+                                if (eval_idx - int(last_fit_eval)) >= retrain_every:
+                                    need_refit = True
+                            if need_refit:
+                                model = factory()
+                                model.fit(x_train, y_train)
+                                state["model"] = model
+                                state["last_fit_eval"] = eval_idx
+                        try:
+                            pred = float(running[mname]["model"].predict(x_cur)[0])
+                        except Exception:
+                            pred = float("nan")
 
-def _write_model_compare_pdf(path: Path, stats: dict[str, dict], selected_model: str, eval_index: int):
+            abs_err = abs(pred - global_score) if pred == pred and global_score == global_score else float("nan")
+            if abs_err == abs_err:
+                running[mname]["sum"] += abs_err
+                running[mname]["count"] += 1
+            running_mae = (
+                running[mname]["sum"] / running[mname]["count"] if running[mname]["count"] > 0 else float("nan")
+            )
+            trace_rows.append(
+                {
+                    "eval_index": eval_idx,
+                    "program_hash": ev["program_hash"],
+                    "method": mname,
+                    "phase": phase,
+                    "global_combined_score": global_score,
+                    "predicted_score": pred,
+                    "abs_err": abs_err,
+                    "running_mae": running_mae,
+                    "train_rows": train_rows,
+                }
+            )
+
+    return trace_rows
+
+
+def _write_model_compare_csv(
+    path: Path,
+    trace_rows: list[dict],
+    eval_index: int,
+    warmup_iters: int,
+    freeze_after_eval: int,
+    retrain_every: int,
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "eval_index",
+        "program_hash",
+        "method",
+        "phase",
+        "global_combined_score",
+        "predicted_score",
+        "abs_err",
+        "running_mae",
+        "train_rows",
+        "snapshot_eval_index",
+        "warmup_iters",
+        "freeze_after_eval",
+        "retrain_every",
+    ]
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in trace_rows:
+            out = dict(row)
+            out["snapshot_eval_index"] = eval_index
+            out["warmup_iters"] = warmup_iters
+            out["freeze_after_eval"] = freeze_after_eval
+            out["retrain_every"] = retrain_every
+            w.writerow({k: out.get(k, "") for k in fields})
+
+
+def _write_model_compare_pdf(
+    path: Path,
+    trace_rows: list[dict],
+    selected_model: str,
+    eval_index: int,
+    freeze_after_eval: int,
+    retrain_every: int,
+):
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return
-    labels = sorted(stats.keys())
-    vals = [_safe_float(stats[m].get("rolling_mae")) for m in labels]
-    valid = [(l, v) for l, v in zip(labels, vals) if v == v]
-    if not valid:
+    if not trace_rows:
         return
-    labels = [l for l, _ in valid]
-    vals = [v for _, v in valid]
 
-    fig, ax = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
-    colors = ["tab:orange" if l == selected_model else "tab:blue" for l in labels]
-    bars = ax.bar(labels, vals, color=colors)
-    ax.set_ylabel("Mean abs diff (rolling one-step)")
-    ax.set_title(f"Surrogate Model Compare @ eval {eval_index}")
-    ax.grid(axis="y", alpha=0.3)
-    for b, v in zip(bars, vals):
-        ax.text(
-            b.get_x() + b.get_width() / 2.0,
-            b.get_height(),
-            f"{v:.4f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    by_method: dict[str, list[dict]] = {}
+    for row in trace_rows:
+        method = str(row.get("method", ""))
+        by_method.setdefault(method, []).append(row)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.2), constrained_layout=True, sharey=True)
+    ax_roll, ax_frozen = axes
+    method_order = [
+        "baseline_random_no_pred",
+        "baseline_corr_no_pred",
+    ] + sorted(
+        [m for m in by_method.keys() if m not in {"baseline_random_no_pred", "baseline_corr_no_pred"}]
+    )
+    colors = {
+        "baseline_random_no_pred": "tab:gray",
+        "baseline_corr_no_pred": "tab:olive",
+    }
+
+    def _plot_phase(ax, phase_name: str, title: str):
+        for method in method_order:
+            rows = [
+                r
+                for r in sorted(
+                    by_method.get(method, []),
+                    key=lambda r: int(_safe_float(r.get("eval_index"), default=0)),
+                )
+                if str(r.get("phase", "")) == phase_name
+            ]
+            if not rows:
+                continue
+            xs = [int(_safe_float(r.get("eval_index"), default=0)) for r in rows]
+            ys = [_safe_float(r.get("running_mae")) for r in rows]
+            valid = [(x, y) for x, y in zip(xs, ys) if y == y]
+            if not valid:
+                continue
+            xs = [x for x, _ in valid]
+            ys = [y for _, y in valid]
+            style = "--" if method.startswith("baseline_") else "-"
+            lw = 2.4 if method == selected_model else 1.8
+            marker = "s" if method.startswith("baseline_") else "o"
+            color = colors.get(method, None)
+            label = method
+            if method == selected_model:
+                label = f"{method} (selected)"
+            ax.plot(xs, ys, linestyle=style, marker=marker, linewidth=lw, color=color, label=label)
+
+        ax.set_xlabel("Evaluation index (k)")
+        ax.set_title(title)
+        ax.grid(alpha=0.25)
+
+    _plot_phase(
+        ax_roll,
+        "rolling",
+        f"Rolling Points (<= {freeze_after_eval} and every {retrain_every})",
+    )
+    _plot_phase(
+        ax_frozen,
+        "frozen",
+        "Frozen Between Refreshes",
+    )
+
+    ax_roll.set_ylabel("Running mean absolute error")
+    handles, labels = ax_roll.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=3, fontsize=8)
+    fig.suptitle(f"Surrogate Accuracy Trend @ eval {eval_index}", fontsize=12)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300)
     plt.close(fig)
@@ -538,6 +985,7 @@ def _dedupe_case_rows_latest(rows: list[dict]) -> list[dict]:
 def _refresh_surrogate_model_selection(
     state_csv: Path,
     meta_json: Path,
+    cases_csv: Path,
     eval_index: int,
     warmup_iters: int,
     write_plot: bool,
@@ -560,11 +1008,29 @@ def _refresh_surrogate_model_selection(
     if write_plot:
         csv_path = _surrogate_model_compare_csv(state_csv)
         pdf_path = _surrogate_model_compare_pdf(state_csv)
+        freeze_after_eval = max(1, int(warmup_iters))
+        retrain_every = _surrogate_refit_every()
+        trace_rows = _compute_surrogate_accuracy_trace(
+            state_rows=_load_surrogate_rows(state_csv),
+            case_rows=_load_surrogate_case_rows(cases_csv),
+            freeze_after_eval=freeze_after_eval,
+            retrain_every=retrain_every,
+        )
         _write_model_compare_csv(
-            csv_path, stats=stats, eval_index=eval_index, warmup_iters=warmup_iters
+            csv_path,
+            trace_rows=trace_rows,
+            eval_index=eval_index,
+            warmup_iters=warmup_iters,
+            freeze_after_eval=freeze_after_eval,
+            retrain_every=retrain_every,
         )
         _write_model_compare_pdf(
-            pdf_path, stats=stats, selected_model=selected, eval_index=eval_index
+            pdf_path,
+            trace_rows=trace_rows,
+            selected_model=selected,
+            eval_index=eval_index,
+            freeze_after_eval=freeze_after_eval,
+            retrain_every=retrain_every,
         )
     return selected, stats, labeled_count
 
@@ -1132,7 +1598,6 @@ def _evaluate_impl(program_path):
     surrogate_prediction_enabled = _surrogate_prediction_enabled()
     surrogate_warmup_iters = _surrogate_warmup_iters()
     surrogate_refit_every = _surrogate_refit_every()
-    surrogate_plot_every = _surrogate_plot_every()
     surrogate_model_name = _surrogate_ml_model_name()
     state_csv = _surrogate_state_csv()
     meta_json = _surrogate_meta_json(state_csv)
@@ -1224,7 +1689,6 @@ def _evaluate_impl(program_path):
     selected_model_name = surrogate_model_name
     model_compare_stats = {}
     model_compare_labeled_rows = 0
-    wrote_model_compare_plot = False
 
     if surrogate_enabled:
         if full_eval_claimed:
@@ -1254,6 +1718,7 @@ def _evaluate_impl(program_path):
         _append_surrogate_row(
             state_csv,
             {
+                "eval_index": eval_index,
                 "program_hash": program_hash,
                 "timestamp_sec": timestamp_sec,
                 "sample_qose_depth": sample_features["sample_qose_depth"],
@@ -1268,17 +1733,15 @@ def _evaluate_impl(program_path):
             },
         )
         if surrogate_prediction_enabled:
-            should_write_model_plot = (
-                surrogate_plot_every > 0 and eval_index > 0 and (eval_index % surrogate_plot_every == 0)
-            )
+            should_write_model_plot = True
             selected_model_name, model_compare_stats, model_compare_labeled_rows = _refresh_surrogate_model_selection(
                 state_csv=state_csv,
                 meta_json=meta_json,
+                cases_csv=cases_csv,
                 eval_index=eval_index,
                 warmup_iters=surrogate_warmup_iters,
                 write_plot=should_write_model_plot,
             )
-            wrote_model_compare_plot = should_write_model_plot
             train_rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
             ml_model, surrogate_train_rows = _fit_surrogate_model(
                 train_rows, ml_model_name=selected_model_name
@@ -1309,6 +1772,27 @@ def _evaluate_impl(program_path):
 
     score_source_mode = "prediction" if surrogate_source == "ml_predict" else "raw"
     selection_mode = "correlation" if corr_selection_used else "random"
+
+    if surrogate_enabled:
+        try:
+            _append_surrogate_selection_row(
+                _surrogate_selection_csv(state_csv),
+                {
+                    "eval_index": eval_index,
+                    "timestamp_sec": timestamp_sec,
+                    "program_hash": program_hash,
+                    "selection_mode": selection_mode,
+                    "score_source": score_source_mode,
+                    "sample_count": len(sample_pairs),
+                    "sample_pairs_json": json.dumps(sample_pairs),
+                    "corr_support": corr_selection_support,
+                    "corr_top_abs_corr": corr_selection_top_abs_corr,
+                    "full_eval_claimed": int(bool(full_eval_claimed)),
+                    "full_eval_reason": full_eval_reason,
+                },
+            )
+        except Exception:
+            pass
 
     summary = {
         "qose_budget": args.budget,
