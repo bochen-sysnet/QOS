@@ -78,7 +78,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _surrogate_enabled() -> bool:
-    return _env_bool("QOSE_SURROGATE_ENABLE", True)
+    return _env_bool("QOSE_SURROGATE_ENABLE", False)
 
 
 def _surrogate_warmup_iters() -> int:

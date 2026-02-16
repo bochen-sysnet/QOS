@@ -367,7 +367,7 @@ prompt:
   num_diverse_programs: 2
   use_template_stochasticity: true
 
-  # Make sure OpenEvolve passes artifacts back into the model prompt each iteration.
+  # Keep artifact injection enabled by default.
   include_artifacts: true
   max_artifact_bytes: 65536
   artifact_security_filter: true

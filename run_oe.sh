@@ -20,7 +20,6 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_TOP_PROGRAMS     Override num_top_programs
   OPENEVOLVE_NUM_DIVERSE_PROGRAMS Override num_diverse_programs
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
-  OPENEVOLVE_INCLUDE_PEER_ARTIFACTS Enable peer (top/diverse/inspire) execution outputs
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
 
@@ -54,6 +53,9 @@ if [[ -z "${QOSE_SURROGATE_STATE_CSV:-}" ]]; then
   export QOSE_SURROGATE_STATE_CSV="$OUTPUT_DIR/qose_surrogate_state.csv"
 fi
 
+# Default: keep surrogate disabled unless explicitly enabled.
+export QOSE_SURROGATE_ENABLE="${QOSE_SURROGATE_ENABLE:-0}"
+
 export OPENEVOLVE_NUM_TOP_PROGRAMS="${OPENEVOLVE_NUM_TOP_PROGRAMS:-3}"
 export OPENEVOLVE_NUM_DIVERSE_PROGRAMS="${OPENEVOLVE_NUM_DIVERSE_PROGRAMS:-2}"
 export OPENEVOLVE_NUM_INSPIRATIONS="${OPENEVOLVE_NUM_INSPIRATIONS:-3}"
@@ -76,14 +78,6 @@ while [[ $# -gt 0 ]]; do
     --num-inspire|--num-inspiration|--num-inspirations)
       export OPENEVOLVE_NUM_INSPIRATIONS="$2"
       shift 2
-      ;;
-    --memory)
-      export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=1
-      shift
-      ;;
-    --no-memory)
-      export OPENEVOLVE_INCLUDE_PEER_ARTIFACTS=0
-      shift
       ;;
     --resume-latest)
       export RESUME_LATEST=1
