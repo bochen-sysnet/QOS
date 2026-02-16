@@ -503,9 +503,6 @@ def _select_random_pairs_from_case_map(
 ) -> list[tuple[str, int]]:
     if not case_map:
         return []
-    size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
-    stratified = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
-    distinct_sizes = os.getenv("QOSE_DISTINCT_SIZES_PER_BENCH", "1").strip().lower() in {"1", "true", "yes", "y"}
     sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
     sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
     rng = random.Random(sample_seed)
@@ -519,17 +516,11 @@ def _select_random_pairs_from_case_map(
         all_sizes = sorted(bench_to_sizes.get(bench, set()))
         if not all_sizes:
             continue
-        sample_pool = all_sizes
-        if stratified:
-            parity_sizes = [s for s in all_sizes if (s - size_min) % 2 == 0]
-            if parity_sizes:
-                sample_pool = parity_sizes
-        if distinct_sizes and len(sample_pool) < samples_per_bench and len(all_sizes) >= samples_per_bench:
-            sample_pool = all_sizes
-        if distinct_sizes and len(sample_pool) >= samples_per_bench:
-            chosen = rng.sample(sample_pool, samples_per_bench)
+        # Keep samples per bench fixed and non-identical by size when possible.
+        if len(all_sizes) < samples_per_bench:
+            chosen = list(all_sizes)
         else:
-            chosen = [rng.choice(sample_pool) for _ in range(max(1, samples_per_bench))]
+            chosen = rng.sample(all_sizes, samples_per_bench)
         picked.extend((bench, int(s)) for s in chosen)
     return picked
 
@@ -1248,14 +1239,9 @@ def _select_bench_size_pairs(args, benches):
     candidate_pairs = _collect_candidate_pairs(benches, size_min, size_max)
     if not candidate_pairs:
         return []
-    stratified_sizes = os.getenv("QOSE_STRATIFIED_SIZES", "1").strip().lower() in {"1", "true", "yes", "y"}
     samples_per_bench = int(os.getenv("QOSE_SAMPLES_PER_BENCH", "1"))
     if samples_per_bench <= 0:
         raise ValueError("QOSE_SAMPLES_PER_BENCH must be >= 1")
-    distinct_sizes = (
-        os.getenv("QOSE_DISTINCT_SIZES_PER_BENCH", "1").strip().lower()
-        in {"1", "true", "yes", "y"}
-    )
     sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
     sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
     rng = random.Random(sample_seed)
@@ -1269,26 +1255,13 @@ def _select_bench_size_pairs(args, benches):
         if not all_sizes:
             raise ValueError(f"No valid sizes found for bench={bench}")
 
-        # Keep old stratified preference when requested.
-        preferred_sizes = all_sizes
-        if stratified_sizes:
-            parity_sizes = [s for s in all_sizes if (s - size_min) % 2 == 0]
-            if parity_sizes:
-                preferred_sizes = parity_sizes
-
-        sample_pool = preferred_sizes
-        if distinct_sizes and len(sample_pool) < samples_per_bench and len(all_sizes) >= samples_per_bench:
-            sample_pool = all_sizes
-        if distinct_sizes and len(sample_pool) < samples_per_bench:
+        # Keep per-bench sample size fixed and non-identical by qubit size.
+        if len(all_sizes) < samples_per_bench:
             raise ValueError(
-                f"Bench={bench} has only {len(sample_pool)} valid sizes, "
+                f"Bench={bench} has only {len(all_sizes)} valid sizes, "
                 f"cannot draw {samples_per_bench} distinct samples"
             )
-
-        if distinct_sizes:
-            picked_sizes = rng.sample(sample_pool, samples_per_bench)
-        else:
-            picked_sizes = [rng.choice(sample_pool) for _ in range(samples_per_bench)]
+        picked_sizes = rng.sample(all_sizes, samples_per_bench)
         for size in picked_sizes:
             bench_size_pairs.append((bench, size))
     return bench_size_pairs
