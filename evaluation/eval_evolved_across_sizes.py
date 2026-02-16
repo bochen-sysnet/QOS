@@ -628,6 +628,13 @@ def main() -> None:
             _restore_env(env_edits)
 
         elapsed = time.perf_counter() - t0
+        summary = artifacts.get("summary", {}) if isinstance(artifacts.get("summary", {}), dict) else {}
+        qose_run_sec_avg = float(
+            summary.get("qose_run_sec_avg", artifacts.get("qose_run_sec_avg", float("nan")))
+        )
+        qos_run_sec_avg = float(
+            summary.get("qos_run_sec_avg", artifacts.get("qos_run_sec_avg", float("nan")))
+        )
         row = {
             "size": size,
             "qose_depth": float(metrics.get("qose_depth", float("nan"))),
@@ -635,12 +642,11 @@ def main() -> None:
             "qose_overhead": float(metrics.get("qose_overhead", float("nan"))),
             "avg_run_time": float(metrics.get("avg_run_time", float("nan"))),
             "combined_score": float(metrics.get("combined_score", float("nan"))),
-            "qose_run_sec_avg": float(artifacts.get("qose_run_sec_avg", float("nan"))),
-            "qos_run_sec_avg": float(artifacts.get("qos_run_sec_avg", float("nan"))),
+            "qose_run_sec_avg": qose_run_sec_avg,
+            "qos_run_sec_avg": qos_run_sec_avg,
             "qose_over_qos_run_time_sum_ratio": (
-                float(artifacts.get("qose_run_sec_avg", float("nan")))
-                / float(artifacts.get("qos_run_sec_avg", float("nan")))
-                if float(artifacts.get("qos_run_sec_avg", float("nan"))) > 0.0
+                qose_run_sec_avg / qos_run_sec_avg
+                if qos_run_sec_avg > 0.0
                 else float("nan")
             ),
             "eval_elapsed_sec": elapsed,

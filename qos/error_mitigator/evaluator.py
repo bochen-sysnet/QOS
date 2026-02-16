@@ -24,11 +24,6 @@ from qos.error_mitigator.analyser import BasicAnalysisPass, SupermarqFeaturesAna
 from qos.error_mitigator.optimiser import GVOptimalDecompositionPass, OptimalWireCuttingPass
 from qos.error_mitigator.run import ErrorMitigator
 from qos.types.types import Qernel
-from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import ElasticNet, Ridge
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 logging.getLogger("qiskit").setLevel(logging.WARNING)
 logging.getLogger("qiskit.transpiler").setLevel(logging.WARNING)
@@ -39,14 +34,6 @@ logger = logging.getLogger(__name__)
 _SCORE_MODE_LEGACY = "legacy"
 _SCORE_MODE_PIECEWISE = "piecewise"
 _SURROGATE_MIN_TRAIN_ROWS_DEFAULT = 5
-
-_SURROGATE_FEATURE_COLUMNS = [
-    "sample_qose_depth",
-    "sample_qose_cnot",
-    "sample_qose_overhead",
-    "sample_avg_run_time",
-    "sample_combined_score_raw",
-]
 
 
 def _pearson_corr(xs: list[float], ys: list[float]) -> float:
@@ -85,12 +72,13 @@ def _surrogate_warmup_iters() -> int:
     return max(0, int(os.getenv("QOSE_SURROGATE_WARMUP_ITERS", "20")))
 
 
-def _surrogate_ml_model_name() -> str:
-    return os.getenv("QOSE_SURROGATE_ML_MODEL", "random_forest").strip().lower()
-
-
-def _surrogate_prediction_enabled() -> bool:
-    return _env_bool("QOSE_SURROGATE_USE_ML_PREDICTION", True)
+def _surrogate_selection_mode() -> str:
+    raw = os.getenv("QOSE_SURROGATE_SELECTION_MODE", "correlation").strip().lower()
+    if raw in {"worst", "worse", "worst_case", "worst-performance", "worst_performance"}:
+        return "worst"
+    if raw in {"random"}:
+        return "random"
+    return "correlation"
 
 
 def _surrogate_refit_every() -> int:
@@ -123,18 +111,24 @@ def _surrogate_cases_csv(state_csv: Path) -> Path:
     return state_csv.with_suffix(state_csv.suffix + ".cases.csv")
 
 
-def _surrogate_model_compare_csv(state_csv: Path) -> Path:
-    raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_CSV", "").strip()
+def _surrogate_progress_csv(state_csv: Path) -> Path:
+    raw = os.getenv("QOSE_SURROGATE_PROGRESS_CSV", "").strip()
+    if not raw:
+        # Backward compatible env key.
+        raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_CSV", "").strip()
     if raw:
         return Path(raw)
-    return state_csv.with_suffix(state_csv.suffix + ".model_compare.csv")
+    return state_csv.with_suffix(state_csv.suffix + ".progress.csv")
 
 
-def _surrogate_model_compare_pdf(state_csv: Path) -> Path:
-    raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_PDF", "").strip()
+def _surrogate_progress_pdf(state_csv: Path) -> Path:
+    raw = os.getenv("QOSE_SURROGATE_PROGRESS_PDF", "").strip()
+    if not raw:
+        # Backward compatible env key.
+        raw = os.getenv("QOSE_SURROGATE_MODEL_COMPARE_PDF", "").strip()
     if raw:
         return Path(raw)
-    return state_csv.with_suffix(state_csv.suffix + ".model_compare.pdf")
+    return state_csv.with_suffix(state_csv.suffix + ".progress.pdf")
 
 
 def _surrogate_selection_csv(state_csv: Path) -> Path:
@@ -303,6 +297,8 @@ def _append_surrogate_selection_row(csv_path: Path, row: dict) -> None:
             "score_source",
             "sample_count",
             "sample_pairs_json",
+            "selection_support",
+            "selection_signal",
             "corr_support",
             "corr_top_abs_corr",
             "full_eval_claimed",
@@ -341,255 +337,6 @@ def _safe_float(value, default=float("nan")):
         return default
 
 
-def _build_pipeline(estimator, use_scaler: bool) -> Pipeline:
-    steps = [("imputer", SimpleImputer(strategy="median"))]
-    if use_scaler:
-        steps.append(("scaler", StandardScaler()))
-    steps.append(("model", estimator))
-    return Pipeline(steps)
-
-
-def _surrogate_model_factories(random_state: int = 42):
-    return {
-        "ridge": lambda: _build_pipeline(
-            Ridge(alpha=1.0, random_state=random_state), use_scaler=True
-        ),
-        "elasticnet": lambda: _build_pipeline(
-            ElasticNet(
-                alpha=0.005,
-                l1_ratio=0.5,
-                max_iter=20000,
-                random_state=random_state,
-            ),
-            use_scaler=True,
-        ),
-        "random_forest": lambda: _build_pipeline(
-            RandomForestRegressor(n_estimators=400, random_state=random_state, n_jobs=-1),
-            use_scaler=False,
-        ),
-        "extra_trees": lambda: _build_pipeline(
-            ExtraTreesRegressor(n_estimators=500, random_state=random_state, n_jobs=-1),
-            use_scaler=False,
-        ),
-        "gradient_boosting": lambda: _build_pipeline(
-            GradientBoostingRegressor(random_state=random_state), use_scaler=False
-        ),
-    }
-
-
-def _prepare_surrogate_xy(rows: list[dict]) -> tuple[list[list[float]], list[float], list[float]]:
-    x = []
-    y = []
-    order_key = []
-    for r in rows:
-        feat = [_safe_float(r.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
-        target = _safe_float(r.get("global_combined_score"))
-        t = _safe_float(r.get("timestamp_sec"), default=0.0)
-        eval_idx = _safe_float(r.get("eval_index"), default=float("nan"))
-        if any(v != v for v in feat) or target != target:
-            continue
-        x.append(feat)
-        y.append(target)
-        if eval_idx == eval_idx:
-            order_key.append((int(eval_idx), t))
-        else:
-            order_key.append((10**12, t))
-    order = sorted(range(len(x)), key=lambda i: order_key[i])
-    return [x[i] for i in order], [y[i] for i in order], [float(order_key[i][1]) for i in order]
-
-
-def _rolling_one_step_mae(
-    x: list[list[float]],
-    y: list[float],
-    model_factory,
-    min_train: int,
-) -> tuple[float, int]:
-    if len(x) <= max(1, min_train):
-        return float("nan"), 0
-    errs = []
-    for i in range(min_train, len(x)):
-        try:
-            model = model_factory()
-            model.fit(x[:i], y[:i])
-            pred = float(model.predict([x[i]])[0])
-            errs.append(abs(pred - y[i]))
-        except Exception:
-            continue
-    if not errs:
-        return float("nan"), 0
-    return float(sum(errs) / len(errs)), len(errs)
-
-
-def _compute_surrogate_model_stats(rows: list[dict]) -> tuple[dict[str, dict], int]:
-    x, y, _ = _prepare_surrogate_xy(rows)
-    min_train = _surrogate_min_train_rows()
-    factories = _surrogate_model_factories()
-    stats = {}
-    for name, factory in factories.items():
-        mae, nsteps = _rolling_one_step_mae(x, y, factory, min_train=min_train)
-        stats[name] = {
-            "rolling_mae": mae,
-            "rolling_steps": nsteps,
-        }
-    return stats, len(x)
-
-
-def _choose_best_surrogate_model(stats: dict[str, dict], fallback: str) -> str:
-    best_name = ""
-    best_mae = float("inf")
-    for name, d in stats.items():
-        mae = _safe_float(d.get("rolling_mae"))
-        steps = int(_safe_float(d.get("rolling_steps"), default=0))
-        if mae != mae or steps <= 0:
-            continue
-        if mae < best_mae:
-            best_mae = mae
-            best_name = name
-    if best_name:
-        return best_name
-    return fallback
-
-
-def _fit_surrogate_model(rows: list[dict], ml_model_name: str):
-    x, y, _ = _prepare_surrogate_xy(rows)
-    if len(x) < _surrogate_min_train_rows():
-        return None, len(x)
-    factories = _surrogate_model_factories()
-    model_name = ml_model_name if ml_model_name in factories else "random_forest"
-    try:
-        model = factories[model_name]()
-        model.fit(x, y)
-        return model, len(x)
-    except Exception:
-        return None, len(x)
-
-
-def _predict_surrogate_score(ml_model, sample_features: dict) -> float:
-    feat = [_safe_float(sample_features.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
-    if any(v != v for v in feat):
-        return float("nan")
-    try:
-        if ml_model is not None:
-            return float(ml_model.predict([feat])[0])
-    except Exception:
-        return float("nan")
-    return float("nan")
-
-
-def _score_from_case_subset(case_map: dict, pairs: list[tuple[str, int]]) -> dict | None:
-    if not case_map or not pairs:
-        return None
-    selected = [case_map[p] for p in pairs if p in case_map]
-    if not selected:
-        return None
-    depth = sum(_safe_float(v.get("depth_ratio")) for v in selected) / len(selected)
-    cnot = sum(_safe_float(v.get("cnot_ratio")) for v in selected) / len(selected)
-    over = sum(_safe_float(v.get("overhead_ratio")) for v in selected) / len(selected)
-    run = sum(_safe_float(v.get("time_ratio")) for v in selected) / len(selected)
-    combined, _ = _combined_score_from_ratios(depth, cnot, run, over)
-    return {
-        "sample_qose_depth": depth,
-        "sample_qose_cnot": cnot,
-        "sample_qose_overhead": over,
-        "sample_avg_run_time": run,
-        "sample_combined_score_raw": combined,
-    }
-
-
-def _select_random_pairs_from_case_map(
-    case_map: dict,
-    benches: list[str],
-    samples_per_bench: int,
-) -> list[tuple[str, int]]:
-    if not case_map:
-        return []
-    sample_seed_raw = os.getenv("QOSE_SAMPLE_SEED", "").strip()
-    sample_seed = int(sample_seed_raw) if sample_seed_raw else 123
-    rng = random.Random(sample_seed)
-
-    bench_to_sizes: dict[str, set[int]] = {}
-    for bench, size in case_map:
-        bench_to_sizes.setdefault(str(bench), set()).add(int(size))
-
-    picked: list[tuple[str, int]] = []
-    for bench in benches:
-        all_sizes = sorted(bench_to_sizes.get(bench, set()))
-        if not all_sizes:
-            continue
-        # Keep samples per bench fixed and non-identical by size when possible.
-        if len(all_sizes) < samples_per_bench:
-            chosen = list(all_sizes)
-        else:
-            chosen = rng.sample(all_sizes, samples_per_bench)
-        picked.extend((bench, int(s)) for s in chosen)
-    return picked
-
-
-def _corr_selection_for_target(
-    target_case_map: dict,
-    history_events: list[dict],
-    all_case_by_pid: dict,
-    target_k: int,
-) -> tuple[list[tuple[str, int]], list[dict]]:
-    if not target_case_map or target_k <= 0:
-        return [], []
-    latest_history: dict[str, dict] = {}
-    for ev in history_events:
-        pid = str(ev.get("program_hash", "")).strip()
-        if pid:
-            latest_history[pid] = ev
-    if len(latest_history) < _surrogate_min_train_rows():
-        return [], []
-
-    y_by_pid = {
-        pid: _safe_float(ev.get("global_combined_score"))
-        for pid, ev in latest_history.items()
-        if _safe_float(ev.get("global_combined_score")) == _safe_float(ev.get("global_combined_score"))
-    }
-    if len(y_by_pid) < _surrogate_min_train_rows():
-        return [], []
-
-    ranking = []
-    for pair in sorted(target_case_map.keys(), key=lambda p: (str(p[0]), int(p[1]))):
-        xs = []
-        ys = []
-        for pid, y in y_by_pid.items():
-            case_map = all_case_by_pid.get(pid, {})
-            case = case_map.get(pair)
-            if not case:
-                continue
-            score = _safe_float(case.get("case_score"))
-            if score != score:
-                continue
-            xs.append(score)
-            ys.append(y)
-        corr = _pearson_corr(xs, ys)
-        ranking.append(
-            {
-                "bench": pair[0],
-                "size": pair[1],
-                "corr": corr,
-                "abs_corr": abs(corr) if corr == corr else float("nan"),
-                "support": len(xs),
-            }
-        )
-
-    ranking.sort(
-        key=lambda r: (
-            -_safe_float(r.get("abs_corr"), default=-1.0),
-            -int(_safe_float(r.get("support"), default=0)),
-            str(r.get("bench", "")),
-            int(_safe_float(r.get("size"), default=0)),
-        )
-    )
-    selected = []
-    for row in ranking:
-        selected.append((str(row["bench"]), int(row["size"])))
-        if len(selected) >= target_k:
-            break
-    return selected, ranking
-
-
 def _extract_eval_events(rows: list[dict]) -> list[dict]:
     latest_by_eval: dict[int, dict] = {}
     latest_ts: dict[int, float] = {}
@@ -621,216 +368,57 @@ def _extract_eval_events(rows: list[dict]) -> list[dict]:
     return ordered
 
 
-def _build_case_maps(case_rows: list[dict]) -> dict[str, dict]:
-    by_pid: dict[str, dict] = {}
-    score_col = "case_score_piecewise" if _score_mode() == _SCORE_MODE_PIECEWISE else "case_score_legacy"
-    for r in _dedupe_case_rows_latest(case_rows):
-        pid = str(r.get("program_hash", "")).strip()
-        bench = str(r.get("bench", "")).strip()
-        try:
-            size = int(float(r.get("size")))
-        except Exception:
-            continue
-        if not pid or not bench:
-            continue
-        by_pid.setdefault(pid, {})[(bench, size)] = {
-            "depth_ratio": _safe_float(r.get("depth_ratio")),
-            "cnot_ratio": _safe_float(r.get("cnot_ratio")),
-            "time_ratio": _safe_float(r.get("time_ratio")),
-            "overhead_ratio": _safe_float(r.get("overhead_ratio")),
-            "case_score": _safe_float(r.get(score_col)),
-        }
-    return by_pid
-
-
-def _compute_surrogate_accuracy_trace(
+def _compute_surrogate_progress_trace(
     state_rows: list[dict],
-    case_rows: list[dict],
-    freeze_after_eval: int,
-    retrain_every: int,
 ) -> list[dict]:
     events = _extract_eval_events(state_rows)
     if not events:
         return []
-    case_by_pid = _build_case_maps(case_rows)
-    samples_per_bench = max(1, int(os.getenv("QOSE_SAMPLES_PER_BENCH", "1")))
-    model_factories = _surrogate_model_factories()
-    min_train = _surrogate_min_train_rows()
-
-    replay = []
-    for idx, ev in enumerate(events):
-        pid = ev["program_hash"]
-        target_case_map = case_by_pid.get(pid, {})
-        if not target_case_map:
-            continue
-        benches = [b for b, _ in BENCHES if any(pair[0] == b for pair in target_case_map.keys())]
-        target_k = max(1, len(benches) * samples_per_bench) if benches else max(1, samples_per_bench)
-        history = replay[:idx]
-        corr_pairs, corr_rank = _corr_selection_for_target(
-            target_case_map=target_case_map,
-            history_events=history,
-            all_case_by_pid=case_by_pid,
-            target_k=target_k,
-        )
-        random_pairs = _select_random_pairs_from_case_map(
-            case_map=target_case_map,
-            benches=benches or sorted({b for b, _ in target_case_map.keys()}),
-            samples_per_bench=samples_per_bench,
-        )
-        replay.append(
-            {
-                **ev,
-                "corr_pairs": corr_pairs,
-                "corr_summary": _score_from_case_subset(target_case_map, corr_pairs),
-                "random_summary": _score_from_case_subset(target_case_map, random_pairs),
-                "corr_support": int(_safe_float(corr_rank[0].get("support"), default=0)) if corr_rank else 0,
-                "corr_top_abs_corr": _safe_float(corr_rank[0].get("abs_corr")) if corr_rank else float("nan"),
-            }
-        )
-
-    if not replay:
+    full_only = [ev for ev in events if _safe_float(ev.get("global_combined_score")) == _safe_float(ev.get("global_combined_score"))]
+    if not full_only:
         return []
 
-    trace_rows = []
-    running = {}
-    baseline_names = ["baseline_random_no_pred", "baseline_corr_no_pred"]
-    for name in baseline_names + sorted(model_factories.keys()):
-        running[name] = {"sum": 0.0, "count": 0, "model": None, "last_fit_eval": None}
-
-    for i, ev in enumerate(replay):
-        eval_idx = int(ev["eval_index"])
-        global_score = _safe_float(ev["global_combined_score"])
-        is_rolling_refit = (
-            eval_idx > freeze_after_eval
-            and retrain_every > 0
-            and ((eval_idx - freeze_after_eval) % retrain_every == 0)
+    out = []
+    running_full = 0.0
+    running_selected = 0.0
+    for i, ev in enumerate(full_only, start=1):
+        full_score = _safe_float(ev.get("global_combined_score"))
+        selected_score = _safe_float(ev.get("sample_combined_score_raw"))
+        running_full += float(full_score)
+        running_selected += float(selected_score)
+        out.append(
+            {
+                "eval_index": int(ev.get("eval_index", 0)),
+                "program_hash": str(ev.get("program_hash", "")),
+                "full_score": full_score,
+                "selected_score": selected_score,
+                "running_avg_full_score": running_full / i,
+                "running_avg_selected_score": running_selected / i,
+                "num_full_points": i,
+            }
         )
-        phase = "rolling" if (eval_idx <= freeze_after_eval or is_rolling_refit) else "frozen"
-
-        for bname, summary_key in [
-            ("baseline_random_no_pred", "random_summary"),
-            ("baseline_corr_no_pred", "corr_summary"),
-        ]:
-            pred = float("nan")
-            summ = ev.get(summary_key)
-            if summ:
-                pred = _safe_float(summ.get("sample_combined_score_raw"))
-            abs_err = abs(pred - global_score) if pred == pred and global_score == global_score else float("nan")
-            if abs_err == abs_err:
-                running[bname]["sum"] += abs_err
-                running[bname]["count"] += 1
-            running_mae = (
-                running[bname]["sum"] / running[bname]["count"] if running[bname]["count"] > 0 else float("nan")
-            )
-            trace_rows.append(
-                {
-                    "eval_index": eval_idx,
-                    "program_hash": ev["program_hash"],
-                    "method": bname,
-                    "phase": phase,
-                    "global_combined_score": global_score,
-                    "predicted_score": pred,
-                    "abs_err": abs_err,
-                    "running_mae": running_mae,
-                    "train_rows": 0,
-                }
-            )
-
-        for mname, factory in sorted(model_factories.items()):
-            current_summary = ev.get("corr_summary")
-            pred = float("nan")
-            train_rows = 0
-            if current_summary:
-                latest_train: dict[str, dict] = {}
-                for prev in replay[:i]:
-                    if not prev.get("corr_summary"):
-                        continue
-                    latest_train[prev["program_hash"]] = prev
-                train_events = sorted(
-                    latest_train.values(),
-                    key=lambda r: (int(r["eval_index"]), float(r["timestamp_sec"])),
-                )
-                train_rows = len(train_events)
-                if train_rows >= min_train:
-                    x_train = [
-                        [_safe_float(te["corr_summary"].get(c)) for c in _SURROGATE_FEATURE_COLUMNS]
-                        for te in train_events
-                    ]
-                    y_train = [_safe_float(te.get("global_combined_score")) for te in train_events]
-                    x_cur = [[_safe_float(current_summary.get(c)) for c in _SURROGATE_FEATURE_COLUMNS]]
-                    if all(v == v for row_vals in x_train for v in row_vals) and all(v == v for v in y_train) and all(
-                        v == v for v in x_cur[0]
-                    ):
-                        state = running[mname]
-                        if eval_idx <= freeze_after_eval:
-                            model = factory()
-                            model.fit(x_train, y_train)
-                            state["model"] = model
-                            state["last_fit_eval"] = eval_idx
-                        else:
-                            model = state.get("model")
-                            last_fit_eval = state.get("last_fit_eval")
-                            need_refit = model is None
-                            if (not need_refit) and retrain_every > 0 and last_fit_eval is not None:
-                                if (eval_idx - int(last_fit_eval)) >= retrain_every:
-                                    need_refit = True
-                            if need_refit:
-                                model = factory()
-                                model.fit(x_train, y_train)
-                                state["model"] = model
-                                state["last_fit_eval"] = eval_idx
-                        try:
-                            pred = float(running[mname]["model"].predict(x_cur)[0])
-                        except Exception:
-                            pred = float("nan")
-
-            abs_err = abs(pred - global_score) if pred == pred and global_score == global_score else float("nan")
-            if abs_err == abs_err:
-                running[mname]["sum"] += abs_err
-                running[mname]["count"] += 1
-            running_mae = (
-                running[mname]["sum"] / running[mname]["count"] if running[mname]["count"] > 0 else float("nan")
-            )
-            trace_rows.append(
-                {
-                    "eval_index": eval_idx,
-                    "program_hash": ev["program_hash"],
-                    "method": mname,
-                    "phase": phase,
-                    "global_combined_score": global_score,
-                    "predicted_score": pred,
-                    "abs_err": abs_err,
-                    "running_mae": running_mae,
-                    "train_rows": train_rows,
-                }
-            )
-
-    return trace_rows
+    return out
 
 
-def _write_model_compare_csv(
+def _write_surrogate_progress_csv(
     path: Path,
     trace_rows: list[dict],
     eval_index: int,
     warmup_iters: int,
-    freeze_after_eval: int,
-    retrain_every: int,
+    refit_every: int,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "eval_index",
         "program_hash",
-        "method",
-        "phase",
-        "global_combined_score",
-        "predicted_score",
-        "abs_err",
-        "running_mae",
-        "train_rows",
+        "full_score",
+        "selected_score",
+        "running_avg_full_score",
+        "running_avg_selected_score",
+        "num_full_points",
         "snapshot_eval_index",
         "warmup_iters",
-        "freeze_after_eval",
-        "retrain_every",
+        "refit_every",
     ]
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -839,18 +427,16 @@ def _write_model_compare_csv(
             out = dict(row)
             out["snapshot_eval_index"] = eval_index
             out["warmup_iters"] = warmup_iters
-            out["freeze_after_eval"] = freeze_after_eval
-            out["retrain_every"] = retrain_every
+            out["refit_every"] = refit_every
             w.writerow({k: out.get(k, "") for k in fields})
 
 
-def _write_model_compare_pdf(
+def _write_surrogate_progress_pdf(
     path: Path,
     trace_rows: list[dict],
-    selected_model: str,
     eval_index: int,
-    freeze_after_eval: int,
-    retrain_every: int,
+    warmup_iters: int,
+    refit_every: int,
 ):
     try:
         import matplotlib.pyplot as plt
@@ -859,72 +445,24 @@ def _write_model_compare_pdf(
     if not trace_rows:
         return
 
-    by_method: dict[str, list[dict]] = {}
-    for row in trace_rows:
-        method = str(row.get("method", ""))
-        by_method.setdefault(method, []).append(row)
+    xs = [int(_safe_float(r.get("eval_index"), default=0)) for r in trace_rows]
+    y_sel = [_safe_float(r.get("running_avg_selected_score")) for r in trace_rows]
+    y_full = [_safe_float(r.get("running_avg_full_score")) for r in trace_rows]
+    raw_sel = [_safe_float(r.get("selected_score")) for r in trace_rows]
+    raw_full = [_safe_float(r.get("full_score")) for r in trace_rows]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.2), constrained_layout=True, sharey=True)
-    ax_roll, ax_frozen = axes
-    method_order = [
-        "baseline_random_no_pred",
-        "baseline_corr_no_pred",
-    ] + sorted(
-        [m for m in by_method.keys() if m not in {"baseline_random_no_pred", "baseline_corr_no_pred"}]
+    fig, ax = plt.subplots(1, 1, figsize=(9.2, 5.0), constrained_layout=True)
+    ax.plot(xs, y_sel, marker="o", linewidth=2.0, color="tab:blue", label="Selected score (running avg)")
+    ax.plot(xs, y_full, marker="s", linewidth=2.0, color="tab:orange", label="Full score (running avg)")
+    ax.scatter(xs, raw_sel, s=22, alpha=0.35, color="tab:blue", label="Selected score (point)")
+    ax.scatter(xs, raw_full, s=22, alpha=0.35, color="tab:orange", label="Full score (point)")
+    ax.set_xlabel("Evaluation index (rolling/full-eval points)")
+    ax.set_ylabel("Combined score")
+    ax.set_title(
+        f"Surrogate Progress @ eval {eval_index} (warmup={warmup_iters}, refit={refit_every})"
     )
-    colors = {
-        "baseline_random_no_pred": "tab:gray",
-        "baseline_corr_no_pred": "tab:olive",
-    }
-
-    def _plot_phase(ax, phase_name: str, title: str):
-        for method in method_order:
-            rows = [
-                r
-                for r in sorted(
-                    by_method.get(method, []),
-                    key=lambda r: int(_safe_float(r.get("eval_index"), default=0)),
-                )
-                if str(r.get("phase", "")) == phase_name
-            ]
-            if not rows:
-                continue
-            xs = [int(_safe_float(r.get("eval_index"), default=0)) for r in rows]
-            ys = [_safe_float(r.get("running_mae")) for r in rows]
-            valid = [(x, y) for x, y in zip(xs, ys) if y == y]
-            if not valid:
-                continue
-            xs = [x for x, _ in valid]
-            ys = [y for _, y in valid]
-            style = "--" if method.startswith("baseline_") else "-"
-            lw = 2.4 if method == selected_model else 1.8
-            marker = "s" if method.startswith("baseline_") else "o"
-            color = colors.get(method, None)
-            label = method
-            if method == selected_model:
-                label = f"{method} (selected)"
-            ax.plot(xs, ys, linestyle=style, marker=marker, linewidth=lw, color=color, label=label)
-
-        ax.set_xlabel("Evaluation index (k)")
-        ax.set_title(title)
-        ax.grid(alpha=0.25)
-
-    _plot_phase(
-        ax_roll,
-        "rolling",
-        f"Rolling Points (<= {freeze_after_eval} and every {retrain_every})",
-    )
-    _plot_phase(
-        ax_frozen,
-        "frozen",
-        "Frozen Between Refreshes",
-    )
-
-    ax_roll.set_ylabel("Running mean absolute error")
-    handles, labels = ax_roll.get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=3, fontsize=8)
-    fig.suptitle(f"Surrogate Accuracy Trend @ eval {eval_index}", fontsize=12)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300)
     plt.close(fig)
@@ -973,57 +511,64 @@ def _dedupe_case_rows_latest(rows: list[dict]) -> list[dict]:
     return list(latest.values())
 
 
-def _refresh_surrogate_model_selection(
+def _refresh_surrogate_progress(
     state_csv: Path,
     meta_json: Path,
-    cases_csv: Path,
     eval_index: int,
     warmup_iters: int,
+    refit_every: int,
     write_plot: bool,
-) -> tuple[str, dict[str, dict], int]:
-    rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
-    stats, labeled_count = _compute_surrogate_model_stats(rows)
-    fallback = _surrogate_ml_model_name()
-    selected = _choose_best_surrogate_model(stats, fallback=fallback)
+) -> tuple[int, float, float]:
+    rows = _extract_eval_events(_load_surrogate_rows(state_csv))
+    full_rows = [
+        r for r in rows
+        if _safe_float(r.get("global_combined_score")) == _safe_float(r.get("global_combined_score"))
+    ]
+    num_full = len(full_rows)
+    avg_full = (
+        sum(_safe_float(r.get("global_combined_score")) for r in full_rows) / num_full
+        if num_full > 0
+        else float("nan")
+    )
+    avg_selected = (
+        sum(_safe_float(r.get("sample_combined_score_raw")) for r in full_rows) / num_full
+        if num_full > 0
+        else float("nan")
+    )
 
     def _update(meta: dict) -> dict:
-        meta["selected_ml_model"] = selected
-        meta["selected_ml_model_updated_eval"] = int(eval_index)
-        meta["labeled_rows"] = int(labeled_count)
-        meta["model_compare_stats"] = stats
-        meta["model_compare_warmup_iters"] = int(warmup_iters)
+        meta["full_eval_points"] = int(num_full)
+        meta["avg_full_score"] = float(avg_full) if avg_full == avg_full else None
+        meta["avg_selected_score"] = float(avg_selected) if avg_selected == avg_selected else None
+        meta["selection_strategy"] = _surrogate_selection_mode()
+        meta["progress_warmup_iters"] = int(warmup_iters)
+        meta["progress_refit_every"] = int(refit_every)
+        meta["progress_updated_eval"] = int(eval_index)
         return meta
 
     _update_meta_json(meta_json, _update)
 
     if write_plot:
-        csv_path = _surrogate_model_compare_csv(state_csv)
-        pdf_path = _surrogate_model_compare_pdf(state_csv)
-        freeze_after_eval = max(1, int(warmup_iters))
-        retrain_every = _surrogate_refit_every()
-        trace_rows = _compute_surrogate_accuracy_trace(
+        csv_path = _surrogate_progress_csv(state_csv)
+        pdf_path = _surrogate_progress_pdf(state_csv)
+        trace_rows = _compute_surrogate_progress_trace(
             state_rows=_load_surrogate_rows(state_csv),
-            case_rows=_load_surrogate_case_rows(cases_csv),
-            freeze_after_eval=freeze_after_eval,
-            retrain_every=retrain_every,
         )
-        _write_model_compare_csv(
+        _write_surrogate_progress_csv(
             csv_path,
             trace_rows=trace_rows,
             eval_index=eval_index,
             warmup_iters=warmup_iters,
-            freeze_after_eval=freeze_after_eval,
-            retrain_every=retrain_every,
+            refit_every=refit_every,
         )
-        _write_model_compare_pdf(
+        _write_surrogate_progress_pdf(
             pdf_path,
             trace_rows=trace_rows,
-            selected_model=selected,
             eval_index=eval_index,
-            freeze_after_eval=freeze_after_eval,
-            retrain_every=retrain_every,
+            warmup_iters=warmup_iters,
+            refit_every=refit_every,
         )
-    return selected, stats, labeled_count
+    return num_full, avg_selected, avg_full
 
 
 def _sample_pairs_target_count(benches: list[str]) -> int:
@@ -1109,6 +654,62 @@ def _select_bench_size_pairs_by_correlation(
         pair = (str(row["bench"]), int(row["size"]))
         if pair in candidate_set:
             selected.append(pair)
+        if len(selected) >= target_k:
+            break
+    return selected, ranking
+
+
+def _select_bench_size_pairs_by_worst_case(
+    benches: list[str],
+    candidate_pairs: list[tuple[str, int]],
+    case_rows: list[dict],
+) -> tuple[list[tuple[str, int]], list[dict]]:
+    target_k = _sample_pairs_target_count(benches)
+    score_col = "case_score_piecewise" if _score_mode() == _SCORE_MODE_PIECEWISE else "case_score_legacy"
+    sums: dict[tuple[str, int], float] = {}
+    counts: dict[tuple[str, int], int] = {}
+    for row in _dedupe_case_rows_latest(case_rows):
+        try:
+            pair = (str(row.get("bench", "")), int(float(row.get("size", "nan"))))
+        except Exception:
+            continue
+        score = _safe_float(row.get(score_col))
+        if score != score:
+            continue
+        sums[pair] = sums.get(pair, 0.0) + float(score)
+        counts[pair] = counts.get(pair, 0) + 1
+
+    ranking = []
+    candidate_set = set(candidate_pairs)
+    for pair in candidate_pairs:
+        support = counts.get(pair, 0)
+        mean_score = (sums[pair] / support) if support > 0 else float("nan")
+        ranking.append(
+            {
+                "bench": pair[0],
+                "size": pair[1],
+                "mean_case_score": mean_score,
+                "support": support,
+            }
+        )
+
+    ranking.sort(
+        key=lambda r: (
+            _safe_float(r.get("mean_case_score"), default=float("inf")),
+            -int(_safe_float(r.get("support"), default=0)),
+            str(r.get("bench", "")),
+            int(_safe_float(r.get("size"), default=0)),
+        )
+    )
+
+    selected = []
+    for row in ranking:
+        pair = (str(row["bench"]), int(row["size"]))
+        if pair not in candidate_set:
+            continue
+        if int(_safe_float(row.get("support"), default=0)) <= 0:
+            continue
+        selected.append(pair)
         if len(selected) >= target_k:
             break
     return selected, ranking
@@ -1568,10 +1169,9 @@ def _evaluate_impl(program_path):
         return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
 
     surrogate_enabled = _surrogate_enabled()
-    surrogate_prediction_enabled = _surrogate_prediction_enabled()
     surrogate_warmup_iters = _surrogate_warmup_iters()
     surrogate_refit_every = _surrogate_refit_every()
-    surrogate_model_name = _surrogate_ml_model_name()
+    surrogate_selection_strategy = _surrogate_selection_mode()
     state_csv = _surrogate_state_csv()
     meta_json = _surrogate_meta_json(state_csv)
     cases_csv = _surrogate_cases_csv(state_csv)
@@ -1599,33 +1199,46 @@ def _evaluate_impl(program_path):
     if not candidate_pairs:
         return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
 
-    corr_selection_used = False
-    corr_selection_support = 0
-    corr_selection_top_abs_corr = float("nan")
-    corr_ranking = []
+    selection_mode = "random"
+    selection_support = 0
+    selection_signal = float("nan")
 
     try:
         sample_pairs: list[tuple[str, int]] = []
         if surrogate_enabled:
             state_rows = _load_surrogate_rows(state_csv)
             case_rows = _load_surrogate_case_rows(cases_csv)
-            sample_pairs, corr_ranking = _select_bench_size_pairs_by_correlation(
-                benches=benches,
-                candidate_pairs=candidate_pairs,
-                state_rows=state_rows,
-                case_rows=case_rows,
-            )
-            if sample_pairs:
-                corr_selection_used = True
-                if corr_ranking:
-                    corr_selection_support = int(
-                        _safe_float(corr_ranking[0].get("support"), default=0)
-                    )
-                    corr_selection_top_abs_corr = _safe_float(
-                        corr_ranking[0].get("abs_corr")
-                    )
+            ranking = []
+            if surrogate_selection_strategy == "correlation":
+                sample_pairs, ranking = _select_bench_size_pairs_by_correlation(
+                    benches=benches,
+                    candidate_pairs=candidate_pairs,
+                    state_rows=state_rows,
+                    case_rows=case_rows,
+                )
+                if sample_pairs:
+                    selection_mode = "correlation"
+                    if ranking:
+                        selection_support = int(
+                            _safe_float(ranking[0].get("support"), default=0)
+                        )
+                        selection_signal = _safe_float(ranking[0].get("abs_corr"))
+            elif surrogate_selection_strategy == "worst":
+                sample_pairs, ranking = _select_bench_size_pairs_by_worst_case(
+                    benches=benches,
+                    candidate_pairs=candidate_pairs,
+                    case_rows=case_rows,
+                )
+                if sample_pairs:
+                    selection_mode = "worst"
+                    if ranking:
+                        selection_support = int(
+                            _safe_float(ranking[0].get("support"), default=0)
+                        )
+                        selection_signal = _safe_float(ranking[0].get("mean_case_score"))
         if not sample_pairs:
             sample_pairs = _select_bench_size_pairs(args, benches)
+            selection_mode = "random"
     except ValueError as exc:
         return {"combined_score": -1000.0}, {"info": str(exc)}
     if not sample_pairs:
@@ -1644,24 +1257,10 @@ def _evaluate_impl(program_path):
     score_mode = str(sample_res["score_mode"])
     score_meta = _score_metadata(score_mode)
 
-    sample_features = {
-        "sample_qose_depth": float(sample_res["avg_depth"]),
-        "sample_qose_cnot": float(sample_res["avg_cnot"]),
-        "sample_qose_overhead": float(sample_res["avg_overhead"]),
-        "sample_avg_run_time": float(sample_res["avg_run_time"]),
-        "sample_combined_score_raw": sample_combined_raw,
-    }
-
     global_combined_score = float("nan")
-    global_num_cases = 0
     surrogate_source = "sample_raw"
-    predicted_ml = float("nan")
-    surrogate_train_rows = 0
     full_eval_error = ""
     timestamp_sec = time.time()
-    selected_model_name = surrogate_model_name
-    model_compare_stats = {}
-    model_compare_labeled_rows = 0
 
     if surrogate_enabled:
         if full_eval_claimed:
@@ -1694,10 +1293,10 @@ def _evaluate_impl(program_path):
                 "eval_index": eval_index,
                 "program_hash": program_hash,
                 "timestamp_sec": timestamp_sec,
-                "sample_qose_depth": sample_features["sample_qose_depth"],
-                "sample_qose_cnot": sample_features["sample_qose_cnot"],
-                "sample_qose_overhead": sample_features["sample_qose_overhead"],
-                "sample_avg_run_time": sample_features["sample_avg_run_time"],
+                "sample_qose_depth": float(sample_res["avg_depth"]),
+                "sample_qose_cnot": float(sample_res["avg_cnot"]),
+                "sample_qose_overhead": float(sample_res["avg_overhead"]),
+                "sample_avg_run_time": float(sample_res["avg_run_time"]),
                 "sample_combined_score_raw": sample_combined_raw,
                 "global_combined_score": (
                     global_combined_score if global_combined_score == global_combined_score else ""
@@ -1705,31 +1304,18 @@ def _evaluate_impl(program_path):
                 "score_mode": score_mode,
             },
         )
-        if surrogate_prediction_enabled:
-            should_write_model_plot = True
-            selected_model_name, model_compare_stats, model_compare_labeled_rows = _refresh_surrogate_model_selection(
-                state_csv=state_csv,
-                meta_json=meta_json,
-                cases_csv=cases_csv,
-                eval_index=eval_index,
-                warmup_iters=surrogate_warmup_iters,
-                write_plot=should_write_model_plot,
-            )
-            train_rows = _dedupe_surrogate_rows_latest(_load_surrogate_rows(state_csv))
-            ml_model, surrogate_train_rows = _fit_surrogate_model(
-                train_rows, ml_model_name=selected_model_name
-            )
-            predicted_ml = _predict_surrogate_score(
-                ml_model=ml_model,
-                sample_features=sample_features,
-            )
+        _refresh_surrogate_progress(
+            state_csv=state_csv,
+            meta_json=meta_json,
+            eval_index=eval_index,
+            warmup_iters=surrogate_warmup_iters,
+            refit_every=surrogate_refit_every,
+            write_plot=True,
+        )
 
     if global_combined_score == global_combined_score:
         combined_score_final = global_combined_score
         surrogate_source = "global_full_eval"
-    elif surrogate_prediction_enabled and predicted_ml == predicted_ml:
-        combined_score_final = predicted_ml
-        surrogate_source = "ml_predict"
     else:
         combined_score_final = sample_combined_raw
         surrogate_source = "sample_raw"
@@ -1743,9 +1329,6 @@ def _evaluate_impl(program_path):
         "combined_score": float(combined_score_final),
     }
 
-    score_source_mode = "prediction" if surrogate_source == "ml_predict" else "raw"
-    selection_mode = "correlation" if corr_selection_used else "random"
-
     if surrogate_enabled:
         try:
             _append_surrogate_selection_row(
@@ -1755,11 +1338,13 @@ def _evaluate_impl(program_path):
                     "timestamp_sec": timestamp_sec,
                     "program_hash": program_hash,
                     "selection_mode": selection_mode,
-                    "score_source": score_source_mode,
+                    "score_source": "raw",
                     "sample_count": len(sample_pairs),
                     "sample_pairs_json": json.dumps(sample_pairs),
-                    "corr_support": corr_selection_support,
-                    "corr_top_abs_corr": corr_selection_top_abs_corr,
+                    "selection_support": selection_support,
+                    "selection_signal": selection_signal,
+                    "corr_support": selection_support,
+                    "corr_top_abs_corr": selection_signal,
                     "full_eval_claimed": int(bool(full_eval_claimed)),
                     "full_eval_reason": full_eval_reason,
                 },
@@ -1780,7 +1365,6 @@ def _evaluate_impl(program_path):
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
         # Minimal surrogate transparency for evolution prompt.
         "qose_selection_mode": selection_mode,
-        "qose_score_source": score_source_mode,
     }
     summary.update(score_meta)
     artifacts = {

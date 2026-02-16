@@ -98,11 +98,10 @@ prompt:
       - qose_overhead: average circuit-count ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize): evaluator score used by evolution ranking.
-        It uses global full-eval score during warmup, then surrogate prediction.
-        Sampled circuits are selected by correlation with global score (from warmup history).
-        During warmup, evaluator compares multiple ML regressors by rolling one-step
-        mean absolute error and auto-selects the best model.
-        After warmup, evaluator performs periodic full-eval recalibration.
+        It uses global full-eval score on warmup/periodic refit points,
+        and otherwise uses the sampled raw score.
+        Sampled circuits are selected by strategy:
+        correlation-based or worst-performance-based (from historical full-eval cases).
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.
@@ -119,8 +118,7 @@ prompt:
       - qose_budget: budget used for all cases
       - qose_run_sec_avg: average runtime of evolved mitigator
       - qos_run_sec_avg: average runtime of baseline QOS
-      - qose_selection_mode: "random" or "correlation"
-      - qose_score_source: "raw" or "prediction"
+      - qose_selection_mode: "random", "correlation", or "worst"
       - gv_cost_calls_total: total GV cost calls (evolved)
       - wc_cost_calls_total: total WC cost calls (evolved)
       - qos_gv_cost_calls_total: total GV cost calls (baseline)
