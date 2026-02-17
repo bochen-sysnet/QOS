@@ -22,6 +22,7 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
+  QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir

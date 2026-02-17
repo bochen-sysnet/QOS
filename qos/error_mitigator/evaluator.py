@@ -9,6 +9,7 @@ import multiprocessing as mp
 import csv
 import hashlib
 import json
+import ast
 import fcntl
 from pathlib import Path
 from types import SimpleNamespace
@@ -576,6 +577,89 @@ def _sample_pairs_target_count(benches: list[str]) -> int:
     if samples_per_bench <= 0:
         raise ValueError("QOSE_SAMPLES_PER_BENCH must be >= 1")
     return max(1, len(benches) * samples_per_bench)
+
+
+def _fixed_bench_size_pairs_from_env(benches: list[str]) -> list[tuple[str, int]] | None:
+    raw = os.getenv("QOSE_FIXED_BENCH_SIZE_PAIRS", "").strip()
+    if not raw:
+        return None
+
+    payloads = [raw]
+    # Be tolerant to shell-escaped doubled quotes like [[""qaoa_r3"",22], ...]
+    if '""' in raw:
+        payloads.append(raw.replace('""', '"'))
+
+    parsed = None
+    for text in payloads:
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                break
+            except Exception:
+                continue
+        if parsed is not None:
+            break
+
+    if parsed is None:
+        raise ValueError(
+            "QOSE_FIXED_BENCH_SIZE_PAIRS must be a list of [bench, size] pairs; "
+            "example: [[\"qaoa_r3\",22],[\"bv\",20]]"
+        )
+    if not isinstance(parsed, (list, tuple)):
+        raise ValueError("QOSE_FIXED_BENCH_SIZE_PAIRS must parse to a list")
+
+    valid_benches = {b for b, _ in BENCHES}
+    enabled_benches = set(benches)
+    fixed_pairs: list[tuple[str, int]] = []
+    seen = set()
+
+    for idx, item in enumerate(parsed):
+        if isinstance(item, dict):
+            bench = str(item.get("bench", "")).strip()
+            size_raw = item.get("size", None)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            bench = str(item[0]).strip()
+            size_raw = item[1]
+        else:
+            raise ValueError(
+                f"QOSE_FIXED_BENCH_SIZE_PAIRS entry #{idx} must be [bench,size] or "
+                "{'bench':..., 'size':...}"
+            )
+
+        if bench not in valid_benches:
+            raise ValueError(f"Unknown bench in QOSE_FIXED_BENCH_SIZE_PAIRS: {bench}")
+        if bench not in enabled_benches:
+            raise ValueError(
+                f"Bench {bench} is not enabled by QOSE_BENCHES for this run"
+            )
+
+        try:
+            size = int(size_raw)
+        except Exception:
+            try:
+                size = int(float(size_raw))
+            except Exception:
+                raise ValueError(
+                    f"Invalid size in QOSE_FIXED_BENCH_SIZE_PAIRS for bench={bench}: {size_raw}"
+                )
+
+        pair = (bench, size)
+        if pair in seen:
+            continue
+
+        try:
+            _load_qasm_circuit(bench, size)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid/unavailable circuit in QOSE_FIXED_BENCH_SIZE_PAIRS: ({bench},{size}): {exc}"
+            )
+
+        seen.add(pair)
+        fixed_pairs.append(pair)
+
+    if not fixed_pairs:
+        raise ValueError("QOSE_FIXED_BENCH_SIZE_PAIRS is empty after parsing")
+    return fixed_pairs
 
 
 def _select_bench_size_pairs_by_correlation(
@@ -1195,8 +1279,13 @@ def _evaluate_impl(program_path):
 
     size_min = int(os.getenv("QOSE_SIZE_MIN", "12"))
     size_max = int(os.getenv("QOSE_SIZE_MAX", "24"))
+    try:
+        fixed_pairs = _fixed_bench_size_pairs_from_env(benches)
+    except ValueError as exc:
+        return {"combined_score": -1000.0}, {"info": str(exc)}
+
     candidate_pairs = _collect_candidate_pairs(benches, size_min, size_max)
-    if not candidate_pairs:
+    if not candidate_pairs and (surrogate_enabled or not fixed_pairs):
         return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
 
     selection_mode = "random"
@@ -1205,7 +1294,15 @@ def _evaluate_impl(program_path):
 
     try:
         sample_pairs: list[tuple[str, int]] = []
-        if surrogate_enabled:
+        if fixed_pairs:
+            sample_pairs = fixed_pairs
+            selection_mode = "fixed"
+            selection_support = len(sample_pairs)
+            logger.warning(
+                "Using fixed bench/size pairs from QOSE_FIXED_BENCH_SIZE_PAIRS: %s",
+                ", ".join(f"({b},{s})" for b, s in sample_pairs),
+            )
+        elif surrogate_enabled:
             state_rows = _load_surrogate_rows(state_csv)
             case_rows = _load_surrogate_case_rows(cases_csv)
             ranking = []
@@ -1363,8 +1460,6 @@ def _evaluate_impl(program_path):
         "qos_depth_avg": sample_res["qos_depth_avg"],
         "qos_cnot_avg": sample_res["qos_cnot_avg"],
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
-        # Minimal surrogate transparency for evolution prompt.
-        "qose_selection_mode": selection_mode,
     }
     summary.update(score_meta)
     artifacts = {
