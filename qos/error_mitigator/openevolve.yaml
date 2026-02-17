@@ -162,7 +162,7 @@ database:
 
   population_size: 100
   archive_size: 20
-  num_islands: 4
+  num_islands: 5
 
   migration_interval: 30
   migration_rate: 0.12

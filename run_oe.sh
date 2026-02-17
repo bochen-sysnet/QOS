@@ -39,10 +39,21 @@ Example:
 USAGE
 }
 
+shell_join() {
+  local out=""
+  local arg
+  for arg in "$@"; do
+    out+=" $(printf '%q' "$arg")"
+  done
+  echo "${out# }"
+}
+
 if [[ $# -lt 2 ]]; then
   usage
   exit 1
 fi
+
+ORIGINAL_INVOCATION=("$0" "$@")
 
 PROFILE="$1"
 OUTPUT_DIR="$2"
@@ -159,6 +170,32 @@ case "$PROFILE" in
 if [[ "$REPEAT" -lt 1 ]]; then
   REPEAT=1
 fi
+
+record_run_invocation() {
+  local ts cmd_line runner_cmd log_path
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  cmd_line="$(shell_join "${ORIGINAL_INVOCATION[@]}")"
+  runner_cmd="$(shell_join conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
+    "$TARGET_PATH" \
+    qos/error_mitigator/evaluator.py \
+    --config "$CONFIG_PATH" \
+    --output "$OUTPUT_DIR" \
+    "${EXTRA_ARGS[@]}")"
+  log_path="$OUTPUT_DIR/run_command.log"
+  {
+    echo "[$ts]"
+    echo "invocation: $cmd_line"
+    echo "profile: $PROFILE"
+    echo "output_dir: $OUTPUT_DIR"
+    echo "target_path: $TARGET_PATH"
+    echo "runner_command: $runner_cmd"
+    echo "effective_env:"
+    env | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_API_BASE|OPENAI_MODEL|OPENAI_SERVICE_TIER|GEMINI_RPM|RESUME_LATEST)=' | sort || true
+    echo
+  } >> "$log_path"
+}
+
+record_run_invocation
 
 run_once() {
   local -a run_args=("${EXTRA_ARGS[@]}")
