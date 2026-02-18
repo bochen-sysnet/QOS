@@ -23,9 +23,9 @@ llm:
   temperature: 0.7
   top_p: 0.9
   max_tokens: 4096
-  timeout: 450
+  timeout: 600
   retries: 3
-  retry_delay: 5
+  retry_delay: 10
 
 prompt:
   system_message: |
@@ -142,9 +142,7 @@ prompt:
       B) Explore size_to_reach efficiently instead of using two while loops iteratively.
       C) Explore early stopping rules for WC and GV.
       D) Skip certain size_to_reach values based on heuristics.
-
-    ```
-
+      
   evaluator_system_message: "You are a strict code reviewer. Do not add commentary."
   num_top_programs: 3
   num_diverse_programs: 2
@@ -162,7 +160,7 @@ database:
 
   population_size: 100
   archive_size: 20
-  num_islands: 5
+  num_islands: 4
 
   migration_interval: 30
   migration_rate: 0.12
