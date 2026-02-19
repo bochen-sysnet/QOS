@@ -23,6 +23,9 @@ Environment variables (override defaults):
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
+  OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
+  OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high
+  OPENEVOLVE_GEMINI_MAX_OUTPUT_TOKENS  Override maxOutputTokens for Gemini native calls
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir

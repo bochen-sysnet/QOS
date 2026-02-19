@@ -6,6 +6,9 @@ import random
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from openevolve.cli import main as openevolve_main
 from openevolve.llm.openai import OpenAILLM
@@ -17,6 +20,7 @@ from openevolve.utils.metrics_utils import safe_numeric_average
 
 _GEMINI_API_PREFIX = "https://generativelanguage.googleapis.com/"
 _OPENAI_API_PREFIX = "https://api.openai.com/"
+_ANTHROPIC_API_PREFIX = "https://api.anthropic.com/"
 _PROMPT_ARTIFACTS_PATCHED = False
 _PROMPT_LOGGING_PATCHED = False
 _EVALUATOR_ARTIFACTS_PATCHED = False
@@ -26,6 +30,7 @@ _PROCESS_PARALLEL_PATCHED = False
 _PROMPT_CONFIG_PATCHED = False
 _LLM_CONFIG_PATCHED = False
 _EVALUATOR_CONFIG_PATCHED = False
+_logger = logging.getLogger(__name__)
 
 
 def _get_inspiration_limit(config) -> int:
@@ -34,8 +39,8 @@ def _get_inspiration_limit(config) -> int:
         try:
             return max(0, int(env_value))
         except ValueError:
-            return 1
-    return 1
+            return 3
+    return 3
 
 
 def _install_prompt_config_overrides() -> None:
@@ -311,14 +316,153 @@ def _extract_code_block(text: str) -> str:
     return text
 
 
+def _flatten_message_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _split_system_and_user_from_messages(messages: list[dict]) -> tuple[str, str]:
+    system_parts: list[str] = []
+    conversation_parts: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "user")).lower()
+        content = _flatten_message_content(message.get("content", ""))
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        if role == "user":
+            conversation_parts.append(content)
+            continue
+        conversation_parts.append(f"[{role}] {content}")
+    return "\n\n".join(system_parts), "\n\n".join(conversation_parts)
+
+
+def _gemini_native_request(api_key: str, params: dict) -> str:
+    model = str(params.get("model", "")).strip()
+    if not model:
+        raise RuntimeError("Gemini native call requires a model name")
+    model_path = model if model.startswith("models/") else f"models/{model}"
+
+    system_text, user_text = _split_system_and_user_from_messages(params.get("messages") or [])
+    if not user_text:
+        raise RuntimeError("Gemini native call requires non-empty user content")
+
+    generation_config: dict[str, object] = {}
+    max_out = params.get("max_output_tokens", params.get("max_tokens"))
+    env_max_out = os.getenv("OPENEVOLVE_GEMINI_MAX_OUTPUT_TOKENS", "").strip()
+    if env_max_out:
+        try:
+            max_out = int(env_max_out)
+        except ValueError:
+            pass
+    if max_out is not None:
+        try:
+            generation_config["maxOutputTokens"] = int(max_out)
+        except (TypeError, ValueError):
+            pass
+    if "temperature" in params:
+        generation_config["temperature"] = params["temperature"]
+    if "top_p" in params:
+        generation_config["topP"] = params["top_p"]
+
+    payload: dict[str, object] = {
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+    if generation_config:
+        payload["generationConfig"] = generation_config
+
+    thinking_level = os.getenv("OPENEVOLVE_GEMINI_THINKING_LEVEL", "").strip().lower()
+    if thinking_level not in {"low", "medium", "high"}:
+        # Gemini 3 models can burn most of the 8k total token window on hidden
+        # reasoning for long prompts, which leaves too little output and causes
+        # truncated code. Use a conservative default unless caller overrides it.
+        if "gemini-3-" in model_path:
+            thinking_level = "low"
+    if thinking_level in {"low", "medium", "high"}:
+        generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"{model_path}:generateContent?key={urllib.parse.quote(api_key)}"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    timeout_sec = 300
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini native HTTP {exc.code}: {body}") from exc
+
+    if isinstance(raw, dict) and raw.get("error"):
+        raise RuntimeError(f"Gemini native error: {raw['error']}")
+    candidates = (raw or {}).get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini native returned no candidates: {raw}")
+    first = candidates[0] or {}
+    parts = ((first.get("content") or {}).get("parts") or [])
+    text = "".join(
+        part.get("text", "") for part in parts if isinstance(part, dict) and "text" in part
+    ).strip()
+    if not text:
+        finish_reason = first.get("finishReason", "unknown")
+        raise RuntimeError(f"Gemini native returned empty text (finishReason={finish_reason})")
+    return text
+
+
+async def _gemini_native_request_async(api_key: str, params: dict) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _gemini_native_request(api_key, params))
+
+
 def _install_gemini_overrides() -> None:
     original_call = OpenAILLM._call_api
     original_generate = OpenAILLM.generate_with_context
 
     async def wrapped_call(self, params):
+        # Anthropic OpenAI-compatible endpoint rejects requests that specify
+        # both temperature and top_p for Claude models.
+        if str(self.api_base).startswith(_ANTHROPIC_API_PREFIX) or str(self.model).lower().startswith(
+            "claude"
+        ):
+            if "temperature" in params and "top_p" in params:
+                params.pop("top_p", None)
+
         if str(self.api_base).startswith(_GEMINI_API_PREFIX):
-            if "max_tokens" in params and "max_output_tokens" not in params:
-                params["max_output_tokens"] = params["max_tokens"]
+            use_native = _env_flag("OPENEVOLVE_GEMINI_NATIVE", default=True)
+            if use_native:
+                api_key = os.getenv("OPENAI_API_KEY", "").strip()
+                if api_key:
+                    try:
+                        return await _gemini_native_request_async(api_key, params)
+                    except Exception as exc:
+                        _logger.warning(
+                            "Gemini native call failed; falling back to OpenAI-compatible endpoint: %s",
+                            exc,
+                        )
         if str(self.api_base).startswith(_OPENAI_API_PREFIX):
             service_tier = os.getenv("OPENAI_SERVICE_TIER", "").strip()
             if service_tier and "service_tier" not in params:
