@@ -217,6 +217,32 @@ def _resume_signature(args, benches, sizes, methods: List[str]) -> Dict[str, obj
     }
 
 
+def _resume_signature_compatible(
+    saved_signature: Optional[Dict[str, object]],
+    requested_signature: Dict[str, object],
+) -> bool:
+    if not isinstance(saved_signature, dict):
+        return False
+    # Allow method superset resume: previously computed methods can be reused
+    # when current run requests additional methods (e.g., add QOSE later).
+    saved_with_real = bool(saved_signature.get("with_real_fidelity", False))
+    req_with_real = bool(requested_signature.get("with_real_fidelity", False))
+    for key, req_val in requested_signature.items():
+        if key == "methods":
+            continue
+        if key in {"with_fidelity", "with_real_fidelity"}:
+            # These can move in either direction; partial row reuse handles missing fields.
+            continue
+        if key in {"real_backend", "real_fidelity_shots"} and (not saved_with_real or not req_with_real):
+            # Real-fidelity settings are irrelevant unless both signatures include real fidelity.
+            continue
+        if saved_signature.get(key) != req_val:
+            return False
+    saved_methods = set(saved_signature.get("methods", []) or [])
+    req_methods = set(requested_signature.get("methods", []) or [])
+    return saved_methods.issubset(req_methods)
+
+
 def _load_resume_state(path: Path, signature: Dict[str, object]) -> Optional[Dict[str, object]]:
     if not path.exists():
         return None
@@ -226,7 +252,7 @@ def _load_resume_state(path: Path, signature: Dict[str, object]) -> Optional[Dic
         return None
     if int(data.get("version", 0)) != _RESUME_STATE_VERSION:
         return None
-    if data.get("signature") != signature:
+    if not _resume_signature_compatible(data.get("signature"), signature):
         return None
     return data
 
@@ -708,6 +734,25 @@ def _parse_methods(value: str, include_qose: bool, qose_methods: Optional[List[s
             ordered.append(method)
             seen.add(method)
     return ordered
+
+
+def _parse_real_fidelity_compute_methods(value: str) -> Optional[set[str]]:
+    raw = value.strip()
+    if not raw or raw.lower() in {"all", "default"}:
+        return None
+    requested: set[str] = set()
+    for entry in raw.split(","):
+        key = entry.strip().lower()
+        if not key:
+            continue
+        if key in {"qiskit", "baseline"}:
+            requested.add("Qiskit")
+            continue
+        method = METHOD_ALIASES.get(key)
+        if method is None:
+            raise ValueError(f"Unknown method in --real-fidelity-compute-methods: {entry}")
+        requested.add(method)
+    return requested
 
 
 def _append_cost_search_log(path: str, row: Dict[str, object]) -> None:
@@ -2491,12 +2536,20 @@ def _plot_timing_total_panel(
         ax.text(x[idx], total, f"{total:.2f}s", ha="center", va="bottom", fontsize=9)
 
 
-def _reorder_methods_qos_last(methods: List[str]) -> List[str]:
-    ordered = [m for m in methods if m not in {"QOS", "CutQC"}]
-    if "CutQC" in methods:
-        ordered.append("CutQC")
-    if "QOS" in methods:
-        ordered.append("QOS")
+def _reorder_methods_for_panels(methods: List[str]) -> List[str]:
+    # Keep panel order consistent with evaluation comparison preference:
+    # FrozenQubits, CutQC, QOS, QOSE (then any other methods).
+    priority = ["FrozenQubits", "CutQC", "QOS", "QOSE", "QOSN", "qwen", "gemini", "gpt"]
+    ordered: List[str] = []
+    seen = set()
+    for method in priority:
+        if method in methods and method not in seen:
+            ordered.append(method)
+            seen.add(method)
+    for method in methods:
+        if method not in seen:
+            ordered.append(method)
+            seen.add(method)
     return ordered
 
 
@@ -2514,7 +2567,7 @@ def _plot_cached_panels(
 ) -> List[Path]:
     plt = _import_matplotlib()
     benches = BENCHES
-    methods = _reorder_methods_qos_last([m for m in methods if m != "Qiskit"])
+    methods = _reorder_methods_for_panels([m for m in methods if m != "Qiskit"])
     fidelity_methods = ["Qiskit"] + methods
     tag_suffix = f"_{tag}" if tag else ""
     panel_tag = f"{timestamp}{tag_suffix}"
@@ -2668,6 +2721,25 @@ def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bo
     return True
 
 
+def _row_has_method_metrics(row: Dict[str, object], args, method: str) -> bool:
+    prefix = _method_prefix(method)
+    if f"{prefix}_depth" not in row or f"{prefix}_nonlocal" not in row:
+        return False
+    if args.with_fidelity and f"{prefix}_fidelity" not in row:
+        return False
+    if args.with_real_fidelity and f"{prefix}_real_fidelity" not in row:
+        return False
+    return True
+
+
+def _row_has_baseline_metrics(row: Dict[str, object], args) -> bool:
+    if args.with_fidelity and "baseline_fidelity" not in row:
+        return False
+    if args.with_real_fidelity and "baseline_real_fidelity" not in row:
+        return False
+    return True
+
+
 def _restore_row_aggregates(
     row: Dict[str, object],
     bench: str,
@@ -2741,6 +2813,13 @@ def _run_eval(
     all_rows: List[Dict[str, object]] = list(initial_rows or [])
     rel_by_size: Dict[int, Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]] = {}
     timing_rows = list(initial_timing_rows or [])
+    timing_row_idx: Dict[Tuple[int, str, str], int] = {}
+    for idx, trow in enumerate(timing_rows):
+        try:
+            tkey = (int(trow.get("size")), str(trow.get("bench")), str(trow.get("method")))
+        except Exception:
+            continue
+        timing_row_idx[tkey] = idx
     fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     fidelity_err_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
     real_fidelity_by_size: Dict[int, Dict[str, Dict[str, float]]] = {}
@@ -2757,9 +2836,12 @@ def _run_eval(
     run_cutqc = "CutQC" in methods
     completed_keys = set(completed_keys or set())
     existing_row_map: Dict[str, Dict[str, object]] = {}
-    for _row in all_rows:
+    existing_row_idx: Dict[str, int] = {}
+    for idx, _row in enumerate(all_rows):
         try:
-            existing_row_map[_bench_key(int(_row["size"]), str(_row["bench"]))] = _row
+            key = _bench_key(int(_row["size"]), str(_row["bench"]))
+            existing_row_map[key] = _row
+            existing_row_idx[key] = idx
         except Exception:
             continue
     total_benches = len(sizes) * len(benches)
@@ -2798,10 +2880,18 @@ def _run_eval(
         for bench, _label in benches:
             bench_key = _bench_key(size, bench)
             cached_row = existing_row_map.get(bench_key)
+            reusable_methods: List[str] = []
+            if cached_row is not None:
+                reusable_methods = [
+                    m for m in methods if _row_has_method_metrics(cached_row, args, m)
+                ]
+            reusable_method_set = set(reusable_methods)
+            reusable_baseline = cached_row is not None and _row_has_baseline_metrics(cached_row, args)
             if (
                 bench_key in completed_keys
                 and cached_row is not None
-                and _resume_row_complete(cached_row, args, methods)
+                and reusable_baseline
+                and len(reusable_method_set) == len(methods)
             ):
                 _restore_row_aggregates(
                     cached_row,
@@ -2823,6 +2913,28 @@ def _run_eval(
                     flush=True,
                 )
                 continue
+            if cached_row is not None and reusable_method_set:
+                _restore_row_aggregates(
+                    cached_row,
+                    bench,
+                    size,
+                    reusable_methods,
+                    rel_depth,
+                    rel_nonlocal,
+                    fidelity_by_size,
+                    fidelity_err_by_size,
+                    real_fidelity_by_size,
+                    real_fidelity_err_by_size,
+                    real_job_counts_by_size,
+                    bool(args.with_fidelity),
+                    bool(args.with_real_fidelity),
+                )
+                missing = [m for m in methods if m not in reusable_method_set]
+                print(
+                    f"[progress] partial-reuse size={size} bench={bench} reused={','.join(reusable_methods)}"
+                    + (f" compute={','.join(missing)}" if missing else ""),
+                    flush=True,
+                )
             print(
                 f"[progress] start size={size} bench={bench} completed={len(completed_keys)}/{total_benches}",
                 flush=True,
@@ -2839,8 +2951,14 @@ def _run_eval(
             qosn_m = qosn_t = qosn_circs = None
             fq_m = fq_t = fq_circs = None
             cutqc_m = cutqc_t = cutqc_circs = None
+            run_qos_now = run_qos and ("QOS" not in reusable_method_set)
+            run_qosn_now = run_qosn and ("QOSN" not in reusable_method_set)
+            run_fq_now = run_fq and ("FrozenQubits" not in reusable_method_set)
+            run_cutqc_now = run_cutqc and ("CutQC" not in reusable_method_set)
+            qose_methods_now = [m for m in qose_methods if m not in reusable_method_set]
+            include_qose_now = bool(qose_methods_now)
 
-            if run_qos:
+            if run_qos_now:
                 cached = _load_method_cache(method_cache_dir, size, bench, "QOS")
                 if cached is not None:
                     qos_m, qos_circs = cached
@@ -2852,7 +2970,7 @@ def _run_eval(
                         qc, [], args, bench_name=bench, size_label=size
                     )
                     _save_method_cache(method_cache_dir, size, bench, "QOS", qos_m, qos_circs)
-            if run_qosn:
+            if run_qosn_now:
                 cached = _load_method_cache(method_cache_dir, size, bench, "QOSN")
                 if cached is not None:
                     qosn_m, qosn_circs = cached
@@ -2869,7 +2987,7 @@ def _run_eval(
                         size_label=size,
                     )
                     _save_method_cache(method_cache_dir, size, bench, "QOSN", qosn_m, qosn_circs)
-            if run_fq:
+            if run_fq_now:
                 cached = _load_method_cache(method_cache_dir, size, bench, "FrozenQubits")
                 if cached is not None:
                     fq_m, fq_circs = cached
@@ -2882,7 +3000,7 @@ def _run_eval(
                     )
                     _save_method_cache(method_cache_dir, size, bench, "FrozenQubits", fq_m, fq_circs)
 
-            if run_cutqc:
+            if run_cutqc_now:
                 cached = _load_method_cache(method_cache_dir, size, bench, "CutQC")
                 if cached is not None:
                     cutqc_m, cutqc_circs = cached
@@ -2897,8 +3015,8 @@ def _run_eval(
                     _save_method_cache(method_cache_dir, size, bench, "CutQC", cutqc_m, cutqc_circs)
 
             qose_results: Dict[str, Dict[str, object]] = {}
-            if include_qose:
-                for method in qose_methods:
+            if include_qose_now:
+                for method in qose_methods_now:
                     cached = _load_method_cache(method_cache_dir, size, bench, method)
                     if cached is not None:
                         qose_m, qose_circs = cached
@@ -2926,27 +3044,27 @@ def _run_eval(
                     args.fidelity_seed,
                 )
 
-            if run_qos and qos_m is not None:
+            if run_qos_now and qos_m is not None:
                 rel_depth[bench]["QOS"] = _relative(qos_m["depth"], base["depth"])
                 rel_nonlocal[bench]["QOS"] = _relative(
                     qos_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
                 )
-            if run_fq and fq_m is not None:
+            if run_fq_now and fq_m is not None:
                 rel_depth[bench]["FrozenQubits"] = _relative(fq_m["depth"], base["depth"])
                 rel_nonlocal[bench]["FrozenQubits"] = _relative(
                     fq_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
                 )
-            if run_cutqc and cutqc_m is not None:
+            if run_cutqc_now and cutqc_m is not None:
                 rel_depth[bench]["CutQC"] = _relative(cutqc_m["depth"], base["depth"])
                 rel_nonlocal[bench]["CutQC"] = _relative(
                     cutqc_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
                 )
-            if run_qosn and qosn_m is not None:
+            if run_qosn_now and qosn_m is not None:
                 rel_depth[bench]["QOSN"] = _relative(qosn_m["depth"], base["depth"])
                 rel_nonlocal[bench]["QOSN"] = _relative(
                     qosn_m["num_nonlocal_gates"], base["num_nonlocal_gates"]
                 )
-            if include_qose:
+            if include_qose_now:
                 for method, qose_data in qose_results.items():
                     qose_m = qose_data.get("metrics")
                     if not qose_m:
@@ -2961,11 +3079,16 @@ def _run_eval(
                 if args.verbose:
                     print("  fidelity sim start", flush=True)
                 sim_times = {}
-                t0 = time.perf_counter()
-                base_fidelity, base_std = _fidelity_stats(
-                    [qc], args.fidelity_shots, noise, args.fidelity_seed
-                )
-                sim_times["Qiskit"] = time.perf_counter() - t0
+                if reusable_baseline and cached_row is not None:
+                    base_fidelity = _safe_float(cached_row.get("baseline_fidelity", ""), 0.0)
+                    base_std = _safe_float(cached_row.get("baseline_fidelity_std", ""), 0.0)
+                    sim_times["Qiskit"] = _safe_float(cached_row.get("baseline_sim_time", ""), 0.0)
+                else:
+                    t0 = time.perf_counter()
+                    base_fidelity, base_std = _fidelity_stats(
+                        [qc], args.fidelity_shots, noise, args.fidelity_seed
+                    )
+                    sim_times["Qiskit"] = time.perf_counter() - t0
                 fidelity_by_size[size][bench] = {"Qiskit": base_fidelity}
                 fidelity_err_by_size[size][bench]["Qiskit"] = base_std
                 rel_fidelity = {}
@@ -2978,7 +3101,7 @@ def _run_eval(
                 qose_std: Dict[str, float] = {}
                 rel_fidelity = {}
 
-                if run_qos and qos_circs is not None:
+                if run_qos_now and qos_circs is not None:
                     t0 = time.perf_counter()
                     qos_fidelity, qos_std = _fidelity_stats(
                         qos_circs, args.fidelity_shots, noise, args.fidelity_seed
@@ -2987,7 +3110,7 @@ def _run_eval(
                     fidelity_by_size[size][bench]["QOS"] = qos_fidelity
                     fidelity_err_by_size[size][bench]["QOS"] = qos_std
                     rel_fidelity["QOS"] = _relative(qos_fidelity, base_fidelity)
-                if run_qosn and qosn_circs is not None:
+                if run_qosn_now and qosn_circs is not None:
                     t0 = time.perf_counter()
                     qosn_fidelity, qosn_std = _fidelity_stats(
                         qosn_circs, args.fidelity_shots, noise, args.fidelity_seed
@@ -2996,7 +3119,7 @@ def _run_eval(
                     fidelity_by_size[size][bench]["QOSN"] = qosn_fidelity
                     fidelity_err_by_size[size][bench]["QOSN"] = qosn_std
                     rel_fidelity["QOSN"] = _relative(qosn_fidelity, base_fidelity)
-                if run_fq and fq_circs is not None:
+                if run_fq_now and fq_circs is not None:
                     t0 = time.perf_counter()
                     fq_fidelity, fq_std = _fidelity_stats(
                         fq_circs, args.fidelity_shots, noise, args.fidelity_seed
@@ -3005,7 +3128,7 @@ def _run_eval(
                     fidelity_by_size[size][bench]["FrozenQubits"] = fq_fidelity
                     fidelity_err_by_size[size][bench]["FrozenQubits"] = fq_std
                     rel_fidelity["FrozenQubits"] = _relative(fq_fidelity, base_fidelity)
-                if run_cutqc and cutqc_circs is not None:
+                if run_cutqc_now and cutqc_circs is not None:
                     t0 = time.perf_counter()
                     cutqc_fidelity, cutqc_std = _fidelity_stats(
                         cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed
@@ -3014,7 +3137,7 @@ def _run_eval(
                     fidelity_by_size[size][bench]["CutQC"] = cutqc_fidelity
                     fidelity_err_by_size[size][bench]["CutQC"] = cutqc_std
                     rel_fidelity["CutQC"] = _relative(cutqc_fidelity, base_fidelity)
-                if include_qose:
+                if include_qose_now:
                     for method, qose_data in qose_results.items():
                         qose_circs = qose_data.get("circs")
                         if not qose_circs:
@@ -3056,87 +3179,224 @@ def _run_eval(
                 rel_fidelity_qose = ""
 
             if args.with_real_fidelity:
-                print(f"[progress] size={size} bench={bench} method=Qiskit stage=real_fidelity", flush=True)
-                real_base, real_base_std = _real_fidelity_stats(
-                    [qc],
-                    args.real_fidelity_shots,
-                    args.real_backend,
-                    args.fidelity_seed,
-                    "Qiskit",
-                    bench,
-                    size,
-                )
-                real_fidelity_by_size[size][bench]["Qiskit"] = real_base
-                real_fidelity_err_by_size[size][bench]["Qiskit"] = real_base_std
-                if run_qos and qos_circs is not None:
-                    print(f"[progress] size={size} bench={bench} method=QOS stage=real_fidelity", flush=True)
-                    real_qos, real_qos_std = _real_fidelity_stats(
-                        qos_circs,
+                real_allowed: Optional[set[str]] = getattr(args, "_real_fidelity_compute_methods", None)
+
+                def _real_enabled(method_name: str) -> bool:
+                    return real_allowed is None or method_name in real_allowed
+
+                def _cached_real_pair(prefix: str) -> Tuple[Optional[float], Optional[float]]:
+                    if cached_row is None:
+                        return None, None
+                    key = f"{prefix}_real_fidelity"
+                    std_key = f"{prefix}_real_fidelity_std"
+                    val = cached_row.get(key, "")
+                    if val in {"", None}:
+                        return None, None
+                    return _safe_float(val, 0.0), _safe_float(cached_row.get(std_key, ""), 0.0)
+
+                real_qose: Dict[str, float] = {}
+                real_qose_std: Dict[str, float] = {}
+
+                real_base_val: Optional[float] = None
+                real_base_std_val: Optional[float] = None
+                real_qos_val: Optional[float] = None
+                real_qos_std_val: Optional[float] = None
+                real_qosn_val: Optional[float] = None
+                real_qosn_std_val: Optional[float] = None
+                real_fq_val: Optional[float] = None
+                real_fq_std_val: Optional[float] = None
+                real_cut_val: Optional[float] = None
+                real_cut_std_val: Optional[float] = None
+
+                # Baseline (Qiskit)
+                if cached_row is not None:
+                    val = cached_row.get("baseline_real_fidelity", "")
+                    if val not in {"", None}:
+                        real_base_val = _safe_float(val, 0.0)
+                        real_base_std_val = _safe_float(cached_row.get("baseline_real_fidelity_std", ""), 0.0)
+                if real_base_val is not None:
+                    print(
+                        f"[progress] size={size} bench={bench} method=Qiskit stage=real_fidelity source=reuse",
+                        flush=True,
+                    )
+                elif _real_enabled("Qiskit"):
+                    print(f"[progress] size={size} bench={bench} method=Qiskit stage=real_fidelity", flush=True)
+                    real_base_val, real_base_std_val = _real_fidelity_stats(
+                        [qc],
                         args.real_fidelity_shots,
                         args.real_backend,
                         args.fidelity_seed,
-                        "QOS",
+                        "Qiskit",
                         bench,
                         size,
                     )
-                    real_fidelity_by_size[size][bench]["QOS"] = real_qos
-                    real_fidelity_err_by_size[size][bench]["QOS"] = real_qos_std
-                if run_qosn and qosn_circs is not None:
-                    print(f"[progress] size={size} bench={bench} method=QOSN stage=real_fidelity", flush=True)
-                    real_qosn, real_qosn_std = _real_fidelity_stats(
-                        qosn_circs,
-                        args.real_fidelity_shots,
-                        args.real_backend,
-                        args.fidelity_seed,
-                        "QOSN",
-                        bench,
-                        size,
+                else:
+                    print(
+                        f"[progress] size={size} bench={bench} method=Qiskit stage=real_fidelity source=skip-disabled",
+                        flush=True,
                     )
-                    real_fidelity_by_size[size][bench]["QOSN"] = real_qosn
-                    real_fidelity_err_by_size[size][bench]["QOSN"] = real_qosn_std
-                if run_fq and fq_circs is not None:
-                    print(f"[progress] size={size} bench={bench} method=FrozenQubits stage=real_fidelity", flush=True)
-                    real_fq, real_fq_std = _real_fidelity_stats(
-                        fq_circs,
-                        args.real_fidelity_shots,
-                        args.real_backend,
-                        args.fidelity_seed,
-                        "FrozenQubits",
-                        bench,
-                        size,
-                    )
-                    real_fidelity_by_size[size][bench]["FrozenQubits"] = real_fq
-                    real_fidelity_err_by_size[size][bench]["FrozenQubits"] = real_fq_std
-                if run_cutqc and cutqc_circs is not None:
-                    print(f"[progress] size={size} bench={bench} method=CutQC stage=real_fidelity", flush=True)
-                    real_cut, real_cut_std = _real_fidelity_stats(
-                        cutqc_circs,
-                        args.real_fidelity_shots,
-                        args.real_backend,
-                        args.fidelity_seed,
-                        "CutQC",
-                        bench,
-                        size,
-                    )
-                    real_fidelity_by_size[size][bench]["CutQC"] = real_cut
-                    real_fidelity_err_by_size[size][bench]["CutQC"] = real_cut_std
-                if include_qose:
+                if real_base_val is not None:
+                    real_fidelity_by_size[size][bench]["Qiskit"] = real_base_val
+                    real_fidelity_err_by_size[size][bench]["Qiskit"] = float(real_base_std_val or 0.0)
+
+                # QOS / QOSN / FrozenQubits / CutQC
+                if run_qos_now and qos_circs is not None:
+                    real_qos_val, real_qos_std_val = _cached_real_pair("qos")
+                    if real_qos_val is not None:
+                        print(
+                            f"[progress] size={size} bench={bench} method=QOS stage=real_fidelity source=reuse",
+                            flush=True,
+                        )
+                    elif _real_enabled("QOS"):
+                        print(f"[progress] size={size} bench={bench} method=QOS stage=real_fidelity", flush=True)
+                        real_qos_val, real_qos_std_val = _real_fidelity_stats(
+                            qos_circs,
+                            args.real_fidelity_shots,
+                            args.real_backend,
+                            args.fidelity_seed,
+                            "QOS",
+                            bench,
+                            size,
+                        )
+                    else:
+                        print(
+                            f"[progress] size={size} bench={bench} method=QOS stage=real_fidelity source=skip-disabled",
+                            flush=True,
+                        )
+                    if real_qos_val is not None:
+                        real_fidelity_by_size[size][bench]["QOS"] = real_qos_val
+                        real_fidelity_err_by_size[size][bench]["QOS"] = float(real_qos_std_val or 0.0)
+
+                if run_qosn_now and qosn_circs is not None:
+                    real_qosn_val, real_qosn_std_val = _cached_real_pair("qosn")
+                    if real_qosn_val is not None:
+                        print(
+                            f"[progress] size={size} bench={bench} method=QOSN stage=real_fidelity source=reuse",
+                            flush=True,
+                        )
+                    elif _real_enabled("QOSN"):
+                        print(f"[progress] size={size} bench={bench} method=QOSN stage=real_fidelity", flush=True)
+                        real_qosn_val, real_qosn_std_val = _real_fidelity_stats(
+                            qosn_circs,
+                            args.real_fidelity_shots,
+                            args.real_backend,
+                            args.fidelity_seed,
+                            "QOSN",
+                            bench,
+                            size,
+                        )
+                    else:
+                        print(
+                            f"[progress] size={size} bench={bench} method=QOSN stage=real_fidelity source=skip-disabled",
+                            flush=True,
+                        )
+                    if real_qosn_val is not None:
+                        real_fidelity_by_size[size][bench]["QOSN"] = real_qosn_val
+                        real_fidelity_err_by_size[size][bench]["QOSN"] = float(real_qosn_std_val or 0.0)
+
+                if run_fq_now and fq_circs is not None:
+                    real_fq_val, real_fq_std_val = _cached_real_pair("fq")
+                    if real_fq_val is not None:
+                        print(
+                            f"[progress] size={size} bench={bench} method=FrozenQubits stage=real_fidelity source=reuse",
+                            flush=True,
+                        )
+                    elif _real_enabled("FrozenQubits"):
+                        print(
+                            f"[progress] size={size} bench={bench} method=FrozenQubits stage=real_fidelity",
+                            flush=True,
+                        )
+                        real_fq_val, real_fq_std_val = _real_fidelity_stats(
+                            fq_circs,
+                            args.real_fidelity_shots,
+                            args.real_backend,
+                            args.fidelity_seed,
+                            "FrozenQubits",
+                            bench,
+                            size,
+                        )
+                    else:
+                        print(
+                            f"[progress] size={size} bench={bench} method=FrozenQubits stage=real_fidelity source=skip-disabled",
+                            flush=True,
+                        )
+                    if real_fq_val is not None:
+                        real_fidelity_by_size[size][bench]["FrozenQubits"] = real_fq_val
+                        real_fidelity_err_by_size[size][bench]["FrozenQubits"] = float(real_fq_std_val or 0.0)
+
+                if run_cutqc_now and cutqc_circs is not None:
+                    real_cut_val, real_cut_std_val = _cached_real_pair("cutqc")
+                    if real_cut_val is not None:
+                        print(
+                            f"[progress] size={size} bench={bench} method=CutQC stage=real_fidelity source=reuse",
+                            flush=True,
+                        )
+                    elif _real_enabled("CutQC"):
+                        print(f"[progress] size={size} bench={bench} method=CutQC stage=real_fidelity", flush=True)
+                        real_cut_val, real_cut_std_val = _real_fidelity_stats(
+                            cutqc_circs,
+                            args.real_fidelity_shots,
+                            args.real_backend,
+                            args.fidelity_seed,
+                            "CutQC",
+                            bench,
+                            size,
+                        )
+                    else:
+                        print(
+                            f"[progress] size={size} bench={bench} method=CutQC stage=real_fidelity source=skip-disabled",
+                            flush=True,
+                        )
+                    if real_cut_val is not None:
+                        real_fidelity_by_size[size][bench]["CutQC"] = real_cut_val
+                        real_fidelity_err_by_size[size][bench]["CutQC"] = float(real_cut_std_val or 0.0)
+
+                if include_qose_now:
                     for method, qose_data in qose_results.items():
                         qose_circs = qose_data.get("circs")
                         if not qose_circs:
                             continue
-                        print(f"[progress] size={size} bench={bench} method={method} stage=real_fidelity", flush=True)
-                        real_qose, real_qose_std = _real_fidelity_stats(
-                            qose_circs,
-                            args.real_fidelity_shots,
-                            args.real_backend,
-                            args.fidelity_seed,
-                            method,
-                            bench,
-                            size,
-                        )
-                        real_fidelity_by_size[size][bench][method] = real_qose
-                        real_fidelity_err_by_size[size][bench][method] = real_qose_std
+                        prefix = method.lower()
+                        cached_val, cached_std = _cached_real_pair(prefix)
+                        if cached_val is not None:
+                            print(
+                                f"[progress] size={size} bench={bench} method={method} stage=real_fidelity source=reuse",
+                                flush=True,
+                            )
+                            real_qose[method] = cached_val
+                            real_qose_std[method] = float(cached_std or 0.0)
+                        elif _real_enabled(method):
+                            print(f"[progress] size={size} bench={bench} method={method} stage=real_fidelity", flush=True)
+                            real_qose_val, real_qose_std_val = _real_fidelity_stats(
+                                qose_circs,
+                                args.real_fidelity_shots,
+                                args.real_backend,
+                                args.fidelity_seed,
+                                method,
+                                bench,
+                                size,
+                            )
+                            real_qose[method] = real_qose_val
+                            real_qose_std[method] = real_qose_std_val
+                        else:
+                            print(
+                                f"[progress] size={size} bench={bench} method={method} stage=real_fidelity source=skip-disabled",
+                                flush=True,
+                            )
+                        if method in real_qose:
+                            real_fidelity_by_size[size][bench][method] = real_qose[method]
+                            real_fidelity_err_by_size[size][bench][method] = real_qose_std.get(method, 0.0)
+
+                real_base = real_base_val if real_base_val is not None else ""
+                real_base_std = real_base_std_val if real_base_std_val is not None else ""
+                real_qos = real_qos_val if real_qos_val is not None else ""
+                real_qos_std = real_qos_std_val if real_qos_std_val is not None else ""
+                real_qosn = real_qosn_val if real_qosn_val is not None else ""
+                real_qosn_std = real_qosn_std_val if real_qosn_std_val is not None else ""
+                real_fq = real_fq_val if real_fq_val is not None else ""
+                real_fq_std = real_fq_std_val if real_fq_std_val is not None else ""
+                real_cut = real_cut_val if real_cut_val is not None else ""
+                real_cut_std = real_cut_std_val if real_cut_std_val is not None else ""
             else:
                 real_base = ""
                 real_base_std = ""
@@ -3154,23 +3414,23 @@ def _run_eval(
                 real_job_counts_by_size[size][bench]["Qiskit"] = float(
                     sum(_count_real_jobs(c) for c in [qc])
                 )
-                if run_qos and qos_circs is not None:
+                if run_qos_now and qos_circs is not None:
                     real_job_counts_by_size[size][bench]["QOS"] = float(
                         sum(_count_real_jobs(c) for c in qos_circs)
                     )
-                if run_qosn and qosn_circs is not None:
+                if run_qosn_now and qosn_circs is not None:
                     real_job_counts_by_size[size][bench]["QOSN"] = float(
                         sum(_count_real_jobs(c) for c in qosn_circs)
                     )
-                if run_fq and fq_circs is not None:
+                if run_fq_now and fq_circs is not None:
                     real_job_counts_by_size[size][bench]["FrozenQubits"] = float(
                         sum(_count_real_jobs(c) for c in fq_circs)
                     )
-                if run_cutqc and cutqc_circs is not None:
+                if run_cutqc_now and cutqc_circs is not None:
                     real_job_counts_by_size[size][bench]["CutQC"] = float(
                         sum(_count_real_jobs(c) for c in cutqc_circs)
                     )
-                if include_qose:
+                if include_qose_now:
                     for method, qose_data in qose_results.items():
                         qose_circs = qose_data.get("circs")
                         if not qose_circs:
@@ -3181,7 +3441,9 @@ def _run_eval(
 
             qiskit_sim = float(sim_times.get("Qiskit", 0.0))
 
-            row = {
+            row = dict(cached_row) if cached_row is not None else {}
+            row.update(
+                {
                 "bench": bench,
                 "size": size,
                 "baseline_depth": base["depth"],
@@ -3191,9 +3453,10 @@ def _run_eval(
                 "baseline_real_fidelity": real_base,
                 "baseline_real_fidelity_std": real_base_std,
                 "baseline_sim_time": qiskit_sim,
-            }
+                }
+            )
 
-            if run_qos and qos_m is not None:
+            if run_qos_now and qos_m is not None:
                 qos_sim = float(sim_times.get("QOS", 0.0))
                 qos_num_circuits = max(1, len(qos_circs))
                 row.update(
@@ -3213,7 +3476,7 @@ def _run_eval(
                         "rel_fidelity_qos": rel_fidelity_qos,
                     }
                 )
-            if run_qosn and qosn_m is not None:
+            if run_qosn_now and qosn_m is not None:
                 qosn_sim = float(sim_times.get("QOSN", 0.0))
                 qosn_num_circuits = max(1, len(qosn_circs))
                 row.update(
@@ -3233,7 +3496,7 @@ def _run_eval(
                         "rel_fidelity_qosn": rel_fidelity_qosn,
                     }
                 )
-            if run_fq and fq_m is not None:
+            if run_fq_now and fq_m is not None:
                 fq_sim = float(sim_times.get("FrozenQubits", 0.0))
                 fq_num_circuits = max(1, len(fq_circs))
                 row.update(
@@ -3253,7 +3516,7 @@ def _run_eval(
                         "rel_fidelity_fq": rel_fidelity_fq,
                     }
                 )
-            if run_cutqc and cutqc_m is not None:
+            if run_cutqc_now and cutqc_m is not None:
                 cutqc_sim = float(sim_times.get("CutQC", 0.0))
                 cutqc_num_circuits = max(1, len(cutqc_circs))
                 row.update(
@@ -3273,7 +3536,7 @@ def _run_eval(
                         "rel_fidelity_cutqc": rel_fidelity_cutqc,
                     }
                 )
-            if include_qose:
+            if include_qose_now:
                 for method, qose_data in qose_results.items():
                     qose_m = qose_data.get("metrics")
                     qose_circs = qose_data.get("circs") or []
@@ -3299,47 +3562,56 @@ def _run_eval(
                             f"rel_fidelity_{prefix}": rel_fidelity.get(method, ""),
                         }
                     )
-            all_rows.append(row)
+            if bench_key in existing_row_idx:
+                all_rows[existing_row_idx[bench_key]] = row
+            else:
+                existing_row_idx[bench_key] = len(all_rows)
+                all_rows.append(row)
 
             if args.collect_timing:
                 timing_methods = []
-                if run_qos and qos_t is not None:
+                if run_qos_now and qos_t is not None:
                     timing_methods.append(("QOS", qos_t))
-                if run_qosn and qosn_t is not None:
+                if run_qosn_now and qosn_t is not None:
                     timing_methods.append(("QOSN", qosn_t))
-                if run_fq and fq_t is not None:
+                if run_fq_now and fq_t is not None:
                     timing_methods.append(("FrozenQubits", fq_t))
-                if run_cutqc and cutqc_t is not None:
+                if run_cutqc_now and cutqc_t is not None:
                     timing_methods.append(("CutQC", cutqc_t))
-                if include_qose:
+                if include_qose_now:
                     for method, qose_data in qose_results.items():
                         qose_t = qose_data.get("timing")
                         if qose_t is not None:
                             timing_methods.append((method, qose_t))
                 for method, timing in timing_methods:
-                    row = {"bench": bench, "size": size, "method": method}
-                    row.update(timing)
+                    trow = {"bench": bench, "size": size, "method": method}
+                    trow.update(timing)
                     if args.with_fidelity:
-                        row["simulation"] = sim_times.get(method, 0.0)
-                    timing_rows.append(row)
+                        trow["simulation"] = sim_times.get(method, 0.0)
+                    tkey = (size, bench, method)
+                    if tkey in timing_row_idx:
+                        timing_rows[timing_row_idx[tkey]] = trow
+                    else:
+                        timing_row_idx[tkey] = len(timing_rows)
+                        timing_rows.append(trow)
             completed_keys.add(bench_key)
             existing_row_map[bench_key] = row
             if on_bench_complete is not None:
                 on_bench_complete(size, bench, all_rows, timing_rows, completed_keys)
             if args.cut_visualization:
                 cut_circuits[(size, bench, "Qiskit")] = [qc]
-                if run_qos and qos_circs is not None:
+                if run_qos_now and qos_circs is not None:
                     cut_circuits[(size, bench, "QOS")] = qos_circs
-                if run_qosn and qosn_circs is not None:
+                if run_qosn_now and qosn_circs is not None:
                     cut_circuits[(size, bench, "QOSN")] = qosn_circs
-                if include_qose:
+                if include_qose_now:
                     for method, qose_data in qose_results.items():
                         qose_circs = qose_data.get("circs")
                         if qose_circs is not None:
                             cut_circuits[(size, bench, method)] = qose_circs
-                if run_fq and fq_circs is not None:
+                if run_fq_now and fq_circs is not None:
                     cut_circuits[(size, bench, "FrozenQubits")] = fq_circs
-                if run_cutqc and cutqc_circs is not None:
+                if run_cutqc_now and cutqc_circs is not None:
                     cut_circuits[(size, bench, "CutQC")] = cutqc_circs
             if args.verbose:
                 print(f"  total_bench_sec={time.perf_counter() - bench_start:.2f}", flush=True)
@@ -3496,6 +3768,15 @@ def main() -> None:
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
     parser.add_argument("--real-backend", default="ibm_torino")
     parser.add_argument(
+        "--real-fidelity-compute-methods",
+        default="all",
+        help=(
+            "Comma-separated methods that are allowed to submit real-QPU jobs. "
+            "Use 'all' (default) for legacy behavior, or e.g. 'QOSE' to submit only QOSE. "
+            "Accepted names: baseline/Qiskit,FrozenQubits,CutQC,QOS,QOSN,QOSE,qwen,gemini,gpt."
+        ),
+    )
+    parser.add_argument(
         "--real-job-timeout-sec",
         type=int,
         default=0,
@@ -3589,9 +3870,17 @@ def main() -> None:
         help="Output directory for figures and CSV.",
     )
     parser.add_argument(
+        "--artifact-dir",
+        default="",
+        help=(
+            "Optional directory to store all full-eval artifacts (state, caches, CSV, figures). "
+            "If unset, uses --out-dir (legacy behavior)."
+        ),
+    )
+    parser.add_argument(
         "--resume-state",
         default="",
-        help="Path to resume-state JSON. Default: <out-dir>/full_eval_progress.json",
+        help="Path to resume-state JSON. Default: <artifact-dir or out-dir>/full_eval_progress.json",
     )
     parser.add_argument(
         "--no-resume",
@@ -3615,6 +3904,15 @@ def main() -> None:
         "--plot-cached-panels",
         action="store_true",
         help="Plot 1x4 cached panel figures from existing CSV outputs, then exit.",
+    )
+    parser.add_argument(
+        "--plot-cached-panels-after-run",
+        action="store_true",
+        help=(
+            "After normal full_eval completes, generate cached-panel figures in the same run. "
+            "Defaults: sim/timing CSV from this run; real CSVs must be provided via "
+            "--panel-real-torino-csv and --panel-real-marrakesh-csv."
+        ),
     )
     parser.add_argument(
         "--panel-simtiming-csv",
@@ -3702,6 +4000,8 @@ def main() -> None:
     ]
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = Path(args.artifact_dir) if str(args.artifact_dir).strip() else out_dir
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = args.tag.strip()
     tag_suffix = f"_{tag}" if tag else ""
@@ -3716,6 +4016,9 @@ def main() -> None:
 
     qose_runs, qose_programs = _load_qose_runs_from_args(args)
     selected_methods = _parse_methods(args.methods, bool(qose_runs), list(qose_runs.keys()))
+    args._real_fidelity_compute_methods = _parse_real_fidelity_compute_methods(
+        str(args.real_fidelity_compute_methods)
+    )
     missing_qose = [
         m
         for m in selected_methods
@@ -3734,8 +4037,10 @@ def main() -> None:
                 print(f"Using QOSE program ({method}): {program}", file=sys.stderr)
 
     resume_state_path = (
-        Path(args.resume_state) if args.resume_state.strip() else out_dir / "full_eval_progress.json"
+        Path(args.resume_state) if args.resume_state.strip() else artifact_dir / "full_eval_progress.json"
     )
+    if str(args.artifact_dir).strip() and not args.resume_state.strip():
+        print(f"Full-eval artifact dir: {artifact_dir}", flush=True)
     use_cache = not args.no_cache
     if args.reset_resume and resume_state_path.exists():
         resume_state_path.unlink()
@@ -3783,8 +4088,8 @@ def main() -> None:
         else:
             print("Starting fresh (--no-cache)", flush=True)
 
-    partial_csv_path = out_dir / f"relative_properties_partial{tag_suffix}.csv"
-    partial_timing_path = out_dir / f"timing_partial{tag_suffix}.csv"
+    partial_csv_path = artifact_dir / f"relative_properties_partial{tag_suffix}.csv"
+    partial_timing_path = artifact_dir / f"timing_partial{tag_suffix}.csv"
     method_cache_dir: Optional[Path] = None
     use_method_cache = bool(use_cache and args.with_real_fidelity)
     if use_method_cache:
@@ -3905,7 +4210,7 @@ def main() -> None:
                             if best is None or summary["target_distance"] < best[0]:
                                 best = (summary["target_distance"], budget, size_to_reach, clingo, max_tries, cost_iter)
 
-        sweep_path = out_dir / f"relative_properties_sweep_{timestamp}{tag_suffix}.csv"
+        sweep_path = artifact_dir / f"relative_properties_sweep_{timestamp}{tag_suffix}.csv"
         with sweep_path.open("w", newline="") as f:
             fieldnames = sorted({k for row in sweep_rows for k in row.keys()})
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -4003,7 +4308,7 @@ def main() -> None:
     combined_path = _plot_combined(
         rel_by_size,
         benches,
-        out_dir,
+        artifact_dir,
         f"{timestamp}{tag_suffix}",
         fidelity_by_size if args.with_fidelity else None,
         fidelity_err_by_size if args.with_fidelity else None,
@@ -4017,7 +4322,7 @@ def main() -> None:
     if real_job_counts_by_size:
         job_methods = ["Qiskit"] + [m for m in selected_methods if m != "Qiskit"]
         job_counts_fig = _plot_job_counts(
-            real_job_counts_by_size, benches, out_dir, f"{timestamp}{tag_suffix}", job_methods
+            real_job_counts_by_size, benches, artifact_dir, f"{timestamp}{tag_suffix}", job_methods
         )
         print(f"Wrote job counts figure: {job_counts_fig}")
     if args.cut_visualization and cut_circuits:
@@ -4026,39 +4331,79 @@ def main() -> None:
             cut_circuits,
             benches,
             sizes,
-            out_dir,
+            artifact_dir,
             f"{timestamp}{tag_suffix}",
             cut_methods,
         )
         print(f"Wrote cut visualization: {cut_fig}")
-    if args.collect_timing and timing_rows and args.timing_csv:
-        timing_path = Path(args.timing_csv)
-        with timing_path.open("w", newline="") as f:
-            fieldnames = sorted({k for row in timing_rows for k in row.keys()})
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(timing_rows)
+    if args.collect_timing and timing_rows:
+        timing_path = (
+            Path(args.timing_csv)
+            if args.timing_csv
+            else artifact_dir / f"timing_{timestamp}{tag_suffix}.csv"
+        )
+        _write_rows_csv(timing_path, timing_rows)
         print(f"Wrote timing: {timing_path}")
+    else:
+        timing_path = None
     if args.collect_timing and timing_rows and args.timing_plot:
-        timing_fig = _plot_timing(timing_rows, out_dir, f"{timestamp}{tag_suffix}", selected_methods)
+        timing_fig = _plot_timing(
+            timing_rows, artifact_dir, f"{timestamp}{tag_suffix}", selected_methods
+        )
         print(f"Wrote timing figure: {timing_fig}")
     if args.overhead_plot:
         if not args.with_fidelity:
             raise RuntimeError("Overhead plot requires --with-fidelity to measure simulation time.")
         overhead_fig = _plot_overheads(
-            all_rows, benches, sizes, out_dir, f"{timestamp}{tag_suffix}", selected_methods
+            all_rows, benches, sizes, artifact_dir, f"{timestamp}{tag_suffix}", selected_methods
         )
         print(f"Wrote overhead figure: {overhead_fig}")
     if args.fragment_fidelity_sweep:
         frag_paths = _plot_fragment_fidelity_sweep(
-            fragment_fidelity, benches, sizes, out_dir, f"{timestamp}{tag_suffix}"
+            fragment_fidelity, benches, sizes, artifact_dir, f"{timestamp}{tag_suffix}"
         )
         for path in frag_paths:
             print(f"Wrote fragment fidelity figure: {path}")
-    final_csv_path = out_dir / f"relative_properties_{timestamp}{tag_suffix}.csv"
+    final_csv_path = artifact_dir / f"relative_properties_{timestamp}{tag_suffix}.csv"
     if all_rows:
         _write_rows_csv(final_csv_path, all_rows)
         print(f"Wrote relative properties CSV: {final_csv_path}")
+    if args.plot_cached_panels_after_run:
+        panel_sizes = [int(s.strip()) for s in str(args.panel_sizes).split(",") if s.strip()]
+        panel_methods = [m.strip() for m in str(args.panel_methods).split(",") if m.strip()]
+        if not panel_sizes:
+            raise RuntimeError("--panel-sizes is empty.")
+        if not panel_methods:
+            raise RuntimeError("--panel-methods is empty.")
+        panel_sim_csv = Path(args.panel_simtiming_csv) if str(args.panel_simtiming_csv).strip() else final_csv_path
+        panel_timing_csv = (
+            Path(args.panel_timing_csv)
+            if str(args.panel_timing_csv).strip()
+            else timing_path
+        )
+        if panel_timing_csv is None:
+            raise RuntimeError(
+                "--plot-cached-panels-after-run requires timing CSV. "
+                "Enable --collect-timing or pass --panel-timing-csv."
+            )
+        if not str(args.panel_real_torino_csv).strip() or not str(args.panel_real_marrakesh_csv).strip():
+            raise RuntimeError(
+                "--plot-cached-panels-after-run requires --panel-real-torino-csv and "
+                "--panel-real-marrakesh-csv."
+            )
+        panel_out = _plot_cached_panels(
+            simtiming_csv=panel_sim_csv,
+            real_torino_csv=Path(args.panel_real_torino_csv),
+            real_marrakesh_csv=Path(args.panel_real_marrakesh_csv),
+            timing_csv=panel_timing_csv,
+            out_dir=artifact_dir,
+            timestamp=timestamp,
+            tag=tag,
+            sizes=panel_sizes,
+            methods=panel_methods,
+        )
+        for path in panel_out:
+            print(f"Wrote figure: {path}")
     if use_cache:
         _save_resume_state(
             resume_state_path,
