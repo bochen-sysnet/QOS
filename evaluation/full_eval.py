@@ -94,6 +94,12 @@ class _RealJobResultCache:
     def count(self) -> int:
         return len(self._results)
 
+    def count_prefix(self, prefix: str) -> int:
+        try:
+            return sum(1 for key in self._results.keys() if str(key).startswith(prefix))
+        except Exception:
+            return 0
+
     def get(self, job_key: str) -> Optional[Dict[str, int]]:
         counts = self._results.get(job_key)
         if counts is None:
@@ -179,6 +185,13 @@ def _safe_int(val, default=0):
         return default
 
 
+def _row_has_nonempty_value(row: Dict[str, object], key: str) -> bool:
+    if key not in row:
+        return False
+    val = row.get(key)
+    return val not in {"", None}
+
+
 def _atomic_write_json(path: Path, payload: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -240,7 +253,9 @@ def _resume_signature_compatible(
             return False
     saved_methods = set(saved_signature.get("methods", []) or [])
     req_methods = set(requested_signature.get("methods", []) or [])
-    return saved_methods.issubset(req_methods)
+    # Allow both expansions (add methods later) and narrowed follow-up runs
+    # (e.g., run only QOSE simulated fidelity after a full real-only run).
+    return saved_methods.issubset(req_methods) or req_methods.issubset(saved_methods)
 
 
 def _load_resume_state(path: Path, signature: Dict[str, object]) -> Optional[Dict[str, object]]:
@@ -924,11 +939,43 @@ def _hellinger_fidelity_from_counts(ideal: Dict[str, int], noisy: Dict[str, int]
     return bc * bc
 
 
-def _simulate_counts(circuit: QuantumCircuit, shots: int, noise, seed: int) -> Dict[str, int]:
+def _simulate_counts(
+    circuit: QuantumCircuit,
+    shots: int,
+    noise,
+    seed: int,
+    ctx: Optional[Dict[str, int]] = None,
+    method_ctx: Optional[Dict[str, int | str]] = None,
+    sim_kind: str = "sim",
+) -> Dict[str, int]:
     AerSimulator, _, _, _ = _import_aer()
     sim = AerSimulator(noise_model=noise) if noise else AerSimulator()
     circ = _ensure_measurements(circuit)
+    show_progress = bool(method_ctx) and _is_real_sim_progress_enabled()
+    t0 = time.perf_counter()
+    if show_progress:
+        _EVAL_LOGGER.warning(
+            "Ideal sim start method=%s bench=%s size=%s kind=%s circuit=%s/%s shots=%s",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            sim_kind,
+            (ctx or {}).get("circuit_idx", 1),
+            (ctx or {}).get("circuit_total", 1),
+            shots,
+        )
     result = sim.run(circ, shots=shots, seed_simulator=seed, seed_transpiler=seed).result()
+    if show_progress:
+        _EVAL_LOGGER.warning(
+            "Ideal sim done method=%s bench=%s size=%s kind=%s circuit=%s/%s elapsed_sec=%.2f",
+            method_ctx.get("method"),
+            method_ctx.get("bench"),
+            method_ctx.get("size"),
+            sim_kind,
+            (ctx or {}).get("circuit_idx", 1),
+            (ctx or {}).get("circuit_total", 1),
+            time.perf_counter() - t0,
+        )
     return result.get_counts()
 
 
@@ -1390,7 +1437,15 @@ def _real_fidelity_for_circuit(
     if ideal is None and _has_virtual_ops(circuit):
         ideal = _simulate_virtual_counts(circuit, shots, None, seed, ctx=ctx, method_ctx=method_ctx)
     elif ideal is None:
-        ideal = _simulate_counts(circuit, shots, None, seed)
+        ideal = _simulate_counts(
+            circuit,
+            shots,
+            None,
+            seed,
+            ctx=ctx,
+            method_ctx=method_ctx,
+            sim_kind="ideal",
+        )
     if _IDEAL_RESULT_CACHE is not None and ideal is not None:
         _IDEAL_RESULT_CACHE.put(
             ideal_key,
@@ -1442,6 +1497,18 @@ def _real_fidelity_stats(
     total = len(circuits)
     jobs_total = sum(_count_real_jobs(c) for c in circuits)
     global _REAL_DRY_RUN_CALLS
+    if _REAL_JOB_RESULT_CACHE is not None:
+        cache_prefix = f"{backend_name}|{shots}|{method}|{bench}|{size}|"
+        cached_jobs = int(_REAL_JOB_RESULT_CACHE.count_prefix(cache_prefix))
+        if cached_jobs > 0:
+            _EVAL_LOGGER.warning(
+                "Real QPU cache resume method=%s bench=%s size=%s cached_jobs=%s expected_total=%s",
+                method,
+                bench,
+                size,
+                cached_jobs,
+                jobs_total,
+            )
     _EVAL_LOGGER.warning(
         "Real QPU jobs method=%s bench=%s size=%s circuits_total=%s jobs_total=%s",
         method,
@@ -1506,13 +1573,31 @@ def _fidelity_for_circuit(
     shots: int,
     noise,
     seed: int,
+    ctx: Optional[Dict[str, int]] = None,
+    method_ctx: Optional[Dict[str, int | str]] = None,
 ) -> float:
     if _has_virtual_ops(circuit):
-        ideal = _simulate_virtual_counts(circuit, shots, None, seed)
-        noisy = _simulate_virtual_counts(circuit, shots, noise, seed)
+        ideal = _simulate_virtual_counts(circuit, shots, None, seed, ctx=ctx, method_ctx=method_ctx)
+        noisy = _simulate_virtual_counts(circuit, shots, noise, seed, ctx=ctx, method_ctx=method_ctx)
     else:
-        ideal = _simulate_counts(circuit, shots, None, seed)
-        noisy = _simulate_counts(circuit, shots, noise, seed)
+        ideal = _simulate_counts(
+            circuit,
+            shots,
+            None,
+            seed,
+            ctx=ctx,
+            method_ctx=method_ctx,
+            sim_kind="ideal",
+        )
+        noisy = _simulate_counts(
+            circuit,
+            shots,
+            noise,
+            seed,
+            ctx=ctx,
+            method_ctx=method_ctx,
+            sim_kind="noisy",
+        )
     if not ideal or not noisy:
         return 0.0
     return _hellinger_fidelity_from_counts(ideal, noisy)
@@ -1533,8 +1618,45 @@ def _fidelity_stats(
     shots: int,
     noise,
     seed: int,
+    method: Optional[str] = None,
+    bench: Optional[str] = None,
+    size: Optional[int] = None,
 ) -> Tuple[float, float]:
-    vals = [_fidelity_for_circuit(c, shots, noise, seed) for c in circuits]
+    total = len(circuits)
+    method_ctx: Optional[Dict[str, int | str]] = None
+    if method is not None and bench is not None and size is not None:
+        method_ctx = {
+            "method": method,
+            "bench": bench,
+            "size": int(size),
+        }
+        _EVAL_LOGGER.warning(
+            "Ideal sim jobs method=%s bench=%s size=%s circuits_total=%s",
+            method,
+            bench,
+            size,
+            total,
+        )
+    vals = []
+    for idx, circuit in enumerate(circuits, start=1):
+        ctx = {
+            "circuit_idx": idx,
+            "circuit_total": total,
+            "fragment_idx": 1,
+            "fragment_total": 1,
+            "inst_idx": 1,
+            "inst_total": 1,
+        }
+        vals.append(
+            _fidelity_for_circuit(
+                circuit,
+                shots,
+                noise,
+                seed,
+                ctx=ctx,
+                method_ctx=method_ctx,
+            )
+        )
     mean = float(sum(vals) / max(1, len(vals)))
     std = float(np.std(vals)) if len(vals) > 1 else 0.0
     return mean, std
@@ -2708,34 +2830,49 @@ def _plot_cached_panels(
 def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
     for method in methods:
         prefix = _method_prefix(method)
-        if f"{prefix}_depth" not in row or f"{prefix}_nonlocal" not in row:
+        if not _row_has_nonempty_value(row, f"{prefix}_depth") or not _row_has_nonempty_value(row, f"{prefix}_nonlocal"):
             return False
-        if args.with_fidelity and f"{prefix}_fidelity" not in row:
+        if args.with_fidelity and not _row_has_nonempty_value(row, f"{prefix}_fidelity"):
             return False
-        if args.with_real_fidelity and f"{prefix}_real_fidelity" not in row:
+        if args.with_real_fidelity and not _row_has_nonempty_value(row, f"{prefix}_real_fidelity"):
             return False
-    if args.with_fidelity and "baseline_fidelity" not in row:
+    if args.with_fidelity and not _row_has_nonempty_value(row, "baseline_fidelity"):
         return False
-    if args.with_real_fidelity and "baseline_real_fidelity" not in row:
+    if args.with_real_fidelity and not _row_has_nonempty_value(row, "baseline_real_fidelity"):
         return False
     return True
 
 
 def _row_has_method_metrics(row: Dict[str, object], args, method: str) -> bool:
     prefix = _method_prefix(method)
-    if f"{prefix}_depth" not in row or f"{prefix}_nonlocal" not in row:
+    if not _row_has_nonempty_value(row, f"{prefix}_depth") or not _row_has_nonempty_value(row, f"{prefix}_nonlocal"):
         return False
-    if args.with_fidelity and f"{prefix}_fidelity" not in row:
+    if args.with_fidelity and not _row_has_nonempty_value(row, f"{prefix}_fidelity"):
         return False
-    if args.with_real_fidelity and f"{prefix}_real_fidelity" not in row:
+    if args.with_real_fidelity and not _row_has_nonempty_value(row, f"{prefix}_real_fidelity"):
         return False
     return True
 
 
 def _row_has_baseline_metrics(row: Dict[str, object], args) -> bool:
-    if args.with_fidelity and "baseline_fidelity" not in row:
+    if args.with_fidelity and not _row_has_nonempty_value(row, "baseline_fidelity"):
         return False
-    if args.with_real_fidelity and "baseline_real_fidelity" not in row:
+    if args.with_real_fidelity and not _row_has_nonempty_value(row, "baseline_real_fidelity"):
+        return False
+    return True
+
+
+def _row_has_method_metrics_no_real(row: Dict[str, object], args, method: str) -> bool:
+    prefix = _method_prefix(method)
+    if not _row_has_nonempty_value(row, f"{prefix}_depth") or not _row_has_nonempty_value(row, f"{prefix}_nonlocal"):
+        return False
+    if args.with_fidelity and not _row_has_nonempty_value(row, f"{prefix}_fidelity"):
+        return False
+    return True
+
+
+def _row_has_baseline_metrics_no_real(row: Dict[str, object], args) -> bool:
+    if args.with_fidelity and not _row_has_nonempty_value(row, "baseline_fidelity"):
         return False
     return True
 
@@ -2881,12 +3018,19 @@ def _run_eval(
             bench_key = _bench_key(size, bench)
             cached_row = existing_row_map.get(bench_key)
             reusable_methods: List[str] = []
+            reusable_methods_no_real: List[str] = []
             if cached_row is not None:
                 reusable_methods = [
                     m for m in methods if _row_has_method_metrics(cached_row, args, m)
                 ]
+                reusable_methods_no_real = [
+                    m for m in methods if _row_has_method_metrics_no_real(cached_row, args, m)
+                ]
             reusable_method_set = set(reusable_methods)
             reusable_baseline = cached_row is not None and _row_has_baseline_metrics(cached_row, args)
+            reusable_baseline_no_real = (
+                cached_row is not None and _row_has_baseline_metrics_no_real(cached_row, args)
+            )
             if (
                 bench_key in completed_keys
                 and cached_row is not None
@@ -2913,12 +3057,12 @@ def _run_eval(
                     flush=True,
                 )
                 continue
-            if cached_row is not None and reusable_method_set:
+            if cached_row is not None and reusable_methods_no_real:
                 _restore_row_aggregates(
                     cached_row,
                     bench,
                     size,
-                    reusable_methods,
+                    reusable_methods_no_real,
                     rel_depth,
                     rel_nonlocal,
                     fidelity_by_size,
@@ -2931,7 +3075,7 @@ def _run_eval(
                 )
                 missing = [m for m in methods if m not in reusable_method_set]
                 print(
-                    f"[progress] partial-reuse size={size} bench={bench} reused={','.join(reusable_methods)}"
+                    f"[progress] partial-reuse size={size} bench={bench} reused={','.join(reusable_methods_no_real)}"
                     + (f" compute={','.join(missing)}" if missing else ""),
                     flush=True,
                 )
@@ -3079,14 +3223,20 @@ def _run_eval(
                 if args.verbose:
                     print("  fidelity sim start", flush=True)
                 sim_times = {}
-                if reusable_baseline and cached_row is not None:
+                if reusable_baseline_no_real and cached_row is not None:
                     base_fidelity = _safe_float(cached_row.get("baseline_fidelity", ""), 0.0)
                     base_std = _safe_float(cached_row.get("baseline_fidelity_std", ""), 0.0)
                     sim_times["Qiskit"] = _safe_float(cached_row.get("baseline_sim_time", ""), 0.0)
                 else:
                     t0 = time.perf_counter()
                     base_fidelity, base_std = _fidelity_stats(
-                        [qc], args.fidelity_shots, noise, args.fidelity_seed
+                        [qc],
+                        args.fidelity_shots,
+                        noise,
+                        args.fidelity_seed,
+                        method="Qiskit",
+                        bench=bench,
+                        size=size,
                     )
                     sim_times["Qiskit"] = time.perf_counter() - t0
                 fidelity_by_size[size][bench] = {"Qiskit": base_fidelity}
@@ -3094,46 +3244,94 @@ def _run_eval(
                 rel_fidelity = {}
 
                 qos_fidelity = ""
+                qos_std = 0.0
                 qosn_fidelity = ""
+                qosn_std = 0.0
                 fq_fidelity = ""
+                fq_std = 0.0
                 cutqc_fidelity = ""
+                cutqc_std = 0.0
                 qose_fidelity: Dict[str, float] = {}
                 qose_std: Dict[str, float] = {}
                 rel_fidelity = {}
 
                 if run_qos_now and qos_circs is not None:
-                    t0 = time.perf_counter()
-                    qos_fidelity, qos_std = _fidelity_stats(
-                        qos_circs, args.fidelity_shots, noise, args.fidelity_seed
-                    )
-                    sim_times["QOS"] = time.perf_counter() - t0
+                    if cached_row is not None and _row_has_nonempty_value(cached_row, "qos_fidelity"):
+                        qos_fidelity = _safe_float(cached_row.get("qos_fidelity", ""), 0.0)
+                        qos_std = _safe_float(cached_row.get("qos_fidelity_std", ""), 0.0)
+                        sim_times["QOS"] = _safe_float(cached_row.get("qos_sim_time", ""), 0.0)
+                    else:
+                        t0 = time.perf_counter()
+                        qos_fidelity, qos_std = _fidelity_stats(
+                            qos_circs,
+                            args.fidelity_shots,
+                            noise,
+                            args.fidelity_seed,
+                            method="QOS",
+                            bench=bench,
+                            size=size,
+                        )
+                        sim_times["QOS"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["QOS"] = qos_fidelity
                     fidelity_err_by_size[size][bench]["QOS"] = qos_std
                     rel_fidelity["QOS"] = _relative(qos_fidelity, base_fidelity)
                 if run_qosn_now and qosn_circs is not None:
-                    t0 = time.perf_counter()
-                    qosn_fidelity, qosn_std = _fidelity_stats(
-                        qosn_circs, args.fidelity_shots, noise, args.fidelity_seed
-                    )
-                    sim_times["QOSN"] = time.perf_counter() - t0
+                    if cached_row is not None and _row_has_nonempty_value(cached_row, "qosn_fidelity"):
+                        qosn_fidelity = _safe_float(cached_row.get("qosn_fidelity", ""), 0.0)
+                        qosn_std = _safe_float(cached_row.get("qosn_fidelity_std", ""), 0.0)
+                        sim_times["QOSN"] = _safe_float(cached_row.get("qosn_sim_time", ""), 0.0)
+                    else:
+                        t0 = time.perf_counter()
+                        qosn_fidelity, qosn_std = _fidelity_stats(
+                            qosn_circs,
+                            args.fidelity_shots,
+                            noise,
+                            args.fidelity_seed,
+                            method="QOSN",
+                            bench=bench,
+                            size=size,
+                        )
+                        sim_times["QOSN"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["QOSN"] = qosn_fidelity
                     fidelity_err_by_size[size][bench]["QOSN"] = qosn_std
                     rel_fidelity["QOSN"] = _relative(qosn_fidelity, base_fidelity)
                 if run_fq_now and fq_circs is not None:
-                    t0 = time.perf_counter()
-                    fq_fidelity, fq_std = _fidelity_stats(
-                        fq_circs, args.fidelity_shots, noise, args.fidelity_seed
-                    )
-                    sim_times["FrozenQubits"] = time.perf_counter() - t0
+                    if cached_row is not None and _row_has_nonempty_value(cached_row, "fq_fidelity"):
+                        fq_fidelity = _safe_float(cached_row.get("fq_fidelity", ""), 0.0)
+                        fq_std = _safe_float(cached_row.get("fq_fidelity_std", ""), 0.0)
+                        sim_times["FrozenQubits"] = _safe_float(cached_row.get("fq_sim_time", ""), 0.0)
+                    else:
+                        t0 = time.perf_counter()
+                        fq_fidelity, fq_std = _fidelity_stats(
+                            fq_circs,
+                            args.fidelity_shots,
+                            noise,
+                            args.fidelity_seed,
+                            method="FrozenQubits",
+                            bench=bench,
+                            size=size,
+                        )
+                        sim_times["FrozenQubits"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["FrozenQubits"] = fq_fidelity
                     fidelity_err_by_size[size][bench]["FrozenQubits"] = fq_std
                     rel_fidelity["FrozenQubits"] = _relative(fq_fidelity, base_fidelity)
                 if run_cutqc_now and cutqc_circs is not None:
-                    t0 = time.perf_counter()
-                    cutqc_fidelity, cutqc_std = _fidelity_stats(
-                        cutqc_circs, args.fidelity_shots, noise, args.fidelity_seed
-                    )
-                    sim_times["CutQC"] = time.perf_counter() - t0
+                    if cached_row is not None and _row_has_nonempty_value(cached_row, "cutqc_fidelity"):
+                        cutqc_fidelity = _safe_float(cached_row.get("cutqc_fidelity", ""), 0.0)
+                        cutqc_std = _safe_float(cached_row.get("cutqc_fidelity_std", ""), 0.0)
+                        sim_times["CutQC"] = _safe_float(cached_row.get("cutqc_sim_time", ""), 0.0)
+                    else:
+                        t0 = time.perf_counter()
+                        cutqc_fidelity, cutqc_std = _fidelity_stats(
+                            cutqc_circs,
+                            args.fidelity_shots,
+                            noise,
+                            args.fidelity_seed,
+                            method="CutQC",
+                            bench=bench,
+                            size=size,
+                        )
+                        sim_times["CutQC"] = time.perf_counter() - t0
                     fidelity_by_size[size][bench]["CutQC"] = cutqc_fidelity
                     fidelity_err_by_size[size][bench]["CutQC"] = cutqc_std
                     rel_fidelity["CutQC"] = _relative(cutqc_fidelity, base_fidelity)
@@ -3142,11 +3340,23 @@ def _run_eval(
                         qose_circs = qose_data.get("circs")
                         if not qose_circs:
                             continue
-                        t0 = time.perf_counter()
-                        qose_val, qose_std_val = _fidelity_stats(
-                            qose_circs, args.fidelity_shots, noise, args.fidelity_seed
-                        )
-                        sim_times[method] = time.perf_counter() - t0
+                        prefix = method.lower()
+                        if cached_row is not None and _row_has_nonempty_value(cached_row, f"{prefix}_fidelity"):
+                            qose_val = _safe_float(cached_row.get(f"{prefix}_fidelity", ""), 0.0)
+                            qose_std_val = _safe_float(cached_row.get(f"{prefix}_fidelity_std", ""), 0.0)
+                            sim_times[method] = _safe_float(cached_row.get(f"{prefix}_sim_time", ""), 0.0)
+                        else:
+                            t0 = time.perf_counter()
+                            qose_val, qose_std_val = _fidelity_stats(
+                                qose_circs,
+                                args.fidelity_shots,
+                                noise,
+                                args.fidelity_seed,
+                                method=method,
+                                bench=bench,
+                                size=size,
+                            )
+                            sim_times[method] = time.perf_counter() - t0
                         qose_fidelity[method] = qose_val
                         qose_std[method] = qose_std_val
                         fidelity_by_size[size][bench][method] = qose_val
