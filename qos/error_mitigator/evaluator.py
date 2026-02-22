@@ -971,6 +971,7 @@ def _evaluate_bench_size_pairs(
 ):
     depth_sum = cnot_sum = run_time_sum = 0.0
     qos_depth_sum = qos_cnot_sum = qos_run_time_sum = 0.0
+    qose_depth_sum = qose_cnot_sum = 0.0
     count = 0
     cases = []
 
@@ -998,6 +999,7 @@ def _evaluate_bench_size_pairs(
     total_qos_gv_calls = 0
     total_qos_wc_calls = 0
     overhead_sum = 0.0
+    qose_overhead_sum = 0.0
     qos_overhead_sum = 0.0
     failure_traces = []
     bench_pairs_str = ", ".join(f"({b},{s})" for b, s in bench_size_pairs)
@@ -1023,11 +1025,59 @@ def _evaluate_bench_size_pairs(
             )
             qos_mitigator._gv_cost_calls = 0
             qos_mitigator._wc_cost_calls = 0
+            # Baseline cost-search may execute in a child process. In that mode,
+            # parent-side _gv/_wc counters can stay 0, so we count from traces.
+            qos_gv_calls = 0
+            qos_wc_calls = 0
+            qos_cost_search_seen = 0
+            qos_cost_search_orig = qos_mitigator.cost_search
+
+            def _wrap_qos_cost_search(*c_args, **c_kwargs):
+                nonlocal qos_gv_calls, qos_wc_calls, qos_cost_search_seen
+                qos_cost_search_seen += 1
+                prev_gv = int(getattr(qos_mitigator, "_gv_cost_calls", 0))
+                prev_wc = int(getattr(qos_mitigator, "_wc_cost_calls", 0))
+                size_out, method_out, cost_time_out, timed_out_out = qos_cost_search_orig(
+                    *c_args, **c_kwargs
+                )
+                gv_trace = getattr(qos_mitigator, "_qose_gv_cost_trace", None)
+                wc_trace = getattr(qos_mitigator, "_qose_wc_cost_trace", None)
+
+                gv_len = None
+                wc_len = None
+                if gv_trace is not None and not isinstance(gv_trace, (str, bytes)):
+                    try:
+                        gv_len = len(gv_trace)
+                    except TypeError:
+                        gv_len = None
+                if wc_trace is not None and not isinstance(wc_trace, (str, bytes)):
+                    try:
+                        wc_len = len(wc_trace)
+                    except TypeError:
+                        wc_len = None
+
+                if gv_len is not None:
+                    qos_gv_calls += gv_len
+                else:
+                    qos_gv_calls += max(
+                        0, int(getattr(qos_mitigator, "_gv_cost_calls", 0)) - prev_gv
+                    )
+                if wc_len is not None:
+                    qos_wc_calls += wc_len
+                else:
+                    qos_wc_calls += max(
+                        0, int(getattr(qos_mitigator, "_wc_cost_calls", 0)) - prev_wc
+                    )
+                return size_out, method_out, cost_time_out, timed_out_out
+
+            qos_mitigator.cost_search = _wrap_qos_cost_search
             t0 = time.perf_counter()
             qos_q = qos_mitigator.run(qos_q)
             qos_run_time = time.perf_counter() - t0
-            qos_gv_calls = getattr(qos_mitigator, "_gv_cost_calls", 0)
-            qos_wc_calls = getattr(qos_mitigator, "_wc_cost_calls", 0)
+            if qos_cost_search_seen == 0:
+                # No cost-search invocations observed; fallback to direct counters.
+                qos_gv_calls = int(getattr(qos_mitigator, "_gv_cost_calls", 0))
+                qos_wc_calls = int(getattr(qos_mitigator, "_wc_cost_calls", 0))
             total_qos_gv_calls += qos_gv_calls
             total_qos_wc_calls += qos_wc_calls
             current_stage = "baseline_qos_analyze"
@@ -1146,6 +1196,9 @@ def _evaluate_bench_size_pairs(
         cnot_sum += rel_cnot
         run_time_sum += rel_run_time
         overhead_sum += rel_overhead
+        qose_depth_sum += qose_depth
+        qose_cnot_sum += qose_cnot
+        qose_overhead_sum += qose_num_circuits
         qos_depth_sum += qos_depth
         qos_cnot_sum += qos_cnot
         qos_run_time_sum += qos_run_time
@@ -1223,6 +1276,9 @@ def _evaluate_bench_size_pairs(
         "wc_cost_calls_total": total_wc_calls,
         "qos_gv_cost_calls_total": total_qos_gv_calls,
         "qos_wc_cost_calls_total": total_qos_wc_calls,
+        "qose_depth_avg": (qose_depth_sum / count) if count else 0.0,
+        "qose_cnot_avg": (qose_cnot_sum / count) if count else 0.0,
+        "qose_overhead_avg": (qose_overhead_sum / count) if count else 0.0,
         "qos_depth_avg": (qos_depth_sum / count) if count else 0.0,
         "qos_cnot_avg": (qos_cnot_sum / count) if count else 0.0,
         "qos_overhead_avg": (qos_overhead_sum / count) if count else 0.0,
@@ -1457,6 +1513,9 @@ def _evaluate_impl(program_path):
         "wc_cost_calls_total": sample_res["wc_cost_calls_total"],
         "qos_gv_cost_calls_total": sample_res["qos_gv_cost_calls_total"],
         "qos_wc_cost_calls_total": sample_res["qos_wc_cost_calls_total"],
+        "qose_depth_avg": sample_res["qose_depth_avg"],
+        "qose_cnot_avg": sample_res["qose_cnot_avg"],
+        "qose_overhead_avg": sample_res["qose_overhead_avg"],
         "qos_depth_avg": sample_res["qos_depth_avg"],
         "qos_cnot_avg": sample_res["qos_cnot_avg"],
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
