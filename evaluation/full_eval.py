@@ -332,6 +332,7 @@ def _publish_full_eval_views(
     out_dir: Path,
     artifact_dir: Path,
     panel_paths: Optional[List[Path]] = None,
+    breakdown_paths: Optional[List[Path]] = None,
     final_csv_path: Optional[Path] = None,
     timing_path: Optional[Path] = None,
 ) -> None:
@@ -361,6 +362,17 @@ def _publish_full_eval_views(
                 _link_or_copy(panel, figures_paper / "panel_real_fidelity.pdf")
             elif "sim_fidelity_timing" in panel_name:
                 _link_or_copy(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
+
+    if breakdown_paths:
+        for path in breakdown_paths:
+            if path.suffix.lower() != ".pdf":
+                continue
+            _link_or_copy(path, figures_debug / path.name)
+            lower = path.name.lower()
+            if lower.startswith("qose_time_breakdown_"):
+                _link_or_copy(path, figures_paper / "qose_time_breakdown.pdf")
+            elif lower.startswith("mitigation_stage_breakdown_qos_qose_"):
+                _link_or_copy(path, figures_paper / "mitigation_stage_breakdown_qos_qose.pdf")
 
     if final_csv_path is not None and final_csv_path.exists():
         _link_or_copy(final_csv_path, tables_debug / final_csv_path.name)
@@ -3205,6 +3217,413 @@ def _plot_cached_panels(
     return out_paths
 
 
+def _timing_row_total(row: Dict[str, object]) -> float:
+    skip_stages = {"bench", "size", "method", "total", "overall", "simulation", "cost_search_calls"}
+    if _has_value(row.get("total")):
+        try:
+            return float(row.get("total", 0.0))
+        except Exception:
+            pass
+    total = 0.0
+    for key, value in row.items():
+        if key in skip_stages:
+            continue
+        try:
+            total += float(value)
+        except Exception:
+            continue
+    return total
+
+
+def _read_jsonl_rows(path: Path) -> List[Dict[str, object]]:
+    if not path.exists():
+        raise FileNotFoundError(f"JSONL file not found: {path}")
+    rows: List[Dict[str, object]] = []
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    return rows
+
+
+def _latest_file(path_glob: List[Path]) -> Optional[Path]:
+    if not path_glob:
+        return None
+    return sorted(path_glob, key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)[0]
+
+
+def _plot_time_breakdowns(
+    *,
+    timing_csv: Path,
+    job_cache_jsonl: Path,
+    out_dir: Path,
+    timestamp: str,
+    tag: str,
+    sizes: List[int],
+    methods: List[str],
+    benches: List[str],
+) -> List[Path]:
+    plt = _import_matplotlib()
+    tag_suffix = f"_{tag}" if tag else ""
+    panel_tag = f"{timestamp}{tag_suffix}"
+
+    timing_rows = _read_rows_csv(timing_csv)
+    timing_rows, timing_used, timing_filled = _auto_fill_rows_from_csv_fallbacks(
+        timing_rows,
+        timing_csv,
+        kind="timing",
+        key_fields=["size", "bench", "method"],
+        sizes=sizes,
+        methods=methods,
+    )
+    if timing_used > 0:
+        print(
+            f"[time-breakdown] timing auto-fill files={timing_used} cells={timing_filled}",
+            flush=True,
+        )
+    job_rows = _read_jsonl_rows(job_cache_jsonl)
+    primary_job_keys = {str(r.get("job_key", "")) for r in job_rows if str(r.get("job_key", ""))}
+    fallback_job_files = [
+        p
+        for p in sorted(
+            out_dir.rglob("*job_cache*.jsonl"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True,
+        )
+        if p != job_cache_jsonl
+    ]
+    fallback_jobs_added = 0
+    fallback_files_used = 0
+    for fp in fallback_job_files:
+        try:
+            rows = _read_jsonl_rows(fp)
+        except Exception:
+            continue
+        added_this_file = 0
+        for rec in rows:
+            key = str(rec.get("job_key", ""))
+            if not key or key in primary_job_keys:
+                continue
+            primary_job_keys.add(key)
+            job_rows.append(rec)
+            added_this_file += 1
+        if added_this_file > 0:
+            fallback_files_used += 1
+            fallback_jobs_added += added_this_file
+    if fallback_files_used > 0:
+        print(
+            f"[time-breakdown] job-cache auto-fill files={fallback_files_used} jobs={fallback_jobs_added}",
+            flush=True,
+        )
+    size_set = {int(s) for s in sizes}
+    bench_set = set(benches)
+    methods = [m for m in methods if m in {"QOS", "QOSE"}]
+    if not methods:
+        raise RuntimeError("No supported methods for breakdown (expected QOS and/or QOSE).")
+
+    # Figure 1: QOSE time breakdown + CDF diagnostics.
+    qose_by_size: Dict[int, Dict[str, float]] = {
+        int(s): {
+            "mitigation_sec_total": 0.0,
+            "real_elapsed_sec_total": 0.0,
+            "real_qpu_sec_total": 0.0,
+            "real_wait_sec_total": 0.0,
+            "real_jobs": 0.0,
+            "real_jobs_qpu_unknown": 0.0,
+        }
+        for s in sizes
+    }
+    mitigation_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+    real_elapsed_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+    real_qpu_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+    real_wait_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+    elapsed_samples: List[float] = []
+    qpu_samples: List[float] = []
+
+    for row in timing_rows:
+        method = str(row.get("method", ""))
+        size = _safe_int(row.get("size", ""), -1)
+        bench = str(row.get("bench", ""))
+        if method != "QOSE" or size not in size_set or bench not in bench_set:
+            continue
+        mitigation_sec = max(_timing_row_total(row), 0.0)
+        qose_by_size[size]["mitigation_sec_total"] += mitigation_sec
+        mitigation_by_bench[size][bench] = mitigation_by_bench[size].get(bench, 0.0) + mitigation_sec
+
+    job_dedup: Dict[str, Dict[str, object]] = {}
+    for rec in job_rows:
+        key = str(rec.get("job_key", ""))
+        if key:
+            job_dedup[key] = rec
+    for rec in job_dedup.values():
+        method = str(rec.get("method", ""))
+        size = _safe_int(rec.get("size", ""), -1)
+        bench = str(rec.get("bench", ""))
+        if method != "QOSE" or size not in size_set or bench not in bench_set:
+            continue
+        elapsed = max(_safe_float(rec.get("elapsed_sec", ""), 0.0), 0.0)
+        has_qpu = _has_value(rec.get("qpu_sec"))
+        qpu_sec = max(_safe_float(rec.get("qpu_sec", ""), 0.0), 0.0) if has_qpu else 0.0
+        wait_sec = max(elapsed - qpu_sec, 0.0) if has_qpu else elapsed
+        qose_by_size[size]["real_elapsed_sec_total"] += elapsed
+        qose_by_size[size]["real_qpu_sec_total"] += qpu_sec
+        qose_by_size[size]["real_wait_sec_total"] += wait_sec
+        qose_by_size[size]["real_jobs"] += 1.0
+        real_elapsed_by_bench[size][bench] = real_elapsed_by_bench[size].get(bench, 0.0) + elapsed
+        real_qpu_by_bench[size][bench] = real_qpu_by_bench[size].get(bench, 0.0) + qpu_sec
+        real_wait_by_bench[size][bench] = real_wait_by_bench[size].get(bench, 0.0) + wait_sec
+        elapsed_samples.append(elapsed)
+        if has_qpu:
+            qpu_samples.append(qpu_sec)
+        if not has_qpu:
+            qose_by_size[size]["real_jobs_qpu_unknown"] += 1.0
+
+    x_labels = [str(s) for s in sizes]
+    components = [
+        (
+            "Mitigation avg/bench",
+            [
+                float(np.mean(list(mitigation_by_bench[s].values())))
+                if mitigation_by_bench[s]
+                else 0.0
+                for s in sizes
+            ],
+            "#4C78A8",
+        ),
+        (
+            "Real Wait avg/bench",
+            [
+                float(np.mean(list(real_wait_by_bench[s].values())))
+                if real_wait_by_bench[s]
+                else 0.0
+                for s in sizes
+            ],
+            "#F58518",
+        ),
+        (
+            "Real QPU avg/bench",
+            [
+                float(np.mean(list(real_qpu_by_bench[s].values())))
+                if real_qpu_by_bench[s]
+                else 0.0
+                for s in sizes
+            ],
+            "#54A24B",
+        ),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.0))
+    x = np.arange(len(x_labels))
+    ax = axes[0]
+    width = 0.24
+    for i, (name, vals, color) in enumerate(components):
+        vals_np = np.array(vals, dtype=float)
+        bars = ax.bar(
+            x + (i - 1) * width,
+            vals_np,
+            width=width,
+            color=color,
+            label=name,
+            edgecolor="black",
+            linewidth=0.6,
+        )
+        ymax = float(vals_np.max()) if len(vals_np) else 0.0
+        offset = 0.01 * ymax if ymax > 0 else 0.0
+        for bar, val in zip(bars, vals_np):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + offset,
+                f"{val:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+            )
+    ax.set_title("QOSE Breakdown (avg per bench)", fontsize=15)
+    ax.set_xlabel("Qubit Size", fontsize=12)
+    ax.set_ylabel("Seconds", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=11)
+    ax.tick_params(axis="y", labelsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    ax.legend(fontsize=10, loc="upper left", frameon=True)
+
+    # CDF subplot: per-job elapsed/qpu + per-bench mitigation totals.
+    ax_cdf = axes[1]
+
+    def _plot_cdf(ax_obj, values: List[float], label: str, color: str) -> None:
+        if not values:
+            return
+        vals = np.sort(np.array(values, dtype=float))
+        y = np.arange(1, len(vals) + 1, dtype=float) / float(len(vals))
+        ax_obj.plot(vals, y, label=f"{label} (n={len(vals)})", color=color, linewidth=2.0)
+
+    mitigation_samples = []
+    for s in sizes:
+        mitigation_samples.extend(list(mitigation_by_bench[s].values()))
+    _plot_cdf(ax_cdf, elapsed_samples, "Per-job Elapsed", "#E45756")
+    _plot_cdf(ax_cdf, qpu_samples, "Per-job QPU", "#54A24B")
+    _plot_cdf(ax_cdf, mitigation_samples, "Per-bench Mitigation", "#4C78A8")
+    ax_cdf.set_title("CDF of Timing Units", fontsize=15)
+    ax_cdf.set_xlabel("Seconds", fontsize=12)
+    ax_cdf.set_ylabel("CDF", fontsize=12)
+    ax_cdf.tick_params(axis="both", labelsize=11)
+    ax_cdf.grid(True, linestyle="--", alpha=0.35)
+    ax_cdf.legend(fontsize=10, loc="lower right", frameon=True)
+
+    total_real_jobs = int(sum(v["real_jobs"] for v in qose_by_size.values()))
+    total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in qose_by_size.values()))
+    fig.suptitle(
+        f"QOSE Timing Diagnostics (real jobs={total_real_jobs}, qpu_sec unknown={total_unknown_qpu})",
+        fontsize=14,
+        y=1.08,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig1 = out_dir / f"qose_time_breakdown_{panel_tag}.pdf"
+    fig.savefig(fig1)
+    plt.close(fig)
+
+    rows1: List[Dict[str, object]] = []
+    for s in sizes:
+        row = {
+            "size": s,
+            "mitigation_sec_total": qose_by_size[s]["mitigation_sec_total"],
+            "mitigation_sec_avg_per_bench": float(np.mean(list(mitigation_by_bench[s].values())))
+            if mitigation_by_bench[s]
+            else 0.0,
+            "real_wait_sec_total": qose_by_size[s]["real_wait_sec_total"],
+            "real_wait_sec_avg_per_bench": float(np.mean(list(real_wait_by_bench[s].values())))
+            if real_wait_by_bench[s]
+            else 0.0,
+            "real_qpu_sec_total": qose_by_size[s]["real_qpu_sec_total"],
+            "real_qpu_sec_avg_per_bench": float(np.mean(list(real_qpu_by_bench[s].values())))
+            if real_qpu_by_bench[s]
+            else 0.0,
+            "real_elapsed_sec_total": qose_by_size[s]["real_elapsed_sec_total"],
+            "real_jobs": qose_by_size[s]["real_jobs"],
+            "real_jobs_qpu_unknown": qose_by_size[s]["real_jobs_qpu_unknown"],
+            "benches_with_mitigation": len(mitigation_by_bench[s]),
+            "benches_with_real_jobs": len(real_elapsed_by_bench[s]),
+        }
+        rows1.append(row)
+    csv1 = out_dir / f"qose_time_breakdown_{panel_tag}.csv"
+    _write_rows_csv(csv1, rows1)
+
+    # Figure 2: mitigation-stage breakdown by bench for QOS/QOSE @ requested sizes.
+    stage_skip = {"bench", "size", "method", "total", "overall", "simulation", "cost_search_calls"}
+    stage_alias = {"qaoa_analysis": "analysis"}
+    stage_order_pref = ["analysis", "qr", "qf", "gv", "wc", "cost_search"]
+
+    def _stage_values_merged(row: Dict[str, object]) -> Dict[str, float]:
+        merged_vals: Dict[str, float] = {}
+        for key, val in row.items():
+            if key in stage_skip:
+                continue
+            stage = stage_alias.get(key, key)
+            sec = max(_safe_float(val, 0.0), 0.0)
+            if sec <= 0.0:
+                continue
+            merged_vals[stage] = merged_vals.get(stage, 0.0) + sec
+        return merged_vals
+
+    stage_set = set()
+    for row in timing_rows:
+        method = str(row.get("method", ""))
+        size = _safe_int(row.get("size", ""), -1)
+        bench = str(row.get("bench", ""))
+        if method not in methods or size not in size_set or bench not in bench_set:
+            continue
+        for key in _stage_values_merged(row).keys():
+            stage_set.add(key)
+    stage_order = [s for s in stage_order_pref if s in stage_set] + sorted(stage_set - set(stage_order_pref))
+    if not stage_order:
+        stage_order = ["analysis"]
+
+    bench_order = [b for b, _ in BENCHES if b in bench_set]
+    fig_rows = 1
+    fig_cols = max(1, len(sizes) * len(methods))
+    fig2, axes2 = plt.subplots(fig_rows, fig_cols, figsize=(5.2 * fig_cols, 5.1), squeeze=False)
+    cmap = plt.get_cmap("tab20")
+
+    rows2: List[Dict[str, object]] = []
+    subplot_index = 0
+    for size in sizes:
+        for method in methods:
+            axm = axes2[0, subplot_index]
+            subplot_index += 1
+            method_rows = [
+                row
+                for row in timing_rows
+                if _safe_int(row.get("size", ""), -1) == int(size)
+                and str(row.get("method", "")) == method
+                and str(row.get("bench", "")) in bench_set
+            ]
+            bench_to_row = {str(row.get("bench", "")): row for row in method_rows}
+            x_bench = np.arange(len(bench_order))
+            bottom = np.zeros(len(bench_order), dtype=float)
+            for si, stage in enumerate(stage_order):
+                vals = []
+                for bench in bench_order:
+                    stage_vals = _stage_values_merged(bench_to_row.get(bench, {}))
+                    val = stage_vals.get(stage, 0.0)
+                    vals.append(max(val, 0.0))
+                    rows2.append(
+                        {
+                            "size": int(size),
+                            "method": method,
+                            "bench": bench,
+                            "stage": stage,
+                            "sec": max(val, 0.0),
+                        }
+                    )
+                vals_np = np.array(vals, dtype=float)
+                if float(vals_np.sum()) <= 0.0:
+                    continue
+                axm.bar(
+                    x_bench,
+                    vals_np,
+                    bottom=bottom,
+                    color=cmap(si % 20),
+                    label=stage if subplot_index == 1 else None,
+                    linewidth=0.4,
+                    edgecolor="black",
+                )
+                bottom += vals_np
+            axm.set_title(f"{method} @ {size} qubits", fontsize=13)
+            axm.set_xticks(x_bench)
+            axm.set_xticklabels(bench_order, rotation=35, ha="right", fontsize=10)
+            axm.tick_params(axis="y", labelsize=10)
+            axm.set_ylabel("Seconds", fontsize=11)
+            axm.grid(axis="y", linestyle="--", alpha=0.3)
+
+    handles, labels = axes2[0, 0].get_legend_handles_labels()
+    if handles:
+        fig2.legend(
+            handles,
+            labels,
+            ncol=max(1, len(labels)),
+            fontsize=12,
+            loc="upper center",
+            frameon=False,
+        )
+        fig2.tight_layout(rect=(0, 0, 1, 0.90))
+    else:
+        fig2.tight_layout()
+    fig2_path = out_dir / f"mitigation_stage_breakdown_qos_qose_{panel_tag}.pdf"
+    fig2.savefig(fig2_path)
+    plt.close(fig2)
+
+    csv2 = out_dir / f"mitigation_stage_breakdown_qos_qose_{panel_tag}.csv"
+    _write_rows_csv(csv2, rows2)
+    return [fig1, fig2_path, csv1, csv2]
+
+
 def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
     for method in methods:
         prefix = _method_prefix(method)
@@ -4532,6 +4951,42 @@ def main() -> None:
         default="QOS,CutQC,FrozenQubits",
         help="Comma-separated methods for panel plotting mode.",
     )
+    parser.add_argument(
+        "--plot-time-breakdowns",
+        action="store_true",
+        help=(
+            "Plot time breakdown figures from cached full-eval timing/job-cache data, then exit. "
+            "Outputs: 1) QOSE end-to-end time components, 2) QOS/QOSE mitigation stage breakdown."
+        ),
+    )
+    parser.add_argument(
+        "--timebreak-timing-csv",
+        default="",
+        help="Timing CSV for --plot-time-breakdowns. If unset, picks latest timing_*.csv under --out-dir.",
+    )
+    parser.add_argument(
+        "--timebreak-job-cache",
+        default="",
+        help=(
+            "Real-job cache JSONL for --plot-time-breakdowns. "
+            "If unset, uses cache from --resume-state (if set) else latest *job_cache*.jsonl under --out-dir."
+        ),
+    )
+    parser.add_argument(
+        "--timebreak-sizes",
+        default="12,24",
+        help="Comma-separated qubit sizes for --plot-time-breakdowns.",
+    )
+    parser.add_argument(
+        "--timebreak-methods",
+        default="QOS,QOSE",
+        help="Comma-separated methods for mitigation-stage breakdown figure.",
+    )
+    parser.add_argument(
+        "--timebreak-benches",
+        default="all",
+        help="Comma-separated benches for --plot-time-breakdowns, or 'all'.",
+    )
     args = parser.parse_args()
 
     if args.plot_cached_panels:
@@ -4575,6 +5030,65 @@ def main() -> None:
             panel_paths=out_paths,
             final_csv_path=Path(args.panel_simtiming_csv),
             timing_path=Path(args.panel_timing_csv),
+        )
+        return
+
+    if args.plot_time_breakdowns:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if str(args.timebreak_timing_csv).strip():
+            timing_csv = Path(args.timebreak_timing_csv)
+        else:
+            timing_csv = _latest_file(list(out_dir.rglob("timing_*.csv")))
+            if timing_csv is None:
+                raise RuntimeError(
+                    "Could not find timing CSV automatically. Pass --timebreak-timing-csv."
+                )
+
+        if str(args.timebreak_job_cache).strip():
+            job_cache = Path(args.timebreak_job_cache)
+        elif str(args.resume_state).strip():
+            resume_path = Path(args.resume_state)
+            job_cache, _, _ = _resume_companion_paths(resume_path)
+        else:
+            job_cache = _latest_file(list(out_dir.rglob("*job_cache*.jsonl")))
+            if job_cache is None:
+                raise RuntimeError(
+                    "Could not find job cache automatically. Pass --timebreak-job-cache or --resume-state."
+                )
+
+        sizes = [int(s.strip()) for s in str(args.timebreak_sizes).split(",") if s.strip()]
+        methods = [m.strip() for m in str(args.timebreak_methods).split(",") if m.strip()]
+        if str(args.timebreak_benches).strip().lower() == "all":
+            benches = [b for b, _ in BENCHES]
+        else:
+            benches = [b.strip() for b in str(args.timebreak_benches).split(",") if b.strip()]
+        if not sizes:
+            raise RuntimeError("--timebreak-sizes is empty.")
+        if not methods:
+            raise RuntimeError("--timebreak-methods is empty.")
+        if not benches:
+            raise RuntimeError("--timebreak-benches is empty.")
+
+        out_paths = _plot_time_breakdowns(
+            timing_csv=timing_csv,
+            job_cache_jsonl=job_cache,
+            out_dir=out_dir,
+            timestamp=timestamp,
+            tag=args.tag.strip(),
+            sizes=sizes,
+            methods=methods,
+            benches=benches,
+        )
+        for path in out_paths:
+            print(f"Wrote: {path}")
+        publish_root = out_dir.parent if out_dir.name == "full_eval_artifacts" else out_dir
+        _publish_full_eval_views(
+            out_dir=publish_root,
+            artifact_dir=out_dir,
+            breakdown_paths=[p for p in out_paths if p.suffix.lower() == ".pdf"],
         )
         return
 
