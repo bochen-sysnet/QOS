@@ -139,6 +139,37 @@ def _surrogate_selection_csv(state_csv: Path) -> Path:
     return state_csv.with_suffix(state_csv.suffix + ".selection.csv")
 
 
+def _include_summary_artifact() -> bool:
+    return _env_bool("QOSE_INCLUDE_SUMMARY_ARTIFACT", True)
+
+
+def _include_cases_artifact() -> bool:
+    return _env_bool("QOSE_INCLUDE_CASES_ARTIFACT", True)
+
+
+def _include_example_code_artifact() -> bool:
+    return _env_bool("QOSE_INCLUDE_EXAMPLE_CODE", False)
+
+
+def _example_code_path() -> Path:
+    raw = os.getenv(
+        "QOSE_EXAMPLE_CODE_PATH",
+        "/home/ryan/bo/QOS/openaievolve/evolution_seed.py",
+    ).strip()
+    return Path(raw)
+
+
+def _load_example_code_artifact() -> str | None:
+    if not _include_example_code_artifact():
+        return None
+    path = _example_code_path()
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to load example code artifact from %s: %s", path, exc)
+        return None
+
+
 def _program_hash(program_path: str) -> str:
     try:
         data = Path(program_path).read_bytes()
@@ -1521,10 +1552,14 @@ def _evaluate_impl(program_path):
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
     }
     summary.update(score_meta)
-    artifacts = {
-        "summary": summary,
-        "cases": sample_res["cases"],
-    }
+    artifacts = {}
+    if _include_summary_artifact():
+        artifacts["summary"] = summary
+    if _include_cases_artifact():
+        artifacts["cases"] = sample_res["cases"]
+    example_code_artifact = _load_example_code_artifact()
+    if example_code_artifact is not None:
+        artifacts["example_code"] = example_code_artifact
     return _round_float_values(metrics), _round_float_values(artifacts)
 
 
