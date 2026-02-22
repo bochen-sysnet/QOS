@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 import json
 import pickle
+import shutil
 import shlex
 from pathlib import Path
 import multiprocessing as mp
@@ -209,6 +210,175 @@ def _write_rows_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _normalize_backend_name(raw: str) -> str:
+    name = str(raw or "").strip().lower()
+    if not name:
+        return "generic"
+    if "torino" in name:
+        return "torino"
+    if "marrakesh" in name:
+        return "marrakesh"
+    for prefix in ("ibm_", "fake_", "backend_"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    cleaned = "".join(ch if (ch.isalnum() or ch in {"_", "-"}) else "_" for ch in name)
+    cleaned = cleaned.strip("_-")
+    return cleaned or "generic"
+
+
+def _infer_state_backend(args) -> str:
+    if bool(args.with_real_fidelity):
+        return _normalize_backend_name(str(args.real_backend))
+    if str(args.metrics_baseline) in {"torino", "marrakesh"}:
+        return _normalize_backend_name(str(args.metrics_baseline))
+    return "generic"
+
+
+def _infer_state_stage(args) -> str:
+    with_fid = bool(args.with_fidelity)
+    with_real = bool(args.with_real_fidelity)
+    if with_fid and with_real:
+        return "mixed"
+    if with_real and not with_fid:
+        return "real_only"
+    if with_fid and not with_real:
+        return "sim_only"
+    return "metrics_only"
+
+
+def _resume_companion_paths(resume_path: Path) -> Tuple[Path, Path, Path]:
+    if resume_path.name == "resume.json":
+        return (
+            resume_path.with_name("cache_job_real.jsonl"),
+            resume_path.with_name("cache_ideal_sim.jsonl"),
+            resume_path.with_name("method_cache"),
+        )
+    stem = resume_path.stem
+    return (
+        resume_path.with_name(f"{stem}_job_cache.jsonl"),
+        resume_path.with_name(f"{stem}_ideal_cache.jsonl"),
+        resume_path.with_name(f"{stem}_method_cache"),
+    )
+
+
+def _copy_path_if_missing(src: Path, dst: Path) -> bool:
+    if not src.exists() or dst.exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+    return True
+
+
+def _dedup_paths(paths: List[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _seed_resume_from_candidates(
+    *,
+    primary_resume: Path,
+    signature: Dict[str, object],
+    candidates: List[Path],
+) -> Optional[Path]:
+    if primary_resume.exists():
+        return None
+    primary_job, primary_ideal, primary_method = _resume_companion_paths(primary_resume)
+    for candidate in candidates:
+        if candidate == primary_resume or not candidate.exists():
+            continue
+        loaded = _load_resume_state(candidate, signature)
+        if loaded is None:
+            continue
+        primary_resume.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, primary_resume)
+        candidate_job, candidate_ideal, candidate_method = _resume_companion_paths(candidate)
+        _copy_path_if_missing(candidate_job, primary_job)
+        _copy_path_if_missing(candidate_ideal, primary_ideal)
+        _copy_path_if_missing(candidate_method, primary_method)
+        return candidate
+    return None
+
+
+def _link_or_copy(target: Path, link: Path) -> None:
+    if not target.exists():
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() or link.exists():
+        try:
+            link.unlink()
+        except IsADirectoryError:
+            shutil.rmtree(link, ignore_errors=True)
+    try:
+        rel = os.path.relpath(target, link.parent)
+        link.symlink_to(rel)
+    except Exception:
+        shutil.copy2(target, link)
+
+
+def _publish_full_eval_views(
+    *,
+    out_dir: Path,
+    artifact_dir: Path,
+    panel_paths: Optional[List[Path]] = None,
+    final_csv_path: Optional[Path] = None,
+    timing_path: Optional[Path] = None,
+) -> None:
+    figures_paper = out_dir / "figures" / "paper"
+    figures_debug = out_dir / "figures" / "debug"
+    tables_paper = out_dir / "tables" / "paper"
+    tables_debug = out_dir / "tables" / "debug"
+    plot_inputs_torino = out_dir / "plot_inputs" / "torino"
+    plot_inputs_marrakesh = out_dir / "plot_inputs" / "marrakesh"
+    for folder in [
+        figures_paper,
+        figures_debug,
+        tables_paper,
+        tables_debug,
+        plot_inputs_torino,
+        plot_inputs_marrakesh,
+    ]:
+        folder.mkdir(parents=True, exist_ok=True)
+
+    if panel_paths:
+        for panel in panel_paths:
+            _link_or_copy(panel, figures_debug / panel.name)
+            panel_name = panel.name.lower()
+            if "depth_cnot" in panel_name:
+                _link_or_copy(panel, figures_paper / "panel_depth_cnot.pdf")
+            elif "real_fidelity" in panel_name:
+                _link_or_copy(panel, figures_paper / "panel_real_fidelity.pdf")
+            elif "sim_fidelity_timing" in panel_name:
+                _link_or_copy(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
+
+    if final_csv_path is not None and final_csv_path.exists():
+        _link_or_copy(final_csv_path, tables_debug / final_csv_path.name)
+        _link_or_copy(final_csv_path, tables_paper / "relative_properties_latest.csv")
+        lower = final_csv_path.name.lower()
+        if "torino" in lower:
+            _link_or_copy(final_csv_path, plot_inputs_torino / "relative_properties_latest.csv")
+        if "marrakesh" in lower:
+            _link_or_copy(final_csv_path, plot_inputs_marrakesh / "relative_properties_latest.csv")
+
+    if timing_path is not None and timing_path.exists():
+        _link_or_copy(timing_path, tables_debug / timing_path.name)
+        _link_or_copy(timing_path, tables_paper / "timing_latest.csv")
+        lower = timing_path.name.lower()
+        if "torino" in lower:
+            _link_or_copy(timing_path, plot_inputs_torino / "timing_latest.csv")
+        if "marrakesh" in lower:
+            _link_or_copy(timing_path, plot_inputs_marrakesh / "timing_latest.csv")
 
 
 def _resume_signature(args, benches, sizes, methods: List[str]) -> Dict[str, object]:
@@ -2608,6 +2778,171 @@ def _read_rows_csv(path: Path) -> List[Dict[str, object]]:
         return [dict(row) for row in reader]
 
 
+def _has_value(val: object) -> bool:
+    if val in {"", None}:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() not in {"", "nan", "none", "null"}
+    try:
+        return bool(np.isfinite(float(val)))
+    except Exception:
+        return True
+
+
+def _row_key_from_fields(row: Dict[str, object], key_fields: List[str]) -> Optional[Tuple[str, ...]]:
+    key_parts: List[str] = []
+    for field in key_fields:
+        val = row.get(field, "")
+        if not _has_value(val):
+            return None
+        if field == "size":
+            key_parts.append(str(_safe_int(val, -1)))
+        else:
+            key_parts.append(str(val))
+    return tuple(key_parts)
+
+
+def _backend_hint_from_path(path: Path) -> str:
+    name = path.name.lower()
+    if "marrakesh" in name:
+        return "marrakesh"
+    if "torino" in name:
+        return "torino"
+    return "unknown"
+
+
+def _collect_fallback_csvs(
+    primary_csv: Path,
+    *,
+    kind: str,
+    backend: Optional[str] = None,
+) -> List[Path]:
+    pattern = "relative_properties*.csv" if kind == "relative" else "timing*.csv"
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+
+    def _add_path(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        if resolved == primary_csv.resolve():
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        candidates.append(path)
+
+    # Prefer local artifacts first.
+    for p in sorted(primary_csv.parent.glob(pattern)):
+        _add_path(p)
+
+    # Then include saved collections.
+    collections_root = ROOT / "evaluation" / "plots" / "full_eval_collections"
+    if collections_root.exists():
+        for p in sorted(collections_root.rglob(pattern)):
+            _add_path(p)
+
+    filtered: List[Path] = []
+    for p in candidates:
+        if backend == "torino":
+            # Torino fallback can use explicit Torino files and unlabeled legacy files.
+            if _backend_hint_from_path(p) == "marrakesh":
+                continue
+        elif backend == "marrakesh":
+            # Marrakesh fallback should only use explicitly labeled Marrakesh files.
+            if _backend_hint_from_path(p) != "marrakesh":
+                continue
+        filtered.append(p)
+
+    # Newest first gives best chance of matching current schema.
+    filtered.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+    return filtered
+
+
+def _merge_rows_from_fallback(
+    primary_rows: List[Dict[str, object]],
+    fallback_rows: List[Dict[str, object]],
+    *,
+    key_fields: List[str],
+) -> Tuple[List[Dict[str, object]], int, int]:
+    merged = [dict(r) for r in primary_rows]
+    row_idx: Dict[Tuple[str, ...], int] = {}
+    for idx, row in enumerate(merged):
+        key = _row_key_from_fields(row, key_fields)
+        if key is not None:
+            row_idx[key] = idx
+
+    filled_cells = 0
+    added_rows = 0
+    for frow in fallback_rows:
+        key = _row_key_from_fields(frow, key_fields)
+        if key is None:
+            continue
+        if key in row_idx:
+            target = merged[row_idx[key]]
+            for col, val in frow.items():
+                if col in key_fields:
+                    continue
+                if _has_value(val) and not _has_value(target.get(col)):
+                    target[col] = val
+                    filled_cells += 1
+        else:
+            merged.append(dict(frow))
+            row_idx[key] = len(merged) - 1
+            added_rows += 1
+
+    return merged, filled_cells, added_rows
+
+
+def _auto_fill_rows_from_csv_fallbacks(
+    primary_rows: List[Dict[str, object]],
+    primary_csv: Path,
+    *,
+    kind: str,
+    key_fields: List[str],
+    backend: Optional[str] = None,
+    sizes: Optional[List[int]] = None,
+    methods: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, object]], int, int]:
+    merged = [dict(r) for r in primary_rows]
+    fallback_paths = _collect_fallback_csvs(primary_csv, kind=kind, backend=backend)
+    used_files = 0
+    total_filled = 0
+
+    size_filter = set(int(s) for s in sizes or [])
+    method_filter = set(methods or [])
+    for path in fallback_paths:
+        try:
+            rows = _read_rows_csv(path)
+        except Exception:
+            continue
+
+        filtered_rows: List[Dict[str, object]] = []
+        for row in rows:
+            if size_filter:
+                row_size = _safe_int(row.get("size", ""), -1)
+                if row_size not in size_filter:
+                    continue
+            if method_filter and "method" in key_fields:
+                row_method = str(row.get("method", ""))
+                if row_method not in method_filter:
+                    continue
+            filtered_rows.append(row)
+
+        if not filtered_rows:
+            continue
+
+        merged, filled_cells, added_rows = _merge_rows_from_fallback(
+            merged, filtered_rows, key_fields=key_fields
+        )
+        if filled_cells > 0 or added_rows > 0:
+            used_files += 1
+            total_filled += filled_cells
+
+    return merged, used_files, total_filled
+
+
 def _plot_timing_total_panel(
     ax,
     timing_rows: List[Dict[str, object]],
@@ -2698,6 +3033,49 @@ def _plot_cached_panels(
     torino_rows = _read_rows_csv(real_torino_csv)
     marrakesh_rows = _read_rows_csv(real_marrakesh_csv)
     timing_rows = _read_rows_csv(timing_csv)
+
+    # Auto-fill missing cached values from prior runs so users do not need
+    # manual CSV merges when combining reused baselines with new QOSE results.
+    sim_rows, sim_used, sim_filled = _auto_fill_rows_from_csv_fallbacks(
+        sim_rows,
+        simtiming_csv,
+        kind="relative",
+        key_fields=["size", "bench"],
+        sizes=sizes,
+    )
+    torino_rows, tor_used, tor_filled = _auto_fill_rows_from_csv_fallbacks(
+        torino_rows,
+        real_torino_csv,
+        kind="relative",
+        key_fields=["size", "bench"],
+        backend="torino",
+        sizes=sizes,
+    )
+    marrakesh_rows, mar_used, mar_filled = _auto_fill_rows_from_csv_fallbacks(
+        marrakesh_rows,
+        real_marrakesh_csv,
+        kind="relative",
+        key_fields=["size", "bench"],
+        backend="marrakesh",
+        sizes=sizes,
+    )
+    timing_rows, timing_used, timing_filled = _auto_fill_rows_from_csv_fallbacks(
+        timing_rows,
+        timing_csv,
+        kind="timing",
+        key_fields=["size", "bench", "method"],
+        sizes=sizes,
+        methods=methods,
+    )
+    if any(x > 0 for x in [sim_used, tor_used, mar_used, timing_used]):
+        print(
+            "[panel-cache] auto-fill "
+            f"sim(files={sim_used},cells={sim_filled}) "
+            f"torino(files={tor_used},cells={tor_filled}) "
+            f"marrakesh(files={mar_used},cells={mar_filled}) "
+            f"timing(files={timing_used},cells={timing_filled})",
+            flush=True,
+        )
 
     sim_rel_by_size, sim_fid_by_size, sim_fid_err_by_size, _, _ = _build_progress_maps_from_rows(
         sim_rows,
@@ -4190,6 +4568,14 @@ def main() -> None:
         )
         for path in out_paths:
             print(f"Wrote figure: {path}")
+        publish_root = out_dir.parent if out_dir.name == "full_eval_artifacts" else out_dir
+        _publish_full_eval_views(
+            out_dir=publish_root,
+            artifact_dir=out_dir,
+            panel_paths=out_paths,
+            final_csv_path=Path(args.panel_simtiming_csv),
+            timing_path=Path(args.panel_timing_csv),
+        )
         return
 
     global _REAL_DRY_RUN, _RUN_QPU_SEC, _RUN_QPU_SEC_KNOWN_JOBS, _RUN_QPU_SEC_UNKNOWN_JOBS
@@ -4246,20 +4632,62 @@ def main() -> None:
             if method in selected_methods:
                 print(f"Using QOSE program ({method}): {program}", file=sys.stderr)
 
-    resume_state_path = (
-        Path(args.resume_state) if args.resume_state.strip() else artifact_dir / "full_eval_progress.json"
-    )
-    if str(args.artifact_dir).strip() and not args.resume_state.strip():
+    state_backend = _infer_state_backend(args)
+    state_stage = _infer_state_stage(args)
+    explicit_resume_state = bool(args.resume_state.strip())
+    if explicit_resume_state:
+        resume_state_path = Path(args.resume_state)
+    else:
+        state_dir = out_dir / "state" / state_backend / state_stage
+        state_dir.mkdir(parents=True, exist_ok=True)
+        resume_state_path = state_dir / "resume.json"
+        print(f"Full-eval state dir: {state_dir}", flush=True)
+    if str(args.artifact_dir).strip() and not explicit_resume_state:
         print(f"Full-eval artifact dir: {artifact_dir}", flush=True)
     use_cache = not args.no_cache
+    signature = _resume_signature(args, benches, sizes, selected_methods)
+    job_cache_path, ideal_cache_path, default_method_cache_dir = _resume_companion_paths(
+        resume_state_path
+    )
+
+    fallback_resume_candidates: List[Path] = []
+    if not explicit_resume_state:
+        state_root = out_dir / "state" / state_backend
+        if state_stage == "mixed":
+            fallback_resume_candidates.extend(
+                [state_root / "sim_only" / "resume.json", state_root / "real_only" / "resume.json"]
+            )
+        elif state_stage == "real_only":
+            fallback_resume_candidates.extend(
+                [state_root / "mixed" / "resume.json", state_root / "sim_only" / "resume.json"]
+            )
+        elif state_stage == "sim_only":
+            fallback_resume_candidates.extend([state_root / "mixed" / "resume.json"])
+        sizes_token = "_".join(str(int(s)) for s in sorted(set(sizes)))
+        fallback_resume_candidates.extend(
+            [
+                artifact_dir / "full_eval_progress.json",
+                artifact_dir / f"full_eval_progress_{sizes_token}.json",
+            ]
+        )
+        fallback_resume_candidates.extend(sorted(artifact_dir.glob("full_eval_progress*.json")))
+        fallback_resume_candidates = _dedup_paths(fallback_resume_candidates)
+
     if args.reset_resume and resume_state_path.exists():
         resume_state_path.unlink()
-    job_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_job_cache.jsonl")
-    ideal_cache_path = resume_state_path.with_name(f"{resume_state_path.stem}_ideal_cache.jsonl")
     if args.reset_resume and job_cache_path.exists():
         job_cache_path.unlink()
     if args.reset_resume and ideal_cache_path.exists():
         ideal_cache_path.unlink()
+    if use_cache and not args.no_resume and not args.reset_resume and fallback_resume_candidates:
+        seeded_from = _seed_resume_from_candidates(
+            primary_resume=resume_state_path,
+            signature=signature,
+            candidates=fallback_resume_candidates,
+        )
+        if seeded_from is not None:
+            print(f"Seeded resume/caches from: {seeded_from}", flush=True)
+
     global _REAL_JOB_RESULT_CACHE, _IDEAL_RESULT_CACHE
     if use_cache:
         _REAL_JOB_RESULT_CACHE = _RealJobResultCache(job_cache_path)
@@ -4276,7 +4704,6 @@ def main() -> None:
         _REAL_JOB_RESULT_CACHE = None
         _IDEAL_RESULT_CACHE = None
         print("Caches disabled (--no-cache): running without persisted caches/resume.", flush=True)
-    signature = _resume_signature(args, benches, sizes, selected_methods)
     initial_rows: List[Dict[str, object]] = []
     initial_timing_rows: List[Dict[str, object]] = []
     completed_keys: set[str] = set()
@@ -4301,9 +4728,9 @@ def main() -> None:
     partial_csv_path = artifact_dir / f"relative_properties_partial{tag_suffix}.csv"
     partial_timing_path = artifact_dir / f"timing_partial{tag_suffix}.csv"
     method_cache_dir: Optional[Path] = None
-    use_method_cache = bool(use_cache and args.with_real_fidelity)
+    use_method_cache = bool(use_cache)
     if use_method_cache:
-        method_cache_dir = resume_state_path.with_name(f"{resume_state_path.stem}_method_cache")
+        method_cache_dir = default_method_cache_dir
         method_cache_dir.mkdir(parents=True, exist_ok=True)
     progress_plot_stamp = f"progress{tag_suffix}" if tag_suffix else "progress"
     progress_total = len(sizes) * len(benches)
@@ -4578,6 +5005,7 @@ def main() -> None:
     if all_rows:
         _write_rows_csv(final_csv_path, all_rows)
         print(f"Wrote relative properties CSV: {final_csv_path}")
+    panel_out: List[Path] = []
     if args.plot_cached_panels_after_run:
         panel_sizes = [int(s.strip()) for s in str(args.panel_sizes).split(",") if s.strip()]
         panel_methods = [m.strip() for m in str(args.panel_methods).split(",") if m.strip()]
@@ -4614,6 +5042,13 @@ def main() -> None:
         )
         for path in panel_out:
             print(f"Wrote figure: {path}")
+    _publish_full_eval_views(
+        out_dir=out_dir,
+        artifact_dir=artifact_dir,
+        panel_paths=panel_out,
+        final_csv_path=final_csv_path if all_rows else None,
+        timing_path=timing_path,
+    )
     if use_cache:
         _save_resume_state(
             resume_state_path,
