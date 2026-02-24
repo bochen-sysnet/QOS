@@ -416,6 +416,8 @@ def _publish_full_eval_views(
                 _copy_replace(path, figures_paper / "qose_time_breakdown.pdf")
             elif lower.startswith("mitigation_stage_breakdown_qos_qose_"):
                 _copy_replace(path, figures_paper / "mitigation_stage_breakdown_qos_qose.pdf")
+            elif lower.startswith("real_jobs_avg_per_bench_"):
+                _copy_replace(path, figures_paper / "panel_avg_jobs_per_bench.pdf")
 
     if final_csv_path is not None and final_csv_path.exists():
         _link_or_copy(final_csv_path, tables_debug / final_csv_path.name)
@@ -3324,6 +3326,92 @@ def _latest_file(path_glob: List[Path]) -> Optional[Path]:
     return sorted(path_glob, key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)[0]
 
 
+def _strict_dry_run_real_job_counts(
+    *,
+    args,
+    sizes: List[int],
+    benches: List[str],
+    methods: List[str],
+    backend_hint: str,
+) -> Dict[int, Dict[str, Dict[str, float]]]:
+    bench_set = set(benches)
+    eval_benches = [(b, label) for b, label in BENCHES if b in bench_set]
+    if not eval_benches:
+        raise RuntimeError("No benches selected for strict dry-run job counting.")
+
+    requested_methods = [m for m in methods if m and m != "Qiskit"]
+    # Keep only methods supported by evaluator path.
+    requested_methods = [
+        m
+        for m in requested_methods
+        if m in {"FrozenQubits", "CutQC", "QOS", "QOSN", "QOSE", "qwen", "gemini", "gpt"}
+    ]
+
+    dry_args = argparse.Namespace(**vars(args))
+    dry_args.with_fidelity = False
+    dry_args.with_real_fidelity = False
+    dry_args.collect_timing = False
+    dry_args.fragment_fidelity_sweep = False
+    dry_args.cut_visualization = False
+    # Align transpile/noise defaults with the target backend when possible.
+    if backend_hint in {"torino", "marrakesh"}:
+        dry_args.metrics_baseline = backend_hint
+
+    qose_runs, _qose_programs = _load_qose_runs_from_args(dry_args)
+    selected_methods: List[str] = []
+    missing_qose: List[str] = []
+    for method in requested_methods:
+        if method in {"QOSE", "qwen", "gemini", "gpt"} and method not in qose_runs:
+            missing_qose.append(method)
+            continue
+        selected_methods.append(method)
+
+    if missing_qose:
+        _EVAL_LOGGER.warning(
+            "Strict dry-run job-count: missing QOSE program for methods=%s; skipping them.",
+            ",".join(missing_qose),
+        )
+
+    global _REAL_DRY_RUN
+    prev_dry_run = _REAL_DRY_RUN
+    _REAL_DRY_RUN = True
+    try:
+        (
+            _rows,
+            _rel_by_size,
+            _timing_rows,
+            _fidelity_by_size,
+            _fidelity_err_by_size,
+            _real_fidelity_by_size,
+            _real_fidelity_err_by_size,
+            _cut_circuits,
+            _fragment_fidelity,
+            real_job_counts_by_size,
+        ) = _run_eval(
+            dry_args,
+            eval_benches,
+            sizes,
+            qose_runs,
+            selected_methods,
+            initial_rows=[],
+            initial_timing_rows=[],
+            completed_keys=set(),
+            method_cache_dir=None,
+            on_bench_complete=None,
+        )
+    finally:
+        _REAL_DRY_RUN = prev_dry_run
+
+    # Convert from size->bench->method to size->method->bench for plotting helper.
+    converted: Dict[int, Dict[str, Dict[str, float]]] = {int(s): {} for s in sizes}
+    for size in sizes:
+        bench_map = real_job_counts_by_size.get(int(size), {})
+        for bench, by_method in bench_map.items():
+            for method, val in by_method.items():
+                converted[int(size)].setdefault(str(method), {})[str(bench)] = float(val)
+    return converted
+
+
 def _plot_time_breakdowns(
     *,
     timing_csv: Path,
@@ -3338,6 +3426,9 @@ def _plot_time_breakdowns(
     secondary_job_cache_jsonl: Optional[Path] = None,
     primary_label: str = "",
     secondary_label: str = "",
+    strict_job_counts_primary: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    strict_job_counts_secondary: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    job_methods_override: Optional[List[str]] = None,
 ) -> List[Path]:
     plt = _import_matplotlib()
     tag_suffix = f"_{tag}" if tag else ""
@@ -3393,8 +3484,8 @@ def _plot_time_breakdowns(
         )
     size_set = {int(s) for s in sizes}
     bench_set = set(benches)
-    methods = [m for m in methods if m in {"QOS", "QOSE"}]
-    if not methods:
+    mitigation_methods = [m for m in methods if m in {"QOS", "QOSE"}]
+    if not mitigation_methods:
         raise RuntimeError("No supported methods for breakdown (expected QOS and/or QOSE).")
 
     def _collect_qose_breakdown(
@@ -3506,14 +3597,7 @@ def _plot_time_breakdowns(
 
     x_labels = [str(s) for s in sizes]
 
-    def _plot_cdf(ax_obj, values: List[float], label: str, color: str) -> None:
-        if not values:
-            return
-        vals = np.sort(np.array(values, dtype=float))
-        y = np.arange(1, len(vals) + 1, dtype=float) / float(len(vals))
-        ax_obj.plot(vals, y, label=f"{label} (n={len(vals)})", color=color, linewidth=2.0)
-
-    def _draw_qose_panels(ax_bar, ax_cdf, stats: Dict[str, object], title_prefix: str) -> None:
+    def _draw_qose_panels(ax_bar, ax_dist, stats: Dict[str, object], title_prefix: str) -> None:
         qose_by_size = stats["qose_by_size"]
         mitigation_by_bench = stats["mitigation_by_bench"]
         real_wait_by_bench = stats["real_wait_by_bench"]
@@ -3585,15 +3669,77 @@ def _plot_time_breakdowns(
         ax_bar.grid(axis="y", linestyle="--", alpha=0.35)
         ax_bar.legend(fontsize=9, loc="upper left", frameon=True)
 
-        _plot_cdf(ax_cdf, stats["elapsed_samples"], "Per-job Elapsed", "#E45756")
-        _plot_cdf(ax_cdf, stats["qpu_samples"], "Per-job QPU", "#54A24B")
-        _plot_cdf(ax_cdf, stats["mitigation_samples"], "Per-bench Mitigation", "#4C78A8")
-        ax_cdf.set_title(f"CDF ({title_prefix})", fontsize=13)
-        ax_cdf.set_xlabel("Seconds", fontsize=11)
-        ax_cdf.set_ylabel("CDF", fontsize=11)
-        ax_cdf.tick_params(axis="both", labelsize=10)
-        ax_cdf.grid(True, linestyle="--", alpha=0.35)
-        ax_cdf.legend(fontsize=9, loc="lower right", frameon=True)
+        dist_specs = [
+            ("Per-job Elapsed", stats["elapsed_samples"], "#E45756"),
+            ("Per-job QPU", stats["qpu_samples"], "#54A24B"),
+            ("Per-bench Mitigation", stats["mitigation_samples"], "#4C78A8"),
+        ]
+        box_labels: List[str] = []
+        box_values: List[List[float]] = []
+        box_colors: List[str] = []
+        for label, raw_vals, color in dist_specs:
+            cleaned: List[float] = []
+            for v in raw_vals:
+                try:
+                    x = float(v)
+                except Exception:
+                    continue
+                if not np.isfinite(x) or x <= 0:
+                    continue
+                cleaned.append(x)
+            if cleaned:
+                box_labels.append(f"{label}\n(n={len(cleaned)})")
+                box_values.append(cleaned)
+                box_colors.append(color)
+
+        if box_values:
+            boxplot_kwargs = dict(
+                patch_artist=True,
+                showfliers=False,
+                medianprops={"color": "black", "linewidth": 1.2},
+                whiskerprops={"linewidth": 1.0},
+                capprops={"linewidth": 1.0},
+            )
+            try:
+                bp = ax_dist.boxplot(
+                    box_values,
+                    tick_labels=box_labels,
+                    **boxplot_kwargs,
+                )
+            except TypeError:
+                bp = ax_dist.boxplot(
+                    box_values,
+                    labels=box_labels,
+                    **boxplot_kwargs,
+                )
+            for patch, color in zip(bp["boxes"], box_colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.75)
+                patch.set_edgecolor("black")
+                patch.set_linewidth(0.8)
+            # Label each box with its median value for quick comparison.
+            for idx, vals in enumerate(box_values, start=1):
+                med = float(np.median(np.array(vals, dtype=float)))
+                ax_dist.text(
+                    idx + 0.18,
+                    med,
+                    f"{med:.2f}",
+                    ha="left",
+                    va="center",
+                    fontsize=9,
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.7, "pad": 1.0},
+                )
+            ax_dist.set_yscale("log")
+            ax_dist.tick_params(axis="x", labelsize=9, rotation=10)
+            ax_dist.tick_params(axis="y", labelsize=10)
+        else:
+            ax_dist.text(0.5, 0.5, "No timing samples", ha="center", va="center", fontsize=10)
+            ax_dist.set_xticks([])
+            ax_dist.set_yticks([])
+
+        ax_dist.set_title(f"Distribution ({title_prefix})", fontsize=13)
+        ax_dist.set_ylabel("Seconds (log scale)", fontsize=11)
+        ax_dist.grid(True, axis="y", linestyle="--", alpha=0.35)
 
         total_real_jobs = int(sum(v["real_jobs"] for v in qose_by_size.values()))
         total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in qose_by_size.values()))
@@ -3684,7 +3830,7 @@ def _plot_time_breakdowns(
         method = str(row.get("method", ""))
         size = _safe_int(row.get("size", ""), -1)
         bench = str(row.get("bench", ""))
-        if method not in methods or size not in size_set or bench not in bench_set:
+        if method not in mitigation_methods or size not in size_set or bench not in bench_set:
             continue
         for key in _stage_values_merged(row).keys():
             stage_set.add(key)
@@ -3694,14 +3840,14 @@ def _plot_time_breakdowns(
 
     bench_order = [b for b, _ in BENCHES if b in bench_set]
     fig_rows = 1
-    fig_cols = max(1, len(sizes) * len(methods))
+    fig_cols = max(1, len(sizes) * len(mitigation_methods))
     fig2, axes2 = plt.subplots(fig_rows, fig_cols, figsize=(5.2 * fig_cols, 5.1), squeeze=False)
     cmap = plt.get_cmap("tab20")
 
     rows2: List[Dict[str, object]] = []
     subplot_index = 0
     for size in sizes:
-        for method in methods:
+        for method in mitigation_methods:
             axm = axes2[0, subplot_index]
             subplot_index += 1
             method_rows = [
@@ -3768,7 +3914,171 @@ def _plot_time_breakdowns(
 
     csv2 = out_dir / f"mitigation_stage_breakdown_qos_qose_{panel_tag}.csv"
     _write_rows_csv(csv2, rows2)
-    return [fig1, fig2_path, csv1, csv2]
+
+    # Figure 3: average real-job count per bench by method (Torino/Marrakesh, 12/24).
+    def _collect_real_job_counts(curr_job_rows: List[Dict[str, object]]) -> Dict[int, Dict[str, Dict[str, float]]]:
+        counts: Dict[int, Dict[str, Dict[str, float]]] = {
+            int(s): {} for s in sizes
+        }
+        seen_keys: set[str] = set()
+        for rec in curr_job_rows:
+            key = str(rec.get("job_key", "")).strip()
+            if key:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+            size = _safe_int(rec.get("size", ""), -1)
+            bench = str(rec.get("bench", ""))
+            method = str(rec.get("method", ""))
+            if size not in size_set or bench not in bench_set or not method:
+                continue
+            by_method = counts[size].setdefault(method, {})
+            by_method[bench] = float(by_method.get(bench, 0.0) + 1.0)
+        return counts
+
+    primary_job_counts = (
+        strict_job_counts_primary
+        if strict_job_counts_primary is not None
+        else _collect_real_job_counts(job_rows)
+    )
+    secondary_job_counts: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None
+    if strict_job_counts_secondary is not None:
+        secondary_job_counts = strict_job_counts_secondary
+    elif secondary_stats is not None and secondary_job_cache_jsonl is not None:
+        secondary_job_rows = _read_jsonl_rows(secondary_job_cache_jsonl)
+        secondary_job_counts = _collect_real_job_counts(secondary_job_rows)
+
+    job_datasets: List[Tuple[str, Dict[int, Dict[str, Dict[str, float]]]]] = [
+        (primary_name, primary_job_counts)
+    ]
+    if secondary_job_counts is not None:
+        job_datasets.append((secondary_name, secondary_job_counts))
+
+    method_priority = (
+        list(job_methods_override)
+        if job_methods_override
+        else ["Qiskit", "FrozenQubits", "CutQC", "QOS", "QOSE", "QOSN", "qwen", "gemini", "gpt"]
+    )
+    method_seen: set[str] = set()
+    job_methods: List[str] = []
+    for m in method_priority:
+        if any(m in ds_counts.get(int(s), {}) for _label, ds_counts in job_datasets for s in sizes):
+            job_methods.append(m)
+            method_seen.add(m)
+    other_methods = sorted(
+        {
+            m
+            for _label, ds_counts in job_datasets
+            for s in sizes
+            for m in ds_counts.get(int(s), {}).keys()
+            if m not in method_seen
+        }
+    )
+    job_methods.extend(other_methods)
+    bench_order = [b for b, _ in BENCHES if b in bench_set]
+
+    # One-row layout: backend-size panels laid out left-to-right
+    # (e.g., Torino-12, Torino-24, Marrakesh-12, Marrakesh-24).
+    panel_specs: List[Tuple[str, int, Dict[int, Dict[str, Dict[str, float]]]]] = []
+    for backend_name, ds_counts in job_datasets:
+        for size in sizes:
+            panel_specs.append((backend_name, int(size), ds_counts))
+    n_rows = 1
+    n_cols = max(1, len(panel_specs))
+    fig3, axes3 = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(5.5 * n_cols, 4.6),
+        squeeze=False,
+    )
+    cmap_jobs = plt.get_cmap("tab10")
+    hatch_patterns = ["///", "\\\\\\", "...", "xxx", "+++", "---", "|||", "ooo", "***"]
+    rows3: List[Dict[str, object]] = []
+
+    legend_handles = []
+    legend_labels: List[str] = []
+    y_eps = 1e-2
+    for panel_idx, (backend_name, size, ds_counts) in enumerate(panel_specs):
+        axj = axes3[0, panel_idx]
+        x = np.arange(len(job_methods))
+        avg_vals_active: List[float] = []
+        avg_vals_all: List[float] = []
+        plot_vals: List[float] = []
+        for method in job_methods:
+            bench_counts = ds_counts.get(int(size), {}).get(method, {})
+            per_bench_all = [float(bench_counts.get(b, 0.0)) for b in bench_order]
+            per_bench_active = [v for v in per_bench_all if v > 0.0]
+            avg_jobs_active = float(np.mean(per_bench_active)) if per_bench_active else 0.0
+            avg_jobs_all = float(np.mean(per_bench_all)) if per_bench_all else 0.0
+            avg_vals_active.append(avg_jobs_active)
+            avg_vals_all.append(avg_jobs_all)
+            plot_vals.append(max(avg_jobs_active, y_eps))
+            for bench in bench_order:
+                rows3.append(
+                    {
+                        "backend": backend_name,
+                        "size": int(size),
+                        "method": method,
+                        "bench": bench,
+                        "jobs": float(bench_counts.get(bench, 0.0)),
+                        "avg_jobs_per_bench_active": avg_jobs_active,
+                        "avg_jobs_per_bench_all": avg_jobs_all,
+                        "benches_with_jobs": len(per_bench_active),
+                        "benches_total": len(per_bench_all),
+                    }
+                )
+
+        colors = [cmap_jobs(i % 10) for i in range(len(job_methods))]
+        bars = axj.bar(
+            x,
+            np.array(plot_vals, dtype=float),
+            color=colors,
+            edgecolor="black",
+            linewidth=0.7,
+        )
+        for i, bar in enumerate(bars):
+            bar.set_hatch(hatch_patterns[i % len(hatch_patterns)])
+            if panel_idx == 0:
+                legend_handles.append(bar)
+                legend_labels.append(job_methods[i])
+            val = float(avg_vals_active[i])
+            y_text = max(plot_vals[i], y_eps) * 1.08
+            axj.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                y_text,
+                f"{val:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        axj.set_title(f"{backend_name} - {int(size)} qubits", fontsize=13)
+        axj.set_ylabel("Avg jobs per bench", fontsize=11)
+        axj.set_xticks(x)
+        axj.set_xticklabels(job_methods, rotation=32, ha="right", fontsize=9)
+        axj.tick_params(axis="y", labelsize=10)
+        axj.set_yscale("log")
+        axj.grid(axis="y", linestyle="--", alpha=0.3)
+
+    if legend_handles:
+        fig3.legend(
+            legend_handles,
+            legend_labels,
+            ncol=max(1, len(legend_labels)),
+            fontsize=10,
+            loc="upper center",
+            frameon=False,
+        )
+        fig3.tight_layout(rect=(0, 0, 1, 0.90))
+    else:
+        fig3.tight_layout()
+    fig3_path = out_dir / f"real_jobs_avg_per_bench_{panel_tag}.pdf"
+    fig3.savefig(fig3_path)
+    plt.close(fig3)
+
+    csv3 = out_dir / f"real_jobs_avg_per_bench_{panel_tag}.csv"
+    _write_rows_csv(csv3, rows3)
+
+    return [fig1, fig2_path, fig3_path, csv1, csv2, csv3]
 
 
 def _resume_row_complete(row: Dict[str, object], args, methods: List[str]) -> bool:
@@ -5135,7 +5445,9 @@ def main() -> None:
         action="store_true",
         help=(
             "Plot time breakdown figures from cached full-eval timing/job-cache data, then exit. "
-            "Outputs: 1) QOSE end-to-end time components, 2) QOS/QOSE mitigation stage breakdown."
+            "Outputs: 1) QOSE end-to-end time components, "
+            "2) QOS/QOSE mitigation stage breakdown, "
+            "3) avg real jobs per bench by method."
         ),
     )
     parser.add_argument(
@@ -5149,6 +5461,24 @@ def main() -> None:
         help=(
             "Real-job cache JSONL for --plot-time-breakdowns. "
             "If unset, uses cache from --resume-state (if set) else latest *job_cache*.jsonl under --out-dir."
+        ),
+    )
+    parser.add_argument(
+        "--timebreak-job-count-source",
+        choices=["cache", "dryrun"],
+        default="cache",
+        help=(
+            "Source for avg-jobs-per-bench panel: "
+            "'cache' uses submitted-job cache; "
+            "'dryrun' recomputes strict expected job counts without reuse."
+        ),
+    )
+    parser.add_argument(
+        "--timebreak-job-methods",
+        default="Qiskit,FrozenQubits,CutQC,QOS,QOSE",
+        help=(
+            "Comma-separated methods for strict dry-run job counting. "
+            "Used when --timebreak-job-count-source=dryrun."
         ),
     )
     parser.add_argument(
@@ -5288,6 +5618,43 @@ def main() -> None:
         if not benches:
             raise RuntimeError("--timebreak-benches is empty.")
 
+        job_methods_override = [
+            m.strip()
+            for m in str(args.timebreak_job_methods).split(",")
+            if m.strip()
+        ]
+        if not job_methods_override:
+            job_methods_override = ["Qiskit", "FrozenQubits", "CutQC", "QOS", "QOSE"]
+
+        strict_job_counts_primary = None
+        strict_job_counts_secondary = None
+        if str(args.timebreak_job_count_source).strip().lower() == "dryrun":
+            primary_backend_hint = _normalize_backend_name(str(args.timebreak_primary_label))
+            if primary_backend_hint == "generic":
+                primary_backend_hint = _backend_hint_from_path(timing_csv)
+            strict_job_counts_primary = _strict_dry_run_real_job_counts(
+                args=args,
+                sizes=sizes,
+                benches=benches,
+                methods=job_methods_override,
+                backend_hint=primary_backend_hint,
+            )
+            if secondary_timing_csv is not None:
+                secondary_backend_hint = _normalize_backend_name(str(args.timebreak_secondary_label))
+                if secondary_backend_hint == "generic":
+                    secondary_backend_hint = _backend_hint_from_path(secondary_timing_csv)
+                strict_job_counts_secondary = _strict_dry_run_real_job_counts(
+                    args=args,
+                    sizes=sizes,
+                    benches=benches,
+                    methods=job_methods_override,
+                    backend_hint=secondary_backend_hint,
+                )
+            print(
+                "[time-breakdown] avg-jobs panel source=dryrun (strict, no resume/cache reuse)",
+                flush=True,
+            )
+
         out_paths = _plot_time_breakdowns(
             timing_csv=timing_csv,
             job_cache_jsonl=job_cache,
@@ -5301,6 +5668,9 @@ def main() -> None:
             secondary_job_cache_jsonl=secondary_job_cache,
             primary_label=str(args.timebreak_primary_label).strip(),
             secondary_label=str(args.timebreak_secondary_label).strip(),
+            strict_job_counts_primary=strict_job_counts_primary,
+            strict_job_counts_secondary=strict_job_counts_secondary,
+            job_methods_override=job_methods_override,
         )
         for path in out_paths:
             print(f"Wrote: {path}")
