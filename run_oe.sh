@@ -20,6 +20,8 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_TOP_PROGRAMS     Override num_top_programs
   OPENEVOLVE_NUM_DIVERSE_PROGRAMS Override num_diverse_programs
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
+  QOSE_SCORE_MODE                 Score profile: legacy (default) or piecewise
+  OPENEVOLVE_CONFIG_PATH          Optional explicit config YAML path (overrides score-profile selection)
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
@@ -122,7 +124,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Default config uses env variables for base/model/key.
-CONFIG_PATH="qos/error_mitigator/openevolve.yaml"
+# Score profile is selected by QOSE_SCORE_MODE:
+# - piecewise -> openevolve_piecewise.yaml
+# - legacy    -> openevolve_legacy.yaml (default)
+SCORE_MODE_RAW="${QOSE_SCORE_MODE:-legacy}"
+SCORE_MODE_NORM="$(echo "$SCORE_MODE_RAW" | tr '[:upper:]' '[:lower:]')"
+case "$SCORE_MODE_NORM" in
+  piecewise|pwl|piecewise_linear)
+    CONFIG_PATH="qos/error_mitigator/openevolve_piecewise.yaml"
+    export QOSE_SCORE_MODE="piecewise"
+    ;;
+  legacy|"")
+    CONFIG_PATH="qos/error_mitigator/openevolve_legacy.yaml"
+    export QOSE_SCORE_MODE="legacy"
+    ;;
+  *)
+    echo "Unknown QOSE_SCORE_MODE='$SCORE_MODE_RAW'; using legacy config." >&2
+    CONFIG_PATH="qos/error_mitigator/openevolve_legacy.yaml"
+    export QOSE_SCORE_MODE="legacy"
+    ;;
+esac
+
+# Optional explicit config override.
+if [[ -n "${OPENEVOLVE_CONFIG_PATH:-}" ]]; then
+  CONFIG_PATH="$OPENEVOLVE_CONFIG_PATH"
+fi
 
 # Keep a copy of the evolve config in the output directory for reproducibility.
 mkdir -p "$OUTPUT_DIR"

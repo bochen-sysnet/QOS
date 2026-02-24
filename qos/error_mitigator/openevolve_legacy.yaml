@@ -98,7 +98,7 @@ prompt:
       - qose_overhead: average circuit-count ratio (QOSE/QOS)
       - avg_run_time: average runtime ratio (QOSE/QOS)
       - combined_score (maximize): evaluator score used by evolution ranking.
-        The exact formula is defined in the active config profile.
+        combined_score = -(qose_depth + qose_cnot + qose_overhead + avg_run_time)
     NOTE:
       - Depth/CNOT ratios are proxies for fidelity. The goal is to improve fidelity,
         reduce cost-search time, and avoid depth/CNOT regressions.

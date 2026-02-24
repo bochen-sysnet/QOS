@@ -170,6 +170,18 @@ def _load_example_code_artifact() -> str | None:
         return None
 
 
+def _failure_artifacts(info: str) -> dict:
+    artifacts = {"info": info}
+    example_code_artifact = _load_example_code_artifact()
+    if example_code_artifact is not None:
+        artifacts["example_code"] = example_code_artifact
+    return artifacts
+
+
+def _failure_result(info: str):
+    return {"combined_score": -1000.0}, _failure_artifacts(info)
+
+
 def _program_hash(program_path: str) -> str:
     try:
         data = Path(program_path).read_bytes()
@@ -924,19 +936,6 @@ def _combined_score_from_ratios(
     return -(avg_depth + avg_cnot + avg_overhead + avg_run_time), mode
 
 
-def _score_metadata(mode: str) -> dict[str, str]:
-    if mode == _SCORE_MODE_PIECEWISE:
-        return {
-            "score_formula": (
-                "struct_delta=1-((qose_depth+qose_cnot)/2); time_delta=1-avg_run_time; "
-                "struct_term=1*struct_delta if struct_delta>=0 else 8*struct_delta; "
-                "combined_score=struct_term+time_delta"
-            ),
-        }
-    return {
-        "score_formula": "combined_score=-(qose_depth+qose_cnot+qose_overhead+avg_run_time)",
-    }
-
 def _build_args():
     return SimpleNamespace(
         size_to_reach=int(os.getenv("QOSE_SIZE_TO_REACH", "0")),
@@ -1324,7 +1323,7 @@ def _evaluate_impl(program_path):
     spec.loader.exec_module(candidate)
     evolved_cost_search = getattr(candidate, "evolved_cost_search", None)
     if evolved_cost_search is None:
-        return {"combined_score": -1000.0}, {"info": "Missing evolved_cost_search"}
+        return _failure_result("Missing evolved_cost_search")
 
     args = _build_args()
     bench_env = os.getenv("QOSE_BENCHES", "").strip()
@@ -1337,7 +1336,7 @@ def _evaluate_impl(program_path):
     valid_benches = {b for b, _label in BENCHES}
     unknown = [b for b in benches if b not in valid_benches]
     if unknown:
-        return {"combined_score": -1000.0}, {"info": f"Unknown benches: {', '.join(unknown)}"}
+        return _failure_result(f"Unknown benches: {', '.join(unknown)}")
 
     surrogate_enabled = _surrogate_enabled()
     surrogate_warmup_iters = _surrogate_warmup_iters()
@@ -1369,11 +1368,11 @@ def _evaluate_impl(program_path):
     try:
         fixed_pairs = _fixed_bench_size_pairs_from_env(benches)
     except ValueError as exc:
-        return {"combined_score": -1000.0}, {"info": str(exc)}
+        return _failure_result(str(exc))
 
     candidate_pairs = _collect_candidate_pairs(benches, size_min, size_max)
     if not candidate_pairs and (surrogate_enabled or not fixed_pairs):
-        return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
+        return _failure_result("No valid (bench,size) pairs found")
 
     selection_mode = "random"
     selection_support = 0
@@ -1424,9 +1423,9 @@ def _evaluate_impl(program_path):
             sample_pairs = _select_bench_size_pairs(args, benches)
             selection_mode = "random"
     except ValueError as exc:
-        return {"combined_score": -1000.0}, {"info": str(exc)}
+        return _failure_result(str(exc))
     if not sample_pairs:
-        return {"combined_score": -1000.0}, {"info": "No valid (bench,size) pairs found"}
+        return _failure_result("No valid (bench,size) pairs found")
 
     sample_res = _evaluate_bench_size_pairs(
         evolved_cost_search=evolved_cost_search,
@@ -1435,11 +1434,10 @@ def _evaluate_impl(program_path):
         include_cases=True,
     )
     if not sample_res.get("ok", False):
-        return {"combined_score": -1000.0}, {"info": sample_res.get("error", "Evaluation failed")}
+        return _failure_result(sample_res.get("error", "Evaluation failed"))
 
     sample_combined_raw = float(sample_res["combined_score_raw"])
     score_mode = str(sample_res["score_mode"])
-    score_meta = _score_metadata(score_mode)
 
     global_combined_score = float("nan")
     surrogate_source = "sample_raw"
@@ -1538,6 +1536,7 @@ def _evaluate_impl(program_path):
 
     summary = {
         "qose_budget": args.budget,
+        "score_mode": score_mode,
         "qose_run_sec_avg": sample_res["qose_run_sec_avg"],
         "qos_run_sec_avg": sample_res["qos_run_sec_avg"],
         "gv_cost_calls_total": sample_res["gv_cost_calls_total"],
@@ -1551,7 +1550,6 @@ def _evaluate_impl(program_path):
         "qos_cnot_avg": sample_res["qos_cnot_avg"],
         "qos_overhead_avg": sample_res["qos_overhead_avg"],
     }
-    summary.update(score_meta)
     artifacts = {}
     if _include_summary_artifact():
         artifacts["summary"] = summary
@@ -1571,7 +1569,7 @@ def evaluate(program_path):
         except Exception as exc:
             trace = traceback.format_exc()
             metrics = {"combined_score": -1000.0}
-            artifacts = {"info": f"Evaluation failed: {exc}\n{trace}"}
+            artifacts = _failure_artifacts(f"Evaluation failed: {exc}\n{trace}")
             logger.error("Evaluation failed with traceback:\n%s", trace)
     else:
         mp_ctx = (
@@ -1589,13 +1587,13 @@ def evaluate(program_path):
             proc.terminate()
             proc.join()
             metrics = {"combined_score": -1000.0}
-            artifacts = {"info": f"Evaluation timed out after {timeout_sec}s"}
+            artifacts = _failure_artifacts(f"Evaluation timed out after {timeout_sec}s")
         else:
             try:
                 result = result_queue.get_nowait()
             except Exception:
                 metrics = {"combined_score": -1000.0}
-                artifacts = {"info": "Evaluation failed: no result returned"}
+                artifacts = _failure_artifacts("Evaluation failed: no result returned")
             else:
                 if result.get("ok"):
                     metrics = result.get("metrics", {"combined_score": -1000.0})
@@ -1604,7 +1602,7 @@ def evaluate(program_path):
                     info = result.get("error", "Evaluation failed")
                     trace = result.get("trace", "")
                     metrics = {"combined_score": -1000.0}
-                    artifacts = {"info": f"{info}\n{trace}"}
+                    artifacts = _failure_artifacts(f"{info}\n{trace}")
     if float(metrics.get("combined_score", 0.0)) <= -999.0 and "info" in artifacts:
         metrics = dict(metrics)
         metrics["failure_reason"] = artifacts.get("info")

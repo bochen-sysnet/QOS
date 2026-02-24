@@ -228,12 +228,26 @@ def _normalize_backend_name(raw: str) -> str:
     return cleaned or "generic"
 
 
-def _infer_state_backend(args) -> str:
+def _state_backend_label(args) -> str:
+    label = str(getattr(args, "state_backend_label", "") or "").strip()
+    if label:
+        return _normalize_backend_name(label)
     if bool(args.with_real_fidelity):
         return _normalize_backend_name(str(args.real_backend))
     if str(args.metrics_baseline) in {"torino", "marrakesh"}:
         return _normalize_backend_name(str(args.metrics_baseline))
     return "generic"
+
+
+def _signature_real_backend(args) -> str:
+    label = str(getattr(args, "state_backend_label", "") or "").strip()
+    if label:
+        return label
+    return str(args.real_backend)
+
+
+def _infer_state_backend(args) -> str:
+    return _state_backend_label(args)
 
 
 def _infer_state_stage(args) -> str:
@@ -314,6 +328,12 @@ def _seed_resume_from_candidates(
 def _link_or_copy(target: Path, link: Path) -> None:
     if not target.exists():
         return
+    # Avoid self-linking (can happen when caller already passes the destination path).
+    try:
+        if target.absolute() == link.absolute():
+            return
+    except Exception:
+        pass
     link.parent.mkdir(parents=True, exist_ok=True)
     if link.is_symlink() or link.exists():
         try:
@@ -327,6 +347,18 @@ def _link_or_copy(target: Path, link: Path) -> None:
         shutil.copy2(target, link)
 
 
+def _copy_replace(target: Path, dst: Path) -> None:
+    if not target.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_symlink() or dst.exists():
+        try:
+            dst.unlink()
+        except IsADirectoryError:
+            shutil.rmtree(dst, ignore_errors=True)
+    shutil.copy2(target, dst)
+
+
 def _publish_full_eval_views(
     *,
     out_dir: Path,
@@ -335,6 +367,7 @@ def _publish_full_eval_views(
     breakdown_paths: Optional[List[Path]] = None,
     final_csv_path: Optional[Path] = None,
     timing_path: Optional[Path] = None,
+    backend_label: str = "",
 ) -> None:
     figures_paper = out_dir / "figures" / "paper"
     figures_debug = out_dir / "figures" / "debug"
@@ -352,16 +385,26 @@ def _publish_full_eval_views(
     ]:
         folder.mkdir(parents=True, exist_ok=True)
 
+    backend_hint = _normalize_backend_name(backend_label) if str(backend_label).strip() else ""
+
     if panel_paths:
         for panel in panel_paths:
             _link_or_copy(panel, figures_debug / panel.name)
             panel_name = panel.name.lower()
             if "depth_cnot" in panel_name:
-                _link_or_copy(panel, figures_paper / "panel_depth_cnot.pdf")
+                _copy_replace(panel, figures_paper / "panel_depth_cnot.pdf")
             elif "real_fidelity" in panel_name:
-                _link_or_copy(panel, figures_paper / "panel_real_fidelity.pdf")
+                _copy_replace(panel, figures_paper / "panel_real_fidelity.pdf")
             elif "sim_fidelity_timing" in panel_name:
-                _link_or_copy(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
+                _copy_replace(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
+                hint = backend_hint
+                if not hint:
+                    if "marrakesh" in panel_name:
+                        hint = "marrakesh"
+                    elif "torino" in panel_name:
+                        hint = "torino"
+                if hint in {"torino", "marrakesh"}:
+                    _copy_replace(panel, figures_paper / f"panel_sim_fidelity_timing_{hint}.pdf")
 
     if breakdown_paths:
         for path in breakdown_paths:
@@ -370,27 +413,39 @@ def _publish_full_eval_views(
             _link_or_copy(path, figures_debug / path.name)
             lower = path.name.lower()
             if lower.startswith("qose_time_breakdown_"):
-                _link_or_copy(path, figures_paper / "qose_time_breakdown.pdf")
+                _copy_replace(path, figures_paper / "qose_time_breakdown.pdf")
             elif lower.startswith("mitigation_stage_breakdown_qos_qose_"):
-                _link_or_copy(path, figures_paper / "mitigation_stage_breakdown_qos_qose.pdf")
+                _copy_replace(path, figures_paper / "mitigation_stage_breakdown_qos_qose.pdf")
 
     if final_csv_path is not None and final_csv_path.exists():
         _link_or_copy(final_csv_path, tables_debug / final_csv_path.name)
-        _link_or_copy(final_csv_path, tables_paper / "relative_properties_latest.csv")
-        lower = final_csv_path.name.lower()
-        if "torino" in lower:
-            _link_or_copy(final_csv_path, plot_inputs_torino / "relative_properties_latest.csv")
-        if "marrakesh" in lower:
-            _link_or_copy(final_csv_path, plot_inputs_marrakesh / "relative_properties_latest.csv")
+        _copy_replace(final_csv_path, tables_paper / "relative_properties_latest.csv")
+        if backend_hint in {"torino", "marrakesh"}:
+            if backend_hint == "torino":
+                _link_or_copy(final_csv_path, plot_inputs_torino / "relative_properties_latest.csv")
+            else:
+                _link_or_copy(final_csv_path, plot_inputs_marrakesh / "relative_properties_latest.csv")
+        else:
+            lower = final_csv_path.name.lower()
+            if "torino" in lower:
+                _link_or_copy(final_csv_path, plot_inputs_torino / "relative_properties_latest.csv")
+            if "marrakesh" in lower:
+                _link_or_copy(final_csv_path, plot_inputs_marrakesh / "relative_properties_latest.csv")
 
     if timing_path is not None and timing_path.exists():
         _link_or_copy(timing_path, tables_debug / timing_path.name)
-        _link_or_copy(timing_path, tables_paper / "timing_latest.csv")
-        lower = timing_path.name.lower()
-        if "torino" in lower:
-            _link_or_copy(timing_path, plot_inputs_torino / "timing_latest.csv")
-        if "marrakesh" in lower:
-            _link_or_copy(timing_path, plot_inputs_marrakesh / "timing_latest.csv")
+        _copy_replace(timing_path, tables_paper / "timing_latest.csv")
+        if backend_hint in {"torino", "marrakesh"}:
+            if backend_hint == "torino":
+                _link_or_copy(timing_path, plot_inputs_torino / "timing_latest.csv")
+            else:
+                _link_or_copy(timing_path, plot_inputs_marrakesh / "timing_latest.csv")
+        else:
+            lower = timing_path.name.lower()
+            if "torino" in lower:
+                _link_or_copy(timing_path, plot_inputs_torino / "timing_latest.csv")
+            if "marrakesh" in lower:
+                _link_or_copy(timing_path, plot_inputs_marrakesh / "timing_latest.csv")
 
 
 def _resume_signature(args, benches, sizes, methods: List[str]) -> Dict[str, object]:
@@ -400,7 +455,7 @@ def _resume_signature(args, benches, sizes, methods: List[str]) -> Dict[str, obj
         "methods": list(methods),
         "with_fidelity": bool(args.with_fidelity),
         "with_real_fidelity": bool(args.with_real_fidelity),
-        "real_backend": str(args.real_backend),
+        "real_backend": _signature_real_backend(args),
         "real_fidelity_shots": int(args.real_fidelity_shots),
         "metric_mode": str(args.metric_mode),
         "metrics_baseline": str(args.metrics_baseline),
@@ -427,6 +482,12 @@ def _resume_signature_compatible(
             continue
         if key in {"with_fidelity", "with_real_fidelity"}:
             # These can move in either direction; partial row reuse handles missing fields.
+            continue
+        if key == "real_backend" and saved_with_real and req_with_real:
+            saved_backend = _normalize_backend_name(str(saved_signature.get(key, "")))
+            req_backend = _normalize_backend_name(str(req_val))
+            if saved_backend != req_backend:
+                return False
             continue
         if key in {"real_backend", "real_fidelity_shots"} and (not saved_with_real or not req_with_real):
             # Real-fidelity settings are irrelevant unless both signatures include real fidelity.
@@ -1603,6 +1664,14 @@ def _real_fidelity_for_circuit(
     if _REAL_DRY_RUN:
         _dry_run_traverse(circuit, ctx, method_ctx)
         return 0.0
+
+    # Submit/collect real counts first so resumed real-only runs start submitting
+    # immediately; ideal simulation can be cached/recomputed afterward.
+    if _has_virtual_ops(circuit):
+        noisy = _real_virtual_counts(circuit, shots, backend_name, ctx, method_ctx)
+    else:
+        noisy = _real_counts(circuit, shots, backend_name, ctx, method_ctx)
+
     ideal_key = _ideal_counts_key(shots, seed, circuit, ctx, method_ctx)
     ideal = None
     if _IDEAL_RESULT_CACHE is not None:
@@ -1643,10 +1712,6 @@ def _real_fidelity_for_circuit(
                 "saved_at": dt.datetime.now().isoformat(timespec="seconds"),
             },
         )
-    if _has_virtual_ops(circuit):
-        noisy = _real_virtual_counts(circuit, shots, backend_name, ctx, method_ctx)
-    else:
-        noisy = _real_counts(circuit, shots, backend_name, ctx, method_ctx)
     if not ideal or not noisy:
         return 0.0
     return _hellinger_fidelity_from_counts(ideal, noisy)
@@ -3269,6 +3334,10 @@ def _plot_time_breakdowns(
     sizes: List[int],
     methods: List[str],
     benches: List[str],
+    secondary_timing_csv: Optional[Path] = None,
+    secondary_job_cache_jsonl: Optional[Path] = None,
+    primary_label: str = "",
+    secondary_label: str = "",
 ) -> List[Path]:
     plt = _import_matplotlib()
     tag_suffix = f"_{tag}" if tag else ""
@@ -3328,134 +3397,114 @@ def _plot_time_breakdowns(
     if not methods:
         raise RuntimeError("No supported methods for breakdown (expected QOS and/or QOSE).")
 
-    # Figure 1: QOSE time breakdown + CDF diagnostics.
-    qose_by_size: Dict[int, Dict[str, float]] = {
-        int(s): {
-            "mitigation_sec_total": 0.0,
-            "real_elapsed_sec_total": 0.0,
-            "real_qpu_sec_total": 0.0,
-            "real_wait_sec_total": 0.0,
-            "real_jobs": 0.0,
-            "real_jobs_qpu_unknown": 0.0,
+    def _collect_qose_breakdown(
+        curr_timing_rows: List[Dict[str, object]],
+        curr_job_rows: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        qose_by_size: Dict[int, Dict[str, float]] = {
+            int(s): {
+                "mitigation_sec_total": 0.0,
+                "real_elapsed_sec_total": 0.0,
+                "real_qpu_sec_total": 0.0,
+                "real_wait_sec_total": 0.0,
+                "real_jobs": 0.0,
+                "real_jobs_qpu_unknown": 0.0,
+            }
+            for s in sizes
         }
-        for s in sizes
-    }
-    mitigation_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
-    real_elapsed_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
-    real_qpu_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
-    real_wait_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
-    elapsed_samples: List[float] = []
-    qpu_samples: List[float] = []
+        mitigation_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+        real_elapsed_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+        real_qpu_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+        real_wait_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
+        elapsed_samples: List[float] = []
+        qpu_samples: List[float] = []
 
-    for row in timing_rows:
-        method = str(row.get("method", ""))
-        size = _safe_int(row.get("size", ""), -1)
-        bench = str(row.get("bench", ""))
-        if method != "QOSE" or size not in size_set or bench not in bench_set:
-            continue
-        mitigation_sec = max(_timing_row_total(row), 0.0)
-        qose_by_size[size]["mitigation_sec_total"] += mitigation_sec
-        mitigation_by_bench[size][bench] = mitigation_by_bench[size].get(bench, 0.0) + mitigation_sec
+        for row in curr_timing_rows:
+            method = str(row.get("method", ""))
+            size = _safe_int(row.get("size", ""), -1)
+            bench = str(row.get("bench", ""))
+            if method != "QOSE" or size not in size_set or bench not in bench_set:
+                continue
+            mitigation_sec = max(_timing_row_total(row), 0.0)
+            qose_by_size[size]["mitigation_sec_total"] += mitigation_sec
+            mitigation_by_bench[size][bench] = mitigation_by_bench[size].get(bench, 0.0) + mitigation_sec
 
-    job_dedup: Dict[str, Dict[str, object]] = {}
-    for rec in job_rows:
-        key = str(rec.get("job_key", ""))
-        if key:
-            job_dedup[key] = rec
-    for rec in job_dedup.values():
-        method = str(rec.get("method", ""))
-        size = _safe_int(rec.get("size", ""), -1)
-        bench = str(rec.get("bench", ""))
-        if method != "QOSE" or size not in size_set or bench not in bench_set:
-            continue
-        elapsed = max(_safe_float(rec.get("elapsed_sec", ""), 0.0), 0.0)
-        has_qpu = _has_value(rec.get("qpu_sec"))
-        qpu_sec = max(_safe_float(rec.get("qpu_sec", ""), 0.0), 0.0) if has_qpu else 0.0
-        wait_sec = max(elapsed - qpu_sec, 0.0) if has_qpu else elapsed
-        qose_by_size[size]["real_elapsed_sec_total"] += elapsed
-        qose_by_size[size]["real_qpu_sec_total"] += qpu_sec
-        qose_by_size[size]["real_wait_sec_total"] += wait_sec
-        qose_by_size[size]["real_jobs"] += 1.0
-        real_elapsed_by_bench[size][bench] = real_elapsed_by_bench[size].get(bench, 0.0) + elapsed
-        real_qpu_by_bench[size][bench] = real_qpu_by_bench[size].get(bench, 0.0) + qpu_sec
-        real_wait_by_bench[size][bench] = real_wait_by_bench[size].get(bench, 0.0) + wait_sec
-        elapsed_samples.append(elapsed)
-        if has_qpu:
-            qpu_samples.append(qpu_sec)
-        if not has_qpu:
-            qose_by_size[size]["real_jobs_qpu_unknown"] += 1.0
+        job_dedup: Dict[str, Dict[str, object]] = {}
+        for rec in curr_job_rows:
+            key = str(rec.get("job_key", ""))
+            if key:
+                job_dedup[key] = rec
+        for rec in job_dedup.values():
+            method = str(rec.get("method", ""))
+            size = _safe_int(rec.get("size", ""), -1)
+            bench = str(rec.get("bench", ""))
+            if method != "QOSE" or size not in size_set or bench not in bench_set:
+                continue
+            elapsed = max(_safe_float(rec.get("elapsed_sec", ""), 0.0), 0.0)
+            has_qpu = _has_value(rec.get("qpu_sec"))
+            qpu_sec = max(_safe_float(rec.get("qpu_sec", ""), 0.0), 0.0) if has_qpu else 0.0
+            wait_sec = max(elapsed - qpu_sec, 0.0) if has_qpu else elapsed
+            qose_by_size[size]["real_elapsed_sec_total"] += elapsed
+            qose_by_size[size]["real_qpu_sec_total"] += qpu_sec
+            qose_by_size[size]["real_wait_sec_total"] += wait_sec
+            qose_by_size[size]["real_jobs"] += 1.0
+            real_elapsed_by_bench[size][bench] = real_elapsed_by_bench[size].get(bench, 0.0) + elapsed
+            real_qpu_by_bench[size][bench] = real_qpu_by_bench[size].get(bench, 0.0) + qpu_sec
+            real_wait_by_bench[size][bench] = real_wait_by_bench[size].get(bench, 0.0) + wait_sec
+            elapsed_samples.append(elapsed)
+            if has_qpu:
+                qpu_samples.append(qpu_sec)
+            if not has_qpu:
+                qose_by_size[size]["real_jobs_qpu_unknown"] += 1.0
+
+        mitigation_samples = []
+        for s in sizes:
+            mitigation_samples.extend(list(mitigation_by_bench[s].values()))
+
+        return {
+            "qose_by_size": qose_by_size,
+            "mitigation_by_bench": mitigation_by_bench,
+            "real_elapsed_by_bench": real_elapsed_by_bench,
+            "real_qpu_by_bench": real_qpu_by_bench,
+            "real_wait_by_bench": real_wait_by_bench,
+            "elapsed_samples": elapsed_samples,
+            "qpu_samples": qpu_samples,
+            "mitigation_samples": mitigation_samples,
+        }
+
+    def _pretty_backend_label(raw: str, fallback: str) -> str:
+        x = _normalize_backend_name(raw)
+        if x == "generic":
+            x = _normalize_backend_name(fallback)
+        if x == "generic":
+            return "Primary"
+        return x.replace("_", " ").title()
+
+    primary_stats = _collect_qose_breakdown(timing_rows, job_rows)
+    primary_name = _pretty_backend_label(primary_label, str(timing_csv))
+
+    secondary_stats: Optional[Dict[str, object]] = None
+    secondary_name = ""
+    if secondary_timing_csv is not None and secondary_job_cache_jsonl is not None:
+        secondary_timing_rows = _read_rows_csv(secondary_timing_csv)
+        secondary_timing_rows, sec_used, sec_filled = _auto_fill_rows_from_csv_fallbacks(
+            secondary_timing_rows,
+            secondary_timing_csv,
+            kind="timing",
+            key_fields=["size", "bench", "method"],
+            sizes=sizes,
+            methods=methods,
+        )
+        if sec_used > 0:
+            print(
+                f"[time-breakdown] secondary timing auto-fill files={sec_used} cells={sec_filled}",
+                flush=True,
+            )
+        secondary_job_rows = _read_jsonl_rows(secondary_job_cache_jsonl)
+        secondary_stats = _collect_qose_breakdown(secondary_timing_rows, secondary_job_rows)
+        secondary_name = _pretty_backend_label(secondary_label, str(secondary_timing_csv))
 
     x_labels = [str(s) for s in sizes]
-    components = [
-        (
-            "Mitigation avg/bench",
-            [
-                float(np.mean(list(mitigation_by_bench[s].values())))
-                if mitigation_by_bench[s]
-                else 0.0
-                for s in sizes
-            ],
-            "#4C78A8",
-        ),
-        (
-            "Real Wait avg/bench",
-            [
-                float(np.mean(list(real_wait_by_bench[s].values())))
-                if real_wait_by_bench[s]
-                else 0.0
-                for s in sizes
-            ],
-            "#F58518",
-        ),
-        (
-            "Real QPU avg/bench",
-            [
-                float(np.mean(list(real_qpu_by_bench[s].values())))
-                if real_qpu_by_bench[s]
-                else 0.0
-                for s in sizes
-            ],
-            "#54A24B",
-        ),
-    ]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.0))
-    x = np.arange(len(x_labels))
-    ax = axes[0]
-    width = 0.24
-    for i, (name, vals, color) in enumerate(components):
-        vals_np = np.array(vals, dtype=float)
-        bars = ax.bar(
-            x + (i - 1) * width,
-            vals_np,
-            width=width,
-            color=color,
-            label=name,
-            edgecolor="black",
-            linewidth=0.6,
-        )
-        ymax = float(vals_np.max()) if len(vals_np) else 0.0
-        offset = 0.01 * ymax if ymax > 0 else 0.0
-        for bar, val in zip(bars, vals_np):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                bar.get_height() + offset,
-                f"{val:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=10,
-            )
-    ax.set_title("QOSE Breakdown (avg per bench)", fontsize=15)
-    ax.set_xlabel("Qubit Size", fontsize=12)
-    ax.set_ylabel("Seconds", fontsize=12)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=11)
-    ax.tick_params(axis="y", labelsize=11)
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend(fontsize=10, loc="upper left", frameon=True)
-
-    # CDF subplot: per-job elapsed/qpu + per-bench mitigation totals.
-    ax_cdf = axes[1]
 
     def _plot_cdf(ax_obj, values: List[float], label: str, color: str) -> None:
         if not values:
@@ -3464,54 +3513,152 @@ def _plot_time_breakdowns(
         y = np.arange(1, len(vals) + 1, dtype=float) / float(len(vals))
         ax_obj.plot(vals, y, label=f"{label} (n={len(vals)})", color=color, linewidth=2.0)
 
-    mitigation_samples = []
-    for s in sizes:
-        mitigation_samples.extend(list(mitigation_by_bench[s].values()))
-    _plot_cdf(ax_cdf, elapsed_samples, "Per-job Elapsed", "#E45756")
-    _plot_cdf(ax_cdf, qpu_samples, "Per-job QPU", "#54A24B")
-    _plot_cdf(ax_cdf, mitigation_samples, "Per-bench Mitigation", "#4C78A8")
-    ax_cdf.set_title("CDF of Timing Units", fontsize=15)
-    ax_cdf.set_xlabel("Seconds", fontsize=12)
-    ax_cdf.set_ylabel("CDF", fontsize=12)
-    ax_cdf.tick_params(axis="both", labelsize=11)
-    ax_cdf.grid(True, linestyle="--", alpha=0.35)
-    ax_cdf.legend(fontsize=10, loc="lower right", frameon=True)
+    def _draw_qose_panels(ax_bar, ax_cdf, stats: Dict[str, object], title_prefix: str) -> None:
+        qose_by_size = stats["qose_by_size"]
+        mitigation_by_bench = stats["mitigation_by_bench"]
+        real_wait_by_bench = stats["real_wait_by_bench"]
+        real_qpu_by_bench = stats["real_qpu_by_bench"]
 
-    total_real_jobs = int(sum(v["real_jobs"] for v in qose_by_size.values()))
-    total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in qose_by_size.values()))
-    fig.suptitle(
-        f"QOSE Timing Diagnostics (real jobs={total_real_jobs}, qpu_sec unknown={total_unknown_qpu})",
-        fontsize=14,
-        y=1.08,
-    )
+        components = [
+            (
+                "Mitigation avg/bench",
+                [
+                    float(np.mean(list(mitigation_by_bench[s].values())))
+                    if mitigation_by_bench[s]
+                    else 0.0
+                    for s in sizes
+                ],
+                "#4C78A8",
+            ),
+            (
+                "Real Wait avg/bench",
+                [
+                    float(np.mean(list(real_wait_by_bench[s].values())))
+                    if real_wait_by_bench[s]
+                    else 0.0
+                    for s in sizes
+                ],
+                "#F58518",
+            ),
+            (
+                "Real QPU avg/bench",
+                [
+                    float(np.mean(list(real_qpu_by_bench[s].values())))
+                    if real_qpu_by_bench[s]
+                    else 0.0
+                    for s in sizes
+                ],
+                "#54A24B",
+            ),
+        ]
+
+        x = np.arange(len(x_labels))
+        width = 0.24
+        for i, (name, vals, color) in enumerate(components):
+            vals_np = np.array(vals, dtype=float)
+            bars = ax_bar.bar(
+                x + (i - 1) * width,
+                vals_np,
+                width=width,
+                color=color,
+                label=name,
+                edgecolor="black",
+                linewidth=0.6,
+            )
+            ymax = float(vals_np.max()) if len(vals_np) else 0.0
+            offset = 0.01 * ymax if ymax > 0 else 0.0
+            for bar, val in zip(bars, vals_np):
+                ax_bar.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    bar.get_height() + offset,
+                    f"{val:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+        ax_bar.set_title(f"QOSE Breakdown ({title_prefix})", fontsize=13)
+        ax_bar.set_xlabel("Qubit Size", fontsize=11)
+        ax_bar.set_ylabel("Seconds", fontsize=11)
+        ax_bar.set_xticks(x)
+        ax_bar.set_xticklabels(x_labels, fontsize=10)
+        ax_bar.tick_params(axis="y", labelsize=10)
+        ax_bar.grid(axis="y", linestyle="--", alpha=0.35)
+        ax_bar.legend(fontsize=9, loc="upper left", frameon=True)
+
+        _plot_cdf(ax_cdf, stats["elapsed_samples"], "Per-job Elapsed", "#E45756")
+        _plot_cdf(ax_cdf, stats["qpu_samples"], "Per-job QPU", "#54A24B")
+        _plot_cdf(ax_cdf, stats["mitigation_samples"], "Per-bench Mitigation", "#4C78A8")
+        ax_cdf.set_title(f"CDF ({title_prefix})", fontsize=13)
+        ax_cdf.set_xlabel("Seconds", fontsize=11)
+        ax_cdf.set_ylabel("CDF", fontsize=11)
+        ax_cdf.tick_params(axis="both", labelsize=10)
+        ax_cdf.grid(True, linestyle="--", alpha=0.35)
+        ax_cdf.legend(fontsize=9, loc="lower right", frameon=True)
+
+        total_real_jobs = int(sum(v["real_jobs"] for v in qose_by_size.values()))
+        total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in qose_by_size.values()))
+        return total_real_jobs, total_unknown_qpu
+
+    if secondary_stats is None:
+        fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.0))
+        jobs, unknown = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
+        fig.suptitle(
+            f"QOSE Timing Diagnostics ({primary_name}; real jobs={jobs}, qpu_sec unknown={unknown})",
+            fontsize=14,
+            y=1.06,
+        )
+    else:
+        fig, axes = plt.subplots(1, 4, figsize=(27.0, 5.0))
+        jobs1, unknown1 = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
+        jobs2, unknown2 = _draw_qose_panels(axes[2], axes[3], secondary_stats, secondary_name)
+        fig.suptitle(
+            (
+                f"QOSE Timing Diagnostics "
+                f"({primary_name}: jobs={jobs1}, unknown={unknown1}; "
+                f"{secondary_name}: jobs={jobs2}, unknown={unknown2})"
+            ),
+            fontsize=14,
+            y=1.06,
+        )
+
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig1 = out_dir / f"qose_time_breakdown_{panel_tag}.pdf"
     fig.savefig(fig1)
     plt.close(fig)
 
     rows1: List[Dict[str, object]] = []
-    for s in sizes:
-        row = {
-            "size": s,
-            "mitigation_sec_total": qose_by_size[s]["mitigation_sec_total"],
-            "mitigation_sec_avg_per_bench": float(np.mean(list(mitigation_by_bench[s].values())))
-            if mitigation_by_bench[s]
-            else 0.0,
-            "real_wait_sec_total": qose_by_size[s]["real_wait_sec_total"],
-            "real_wait_sec_avg_per_bench": float(np.mean(list(real_wait_by_bench[s].values())))
-            if real_wait_by_bench[s]
-            else 0.0,
-            "real_qpu_sec_total": qose_by_size[s]["real_qpu_sec_total"],
-            "real_qpu_sec_avg_per_bench": float(np.mean(list(real_qpu_by_bench[s].values())))
-            if real_qpu_by_bench[s]
-            else 0.0,
-            "real_elapsed_sec_total": qose_by_size[s]["real_elapsed_sec_total"],
-            "real_jobs": qose_by_size[s]["real_jobs"],
-            "real_jobs_qpu_unknown": qose_by_size[s]["real_jobs_qpu_unknown"],
-            "benches_with_mitigation": len(mitigation_by_bench[s]),
-            "benches_with_real_jobs": len(real_elapsed_by_bench[s]),
-        }
-        rows1.append(row)
+    datasets = [(primary_name, primary_stats)]
+    if secondary_stats is not None:
+        datasets.append((secondary_name, secondary_stats))
+    for backend_name, stats in datasets:
+        qose_by_size = stats["qose_by_size"]
+        mitigation_by_bench = stats["mitigation_by_bench"]
+        real_wait_by_bench = stats["real_wait_by_bench"]
+        real_qpu_by_bench = stats["real_qpu_by_bench"]
+        real_elapsed_by_bench = stats["real_elapsed_by_bench"]
+        for s in sizes:
+            row = {
+                "backend": backend_name,
+                "size": s,
+                "mitigation_sec_total": qose_by_size[s]["mitigation_sec_total"],
+                "mitigation_sec_avg_per_bench": float(np.mean(list(mitigation_by_bench[s].values())))
+                if mitigation_by_bench[s]
+                else 0.0,
+                "real_wait_sec_total": qose_by_size[s]["real_wait_sec_total"],
+                "real_wait_sec_avg_per_bench": float(np.mean(list(real_wait_by_bench[s].values())))
+                if real_wait_by_bench[s]
+                else 0.0,
+                "real_qpu_sec_total": qose_by_size[s]["real_qpu_sec_total"],
+                "real_qpu_sec_avg_per_bench": float(np.mean(list(real_qpu_by_bench[s].values())))
+                if real_qpu_by_bench[s]
+                else 0.0,
+                "real_elapsed_sec_total": qose_by_size[s]["real_elapsed_sec_total"],
+                "real_jobs": qose_by_size[s]["real_jobs"],
+                "real_jobs_qpu_unknown": qose_by_size[s]["real_jobs_qpu_unknown"],
+                "benches_with_mitigation": len(mitigation_by_bench[s]),
+                "benches_with_real_jobs": len(real_elapsed_by_bench[s]),
+            }
+            rows1.append(row)
     csv1 = out_dir / f"qose_time_breakdown_{panel_tag}.csv"
     _write_rows_csv(csv1, rows1)
 
@@ -4170,20 +4317,44 @@ def _run_eval(
                 rel_fidelity_qose = rel_fidelity.get("QOSE", "")
             else:
                 sim_times = {}
-                base_fidelity = ""
-                base_std = ""
-                qos_fidelity = ""
-                qosn_fidelity = ""
-                fq_fidelity = ""
-                cutqc_fidelity = ""
-                qose_fidelity = {}
-                qose_std = {}
                 rel_fidelity = {}
-                rel_fidelity_qos = ""
-                rel_fidelity_qosn = ""
-                rel_fidelity_fq = ""
-                rel_fidelity_cutqc = ""
-                rel_fidelity_qose = ""
+                if cached_row is not None:
+                    base_fidelity = cached_row.get("baseline_fidelity", "")
+                    base_std = cached_row.get("baseline_fidelity_std", "")
+                    sim_times["Qiskit"] = _safe_float(cached_row.get("baseline_sim_time", ""), 0.0)
+                    qos_fidelity = cached_row.get("qos_fidelity", "")
+                    qosn_fidelity = cached_row.get("qosn_fidelity", "")
+                    fq_fidelity = cached_row.get("fq_fidelity", "")
+                    cutqc_fidelity = cached_row.get("cutqc_fidelity", "")
+                    qose_fidelity = {}
+                    qose_std = {}
+                    for method in qose_methods:
+                        prefix = method.lower()
+                        qose_fidelity[method] = cached_row.get(f"{prefix}_fidelity", "")
+                        qose_std[method] = _safe_float(
+                            cached_row.get(f"{prefix}_fidelity_std", ""),
+                            0.0,
+                        )
+                        sim_times[method] = _safe_float(cached_row.get(f"{prefix}_sim_time", ""), 0.0)
+                    rel_fidelity_qos = cached_row.get("rel_fidelity_qos", "")
+                    rel_fidelity_qosn = cached_row.get("rel_fidelity_qosn", "")
+                    rel_fidelity_fq = cached_row.get("rel_fidelity_fq", "")
+                    rel_fidelity_cutqc = cached_row.get("rel_fidelity_cutqc", "")
+                    rel_fidelity_qose = cached_row.get("rel_fidelity_qose", "")
+                else:
+                    base_fidelity = ""
+                    base_std = ""
+                    qos_fidelity = ""
+                    qosn_fidelity = ""
+                    fq_fidelity = ""
+                    cutqc_fidelity = ""
+                    qose_fidelity = {}
+                    qose_std = {}
+                    rel_fidelity_qos = ""
+                    rel_fidelity_qosn = ""
+                    rel_fidelity_fq = ""
+                    rel_fidelity_cutqc = ""
+                    rel_fidelity_qose = ""
 
             if args.with_real_fidelity:
                 real_allowed: Optional[set[str]] = getattr(args, "_real_fidelity_compute_methods", None)
@@ -4775,6 +4946,14 @@ def main() -> None:
     parser.add_argument("--real-fidelity-shots", type=int, default=1000)
     parser.add_argument("--real-backend", default="ibm_torino")
     parser.add_argument(
+        "--state-backend-label",
+        default="",
+        help=(
+            "Optional backend label for state/cache namespace and plot-input routing "
+            "(e.g., use 'marrakesh' while running real jobs on ibm_fez)."
+        ),
+    )
+    parser.add_argument(
         "--real-fidelity-compute-methods",
         default="all",
         help=(
@@ -4973,6 +5152,29 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--timebreak-secondary-timing-csv",
+        default="",
+        help=(
+            "Optional second timing CSV for backend comparison in QOSE breakdown "
+            "(produces a 1x4 figure: primary+secondary)."
+        ),
+    )
+    parser.add_argument(
+        "--timebreak-secondary-job-cache",
+        default="",
+        help="Optional second real-job cache JSONL matching --timebreak-secondary-timing-csv.",
+    )
+    parser.add_argument(
+        "--timebreak-primary-label",
+        default="",
+        help="Optional display label for the primary QOSE breakdown backend.",
+    )
+    parser.add_argument(
+        "--timebreak-secondary-label",
+        default="",
+        help="Optional display label for the secondary QOSE breakdown backend.",
+    )
+    parser.add_argument(
         "--timebreak-sizes",
         default="12,24",
         help="Comma-separated qubit sizes for --plot-time-breakdowns.",
@@ -5030,8 +5232,10 @@ def main() -> None:
             panel_paths=out_paths,
             final_csv_path=Path(args.panel_simtiming_csv),
             timing_path=Path(args.panel_timing_csv),
+            backend_label=_state_backend_label(args),
         )
-        return
+        if not args.plot_time_breakdowns:
+            return
 
     if args.plot_time_breakdowns:
         out_dir = Path(args.out_dir)
@@ -5059,6 +5263,18 @@ def main() -> None:
                     "Could not find job cache automatically. Pass --timebreak-job-cache or --resume-state."
                 )
 
+        secondary_timing_csv: Optional[Path] = None
+        secondary_job_cache: Optional[Path] = None
+        has_secondary_timing = bool(str(args.timebreak_secondary_timing_csv).strip())
+        has_secondary_job = bool(str(args.timebreak_secondary_job_cache).strip())
+        if has_secondary_timing != has_secondary_job:
+            raise RuntimeError(
+                "Provide both --timebreak-secondary-timing-csv and --timebreak-secondary-job-cache, or neither."
+            )
+        if has_secondary_timing and has_secondary_job:
+            secondary_timing_csv = Path(args.timebreak_secondary_timing_csv)
+            secondary_job_cache = Path(args.timebreak_secondary_job_cache)
+
         sizes = [int(s.strip()) for s in str(args.timebreak_sizes).split(",") if s.strip()]
         methods = [m.strip() for m in str(args.timebreak_methods).split(",") if m.strip()]
         if str(args.timebreak_benches).strip().lower() == "all":
@@ -5081,6 +5297,10 @@ def main() -> None:
             sizes=sizes,
             methods=methods,
             benches=benches,
+            secondary_timing_csv=secondary_timing_csv,
+            secondary_job_cache_jsonl=secondary_job_cache,
+            primary_label=str(args.timebreak_primary_label).strip(),
+            secondary_label=str(args.timebreak_secondary_label).strip(),
         )
         for path in out_paths:
             print(f"Wrote: {path}")
@@ -5089,6 +5309,7 @@ def main() -> None:
             out_dir=publish_root,
             artifact_dir=out_dir,
             breakdown_paths=[p for p in out_paths if p.suffix.lower() == ".pdf"],
+            backend_label=_state_backend_label(args),
         )
         return
 
@@ -5562,6 +5783,7 @@ def main() -> None:
         panel_paths=panel_out,
         final_csv_path=final_csv_path if all_rows else None,
         timing_path=timing_path,
+        backend_label=state_backend,
     )
     if use_cache:
         _save_resume_state(
