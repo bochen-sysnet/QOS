@@ -26,7 +26,7 @@ Environment variables (override defaults):
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
-  OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high
+  OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high|auto (default: auto)
   OPENEVOLVE_GEMINI_MAX_OUTPUT_TOKENS  Override maxOutputTokens for Gemini native calls
 
 Flags:
@@ -44,21 +44,10 @@ Example:
 USAGE
 }
 
-shell_join() {
-  local out=""
-  local arg
-  for arg in "$@"; do
-    out+=" $(printf '%q' "$arg")"
-  done
-  echo "${out# }"
-}
-
 if [[ $# -lt 2 ]]; then
   usage
   exit 1
 fi
-
-ORIGINAL_INVOCATION=("$0" "$@")
 
 PROFILE="$1"
 OUTPUT_DIR="$2"
@@ -173,6 +162,7 @@ case "$PROFILE" in
     export OPENAI_API_BASE="${OPENAI_API_BASE:-https://generativelanguage.googleapis.com/v1beta/openai/}"
     export OPENAI_MODEL="${OPENAI_MODEL:-gemini-2.5-flash-lite}"
     export GEMINI_RPM="${GEMINI_RPM:-5}"
+    export OPENEVOLVE_GEMINI_THINKING_LEVEL="${OPENEVOLVE_GEMINI_THINKING_LEVEL:-auto}"
     export OPENEVOLVE_PARALLEL_EVALUATIONS="${OPENEVOLVE_PARALLEL_EVALUATIONS:-1}"
     ;;
   qwen)
@@ -200,31 +190,18 @@ if [[ "$REPEAT" -lt 1 ]]; then
   REPEAT=1
 fi
 
-record_run_invocation() {
-  local ts cmd_line runner_cmd log_path
+record_run_environment() {
+  local ts env_path
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  cmd_line="$(shell_join "${ORIGINAL_INVOCATION[@]}")"
-  runner_cmd="$(shell_join conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
-    "$TARGET_PATH" \
-    qos/error_mitigator/evaluator.py \
-    --config "$CONFIG_PATH" \
-    --output "$OUTPUT_DIR" \
-    "${EXTRA_ARGS[@]}")"
-  log_path="$OUTPUT_DIR/run_command.log"
+  env_path="$OUTPUT_DIR/run_env_vars.log"
   {
     echo "[$ts]"
-    echo "invocation: $cmd_line"
-    echo "profile: $PROFILE"
-    echo "output_dir: $OUTPUT_DIR"
-    echo "target_path: $TARGET_PATH"
-    echo "runner_command: $runner_cmd"
-    echo "effective_env:"
-    env | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_API_BASE|OPENAI_MODEL|OPENAI_SERVICE_TIER|GEMINI_RPM|RESUME_LATEST)=' | sort || true
+    env | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_|GEMINI_|RESUME_LATEST|QISKIT_|IBM_)=' | sort || true
     echo
-  } >> "$log_path"
+  } >> "$env_path"
 }
 
-record_run_invocation
+record_run_environment
 
 run_once() {
   local -a run_args=("${EXTRA_ARGS[@]}")

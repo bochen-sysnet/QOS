@@ -389,13 +389,13 @@ def _gemini_native_request(api_key: str, params: dict) -> str:
     if generation_config:
         payload["generationConfig"] = generation_config
 
-    thinking_level = os.getenv("OPENEVOLVE_GEMINI_THINKING_LEVEL", "").strip().lower()
-    if thinking_level not in {"low", "medium", "high"}:
-        # Gemini 3 models can burn most of the 8k total token window on hidden
-        # reasoning for long prompts, which leaves too little output and causes
-        # truncated code. Use a conservative default unless caller overrides it.
-        if "gemini-3-" in model_path:
-            thinking_level = "low"
+    thinking_level_raw = os.getenv("OPENEVOLVE_GEMINI_THINKING_LEVEL", "").strip().lower()
+    # Default behavior is auto/provider-default: do not send thinkingConfig.
+    thinking_level = ""
+    if thinking_level_raw in {"low", "medium", "high"}:
+        thinking_level = thinking_level_raw
+    elif thinking_level_raw in {"", "auto"}:
+        thinking_level = ""
     if thinking_level in {"low", "medium", "high"}:
         generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
 
