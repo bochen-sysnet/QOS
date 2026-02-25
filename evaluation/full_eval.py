@@ -386,6 +386,8 @@ def _publish_full_eval_views(
         folder.mkdir(parents=True, exist_ok=True)
 
     backend_hint = _normalize_backend_name(backend_label) if str(backend_label).strip() else ""
+    if backend_hint == "generic":
+        backend_hint = ""
 
     if panel_paths:
         for panel in panel_paths:
@@ -396,7 +398,6 @@ def _publish_full_eval_views(
             elif "real_fidelity" in panel_name:
                 _copy_replace(panel, figures_paper / "panel_real_fidelity.pdf")
             elif "sim_fidelity_timing" in panel_name:
-                _copy_replace(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
                 hint = backend_hint
                 if not hint:
                     if "marrakesh" in panel_name:
@@ -405,6 +406,8 @@ def _publish_full_eval_views(
                         hint = "torino"
                 if hint in {"torino", "marrakesh"}:
                     _copy_replace(panel, figures_paper / f"panel_sim_fidelity_timing_{hint}.pdf")
+                else:
+                    _copy_replace(panel, figures_paper / "panel_sim_fidelity_timing.pdf")
 
     if breakdown_paths:
         for path in breakdown_paths:
@@ -413,7 +416,20 @@ def _publish_full_eval_views(
             _link_or_copy(path, figures_debug / path.name)
             lower = path.name.lower()
             if lower.startswith("qose_time_breakdown_"):
-                _copy_replace(path, figures_paper / "qose_time_breakdown.pdf")
+                hint = backend_hint
+                if not hint:
+                    has_torino = "torino" in lower
+                    has_marrakesh = "marrakesh" in lower
+                    if has_torino and has_marrakesh:
+                        hint = "torino_marrakesh"
+                    elif has_torino:
+                        hint = "torino"
+                    elif has_marrakesh:
+                        hint = "marrakesh"
+                if hint in {"torino", "marrakesh", "torino_marrakesh"}:
+                    _copy_replace(path, figures_paper / f"qose_time_breakdown_{hint}.pdf")
+                else:
+                    _copy_replace(path, figures_paper / "qose_time_breakdown.pdf")
             elif lower.startswith("mitigation_stage_breakdown_qos_qose_"):
                 _copy_replace(path, figures_paper / "mitigation_stage_breakdown_qos_qose.pdf")
             elif lower.startswith("real_jobs_avg_per_bench_"):
@@ -3053,7 +3069,8 @@ def _plot_timing_total_panel(
     for method in methods:
         method_rows = [r for r in timing_rows if _safe_int(r.get("size", 0), -1) == size and r.get("method") == method]
         vals = [_row_total(r) for r in method_rows]
-        totals.append(sum(vals) / max(1, len(vals)))
+        valid_vals = [v for v in vals if v > 0.0]
+        totals.append(sum(valid_vals) / max(1, len(valid_vals)))
     for idx, total in enumerate(totals):
         ax.bar(
             x[idx],
@@ -3517,6 +3534,8 @@ def _plot_time_breakdowns(
             if method != "QOSE" or size not in size_set or bench not in bench_set:
                 continue
             mitigation_sec = max(_timing_row_total(row), 0.0)
+            if mitigation_sec <= 0.0:
+                continue
             qose_by_size[size]["mitigation_sec_total"] += mitigation_sec
             mitigation_by_bench[size][bench] = mitigation_by_bench[size].get(bench, 0.0) + mitigation_sec
 
