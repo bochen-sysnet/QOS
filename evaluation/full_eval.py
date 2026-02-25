@@ -3505,11 +3505,16 @@ def _plot_time_breakdowns(
     if not mitigation_methods:
         raise RuntimeError("No supported methods for breakdown (expected QOS and/or QOSE).")
 
-    def _collect_qose_breakdown(
+    breakdown_methods = [m for m in ["QOS", "QOSE"] if m in mitigation_methods]
+    if not breakdown_methods:
+        breakdown_methods = ["QOSE"]
+
+    def _collect_method_breakdown(
         curr_timing_rows: List[Dict[str, object]],
         curr_job_rows: List[Dict[str, object]],
+        method_name: str,
     ) -> Dict[str, object]:
-        qose_by_size: Dict[int, Dict[str, float]] = {
+        by_size: Dict[int, Dict[str, float]] = {
             int(s): {
                 "mitigation_sec_total": 0.0,
                 "real_elapsed_sec_total": 0.0,
@@ -3524,19 +3529,21 @@ def _plot_time_breakdowns(
         real_elapsed_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
         real_qpu_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
         real_wait_by_bench: Dict[int, Dict[str, float]] = {int(s): {} for s in sizes}
-        elapsed_samples: List[float] = []
+        wait_samples: List[float] = []
         qpu_samples: List[float] = []
+        wait_samples_by_size: Dict[int, List[float]] = {int(s): [] for s in sizes}
+        qpu_samples_by_size: Dict[int, List[float]] = {int(s): [] for s in sizes}
 
         for row in curr_timing_rows:
             method = str(row.get("method", ""))
             size = _safe_int(row.get("size", ""), -1)
             bench = str(row.get("bench", ""))
-            if method != "QOSE" or size not in size_set or bench not in bench_set:
+            if method != method_name or size not in size_set or bench not in bench_set:
                 continue
             mitigation_sec = max(_timing_row_total(row), 0.0)
             if mitigation_sec <= 0.0:
                 continue
-            qose_by_size[size]["mitigation_sec_total"] += mitigation_sec
+            by_size[size]["mitigation_sec_total"] += mitigation_sec
             mitigation_by_bench[size][bench] = mitigation_by_bench[size].get(bench, 0.0) + mitigation_sec
 
         job_dedup: Dict[str, Dict[str, object]] = {}
@@ -3548,38 +3555,47 @@ def _plot_time_breakdowns(
             method = str(rec.get("method", ""))
             size = _safe_int(rec.get("size", ""), -1)
             bench = str(rec.get("bench", ""))
-            if method != "QOSE" or size not in size_set or bench not in bench_set:
+            if method != method_name or size not in size_set or bench not in bench_set:
                 continue
             elapsed = max(_safe_float(rec.get("elapsed_sec", ""), 0.0), 0.0)
             has_qpu = _has_value(rec.get("qpu_sec"))
             qpu_sec = max(_safe_float(rec.get("qpu_sec", ""), 0.0), 0.0) if has_qpu else 0.0
             wait_sec = max(elapsed - qpu_sec, 0.0) if has_qpu else elapsed
-            qose_by_size[size]["real_elapsed_sec_total"] += elapsed
-            qose_by_size[size]["real_qpu_sec_total"] += qpu_sec
-            qose_by_size[size]["real_wait_sec_total"] += wait_sec
-            qose_by_size[size]["real_jobs"] += 1.0
+            by_size[size]["real_elapsed_sec_total"] += elapsed
+            by_size[size]["real_qpu_sec_total"] += qpu_sec
+            by_size[size]["real_wait_sec_total"] += wait_sec
+            by_size[size]["real_jobs"] += 1.0
             real_elapsed_by_bench[size][bench] = real_elapsed_by_bench[size].get(bench, 0.0) + elapsed
             real_qpu_by_bench[size][bench] = real_qpu_by_bench[size].get(bench, 0.0) + qpu_sec
             real_wait_by_bench[size][bench] = real_wait_by_bench[size].get(bench, 0.0) + wait_sec
-            elapsed_samples.append(elapsed)
+            wait_samples.append(wait_sec)
+            wait_samples_by_size[size].append(wait_sec)
             if has_qpu:
                 qpu_samples.append(qpu_sec)
+                qpu_samples_by_size[size].append(qpu_sec)
             if not has_qpu:
-                qose_by_size[size]["real_jobs_qpu_unknown"] += 1.0
+                by_size[size]["real_jobs_qpu_unknown"] += 1.0
 
         mitigation_samples = []
+        mitigation_samples_by_size: Dict[int, List[float]] = {int(s): [] for s in sizes}
         for s in sizes:
-            mitigation_samples.extend(list(mitigation_by_bench[s].values()))
+            vals = list(mitigation_by_bench[s].values())
+            mitigation_samples.extend(vals)
+            mitigation_samples_by_size[int(s)] = vals
 
         return {
-            "qose_by_size": qose_by_size,
+            "method": method_name,
+            "by_size": by_size,
             "mitigation_by_bench": mitigation_by_bench,
             "real_elapsed_by_bench": real_elapsed_by_bench,
             "real_qpu_by_bench": real_qpu_by_bench,
             "real_wait_by_bench": real_wait_by_bench,
-            "elapsed_samples": elapsed_samples,
+            "wait_samples": wait_samples,
+            "wait_samples_by_size": wait_samples_by_size,
             "qpu_samples": qpu_samples,
+            "qpu_samples_by_size": qpu_samples_by_size,
             "mitigation_samples": mitigation_samples,
+            "mitigation_samples_by_size": mitigation_samples_by_size,
         }
 
     def _pretty_backend_label(raw: str, fallback: str) -> str:
@@ -3590,10 +3606,13 @@ def _plot_time_breakdowns(
             return "Primary"
         return x.replace("_", " ").title()
 
-    primary_stats = _collect_qose_breakdown(timing_rows, job_rows)
+    primary_stats: Dict[str, Dict[str, object]] = {
+        method_name: _collect_method_breakdown(timing_rows, job_rows, method_name)
+        for method_name in breakdown_methods
+    }
     primary_name = _pretty_backend_label(primary_label, str(timing_csv))
 
-    secondary_stats: Optional[Dict[str, object]] = None
+    secondary_stats: Optional[Dict[str, Dict[str, object]]] = None
     secondary_name = ""
     if secondary_timing_csv is not None and secondary_job_cache_jsonl is not None:
         secondary_timing_rows = _read_rows_csv(secondary_timing_csv)
@@ -3611,91 +3630,108 @@ def _plot_time_breakdowns(
                 flush=True,
             )
         secondary_job_rows = _read_jsonl_rows(secondary_job_cache_jsonl)
-        secondary_stats = _collect_qose_breakdown(secondary_timing_rows, secondary_job_rows)
+        secondary_stats = {
+            method_name: _collect_method_breakdown(secondary_timing_rows, secondary_job_rows, method_name)
+            for method_name in breakdown_methods
+        }
         secondary_name = _pretty_backend_label(secondary_label, str(secondary_timing_csv))
 
     x_labels = [str(s) for s in sizes]
 
-    def _draw_qose_panels(ax_bar, ax_dist, stats: Dict[str, object], title_prefix: str) -> None:
-        qose_by_size = stats["qose_by_size"]
-        mitigation_by_bench = stats["mitigation_by_bench"]
-        real_wait_by_bench = stats["real_wait_by_bench"]
-        real_qpu_by_bench = stats["real_qpu_by_bench"]
-
-        components = [
-            (
-                "Mitigation avg/bench",
-                [
-                    float(np.mean(list(mitigation_by_bench[s].values())))
-                    if mitigation_by_bench[s]
-                    else 0.0
-                    for s in sizes
-                ],
-                "#4C78A8",
-            ),
-            (
-                "Real Wait avg/bench",
-                [
-                    float(np.mean(list(real_wait_by_bench[s].values())))
-                    if real_wait_by_bench[s]
-                    else 0.0
-                    for s in sizes
-                ],
-                "#F58518",
-            ),
-            (
-                "Real QPU avg/bench",
-                [
-                    float(np.mean(list(real_qpu_by_bench[s].values())))
-                    if real_qpu_by_bench[s]
-                    else 0.0
-                    for s in sizes
-                ],
-                "#54A24B",
-            ),
+    def _draw_qose_panels(
+        ax_bar,
+        ax_dist,
+        stats_by_method: Dict[str, Dict[str, object]],
+        title_prefix: str,
+    ) -> Dict[str, Dict[str, int]]:
+        component_defs = [
+            ("Mitigation avg/bench", "mitigation_by_bench", "#4C78A8"),
+            ("Real Wait avg/bench", "real_wait_by_bench", "#F58518"),
+            ("Real QPU avg/bench", "real_qpu_by_bench", "#54A24B"),
         ]
-
+        method_order = [m for m in breakdown_methods if m in stats_by_method]
+        hatch_by_method = {"QOS": "///", "QOSE": ""}
+        y_eps = 1e-3
         x = np.arange(len(x_labels))
-        width = 0.24
-        for i, (name, vals, color) in enumerate(components):
-            vals_np = np.array(vals, dtype=float)
-            bars = ax_bar.bar(
-                x + (i - 1) * width,
-                vals_np,
-                width=width,
-                color=color,
-                label=name,
-                edgecolor="black",
-                linewidth=0.6,
-            )
-            ymax = float(vals_np.max()) if len(vals_np) else 0.0
-            offset = 0.01 * ymax if ymax > 0 else 0.0
-            for bar, val in zip(bars, vals_np):
-                ax_bar.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    bar.get_height() + offset,
-                    f"{val:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=9,
+        n_series = max(1, len(method_order) * len(component_defs))
+        width = min(0.14, 0.84 / n_series)
+        center = (n_series - 1) / 2.0
+
+        series_idx = 0
+        for method_name in method_order:
+            mstats = stats_by_method[method_name]
+            for comp_name, comp_key, color in component_defs:
+                comp_map = mstats[comp_key]
+                raw_vals = np.array(
+                    [
+                        float(np.mean(list(comp_map[s].values()))) if comp_map[s] else 0.0
+                        for s in sizes
+                    ],
+                    dtype=float,
                 )
-        ax_bar.set_title(f"QOSE Breakdown ({title_prefix})", fontsize=13)
+                plot_vals = np.where(raw_vals > 0.0, raw_vals, y_eps)
+                bars = ax_bar.bar(
+                    x + (series_idx - center) * width,
+                    plot_vals,
+                    width=width,
+                    color=color,
+                    label=f"{method_name} {comp_name}",
+                    edgecolor="black",
+                    linewidth=0.6,
+                    hatch=hatch_by_method.get(method_name, ""),
+                    alpha=0.85,
+                )
+                for bar, raw_val in zip(bars, raw_vals):
+                    y_text = max(float(bar.get_height()), y_eps) * 1.05
+                    ax_bar.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        y_text,
+                        f"{raw_val:.2f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=8,
+                    )
+                series_idx += 1
+        ax_bar.set_title(f"QOS/QOSE Breakdown ({title_prefix})", fontsize=13)
         ax_bar.set_xlabel("Qubit Size", fontsize=11)
         ax_bar.set_ylabel("Seconds", fontsize=11)
         ax_bar.set_xticks(x)
         ax_bar.set_xticklabels(x_labels, fontsize=10)
         ax_bar.tick_params(axis="y", labelsize=10)
+        ax_bar.set_yscale("log")
+        ax_bar.set_ylim(bottom=y_eps * 0.8)
         ax_bar.grid(axis="y", linestyle="--", alpha=0.35)
-        ax_bar.legend(fontsize=9, loc="upper left", frameon=True)
+        ax_bar.legend(fontsize=8, loc="upper left", frameon=True, ncol=2)
 
-        dist_specs = [
-            ("Per-job Elapsed", stats["elapsed_samples"], "#E45756"),
-            ("Per-job QPU", stats["qpu_samples"], "#54A24B"),
-            ("Per-bench Mitigation", stats["mitigation_samples"], "#4C78A8"),
-        ]
+        dist_specs = []
+        for size in sizes:
+            for method_name in method_order:
+                mstats = stats_by_method[method_name]
+                # Keep order consistent across 2nd and 4th subfigures:
+                # mitigation, wait, qpu.
+                dist_specs.extend(
+                    [
+                        (
+                            f"{size}q {method_name} Mitigation",
+                            mstats["mitigation_samples_by_size"].get(int(size), []),
+                            "#4C78A8",
+                        ),
+                        (
+                            f"{size}q {method_name} Wait",
+                            mstats["wait_samples_by_size"].get(int(size), []),
+                            "#F58518",
+                        ),
+                        (
+                            f"{size}q {method_name} QPU",
+                            mstats["qpu_samples_by_size"].get(int(size), []),
+                            "#54A24B",
+                        ),
+                    ]
+                )
         box_labels: List[str] = []
         box_values: List[List[float]] = []
         box_colors: List[str] = []
+        box_hatches: List[str] = []
         for label, raw_vals, color in dist_specs:
             cleaned: List[float] = []
             for v in raw_vals:
@@ -3707,9 +3743,10 @@ def _plot_time_breakdowns(
                     continue
                 cleaned.append(x)
             if cleaned:
-                box_labels.append(f"{label}\n(n={len(cleaned)})")
+                box_labels.append(f"{label} (n={len(cleaned)})")
                 box_values.append(cleaned)
                 box_colors.append(color)
+                box_hatches.append("///" if label.startswith("12q ") else "\\\\\\")
 
         if box_values:
             boxplot_kwargs = dict(
@@ -3736,6 +3773,8 @@ def _plot_time_breakdowns(
                 patch.set_alpha(0.75)
                 patch.set_edgecolor("black")
                 patch.set_linewidth(0.8)
+            for patch, hatch in zip(bp["boxes"], box_hatches):
+                patch.set_hatch(hatch)
             # Label each box with its median value for quick comparison.
             for idx, vals in enumerate(box_values, start=1):
                 med = float(np.median(np.array(vals, dtype=float)))
@@ -3748,8 +3787,28 @@ def _plot_time_breakdowns(
                     fontsize=9,
                     bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.7, "pad": 1.0},
                 )
+            # Keep x-axis clean; use legend for detailed labels.
+            ax_dist.set_xticks(np.arange(1, len(box_values) + 1))
+            ax_dist.set_xticklabels([])
+            from matplotlib.patches import Patch
+            legend_handles = [
+                Patch(
+                    facecolor=color,
+                    edgecolor="black",
+                    hatch=hatch,
+                    alpha=0.75,
+                    label=lbl,
+                )
+                for color, hatch, lbl in zip(box_colors, box_hatches, box_labels)
+            ]
+            ax_dist.legend(
+                handles=legend_handles,
+                fontsize=7,
+                loc="upper left",
+                frameon=True,
+                ncol=2,
+            )
             ax_dist.set_yscale("log")
-            ax_dist.tick_params(axis="x", labelsize=9, rotation=10)
             ax_dist.tick_params(axis="y", labelsize=10)
         else:
             ax_dist.text(0.5, 0.5, "No timing samples", ha="center", va="center", fontsize=10)
@@ -3760,27 +3819,40 @@ def _plot_time_breakdowns(
         ax_dist.set_ylabel("Seconds (log scale)", fontsize=11)
         ax_dist.grid(True, axis="y", linestyle="--", alpha=0.35)
 
-        total_real_jobs = int(sum(v["real_jobs"] for v in qose_by_size.values()))
-        total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in qose_by_size.values()))
-        return total_real_jobs, total_unknown_qpu
+        summary: Dict[str, Dict[str, int]] = {}
+        for method_name in method_order:
+            by_size = stats_by_method[method_name]["by_size"]
+            total_real_jobs = int(sum(v["real_jobs"] for v in by_size.values()))
+            total_unknown_qpu = int(sum(v["real_jobs_qpu_unknown"] for v in by_size.values()))
+            summary[method_name] = {"jobs": total_real_jobs, "unknown": total_unknown_qpu}
+        return summary
 
     if secondary_stats is None:
         fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.0))
-        jobs, unknown = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
+        summary = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
+        summary_text = ", ".join(
+            f"{m}: jobs={v['jobs']}, unknown={v['unknown']}" for m, v in summary.items()
+        )
         fig.suptitle(
-            f"QOSE Timing Diagnostics ({primary_name}; real jobs={jobs}, qpu_sec unknown={unknown})",
+            f"QOS/QOSE Timing Diagnostics ({primary_name}; {summary_text})",
             fontsize=14,
             y=1.06,
         )
     else:
         fig, axes = plt.subplots(1, 4, figsize=(27.0, 5.0))
-        jobs1, unknown1 = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
-        jobs2, unknown2 = _draw_qose_panels(axes[2], axes[3], secondary_stats, secondary_name)
+        summary1 = _draw_qose_panels(axes[0], axes[1], primary_stats, primary_name)
+        summary2 = _draw_qose_panels(axes[2], axes[3], secondary_stats, secondary_name)
+        summary1_text = ", ".join(
+            f"{m}: jobs={v['jobs']}, unknown={v['unknown']}" for m, v in summary1.items()
+        )
+        summary2_text = ", ".join(
+            f"{m}: jobs={v['jobs']}, unknown={v['unknown']}" for m, v in summary2.items()
+        )
         fig.suptitle(
             (
-                f"QOSE Timing Diagnostics "
-                f"({primary_name}: jobs={jobs1}, unknown={unknown1}; "
-                f"{secondary_name}: jobs={jobs2}, unknown={unknown2})"
+                f"QOS/QOSE Timing Diagnostics "
+                f"({primary_name}: {summary1_text}; "
+                f"{secondary_name}: {summary2_text})"
             ),
             fontsize=14,
             y=1.06,
@@ -3795,35 +3867,37 @@ def _plot_time_breakdowns(
     datasets = [(primary_name, primary_stats)]
     if secondary_stats is not None:
         datasets.append((secondary_name, secondary_stats))
-    for backend_name, stats in datasets:
-        qose_by_size = stats["qose_by_size"]
-        mitigation_by_bench = stats["mitigation_by_bench"]
-        real_wait_by_bench = stats["real_wait_by_bench"]
-        real_qpu_by_bench = stats["real_qpu_by_bench"]
-        real_elapsed_by_bench = stats["real_elapsed_by_bench"]
-        for s in sizes:
-            row = {
-                "backend": backend_name,
-                "size": s,
-                "mitigation_sec_total": qose_by_size[s]["mitigation_sec_total"],
-                "mitigation_sec_avg_per_bench": float(np.mean(list(mitigation_by_bench[s].values())))
-                if mitigation_by_bench[s]
-                else 0.0,
-                "real_wait_sec_total": qose_by_size[s]["real_wait_sec_total"],
-                "real_wait_sec_avg_per_bench": float(np.mean(list(real_wait_by_bench[s].values())))
-                if real_wait_by_bench[s]
-                else 0.0,
-                "real_qpu_sec_total": qose_by_size[s]["real_qpu_sec_total"],
-                "real_qpu_sec_avg_per_bench": float(np.mean(list(real_qpu_by_bench[s].values())))
-                if real_qpu_by_bench[s]
-                else 0.0,
-                "real_elapsed_sec_total": qose_by_size[s]["real_elapsed_sec_total"],
-                "real_jobs": qose_by_size[s]["real_jobs"],
-                "real_jobs_qpu_unknown": qose_by_size[s]["real_jobs_qpu_unknown"],
-                "benches_with_mitigation": len(mitigation_by_bench[s]),
-                "benches_with_real_jobs": len(real_elapsed_by_bench[s]),
-            }
-            rows1.append(row)
+    for backend_name, stats_by_method in datasets:
+        for method_name, stats in stats_by_method.items():
+            by_size = stats["by_size"]
+            mitigation_by_bench = stats["mitigation_by_bench"]
+            real_wait_by_bench = stats["real_wait_by_bench"]
+            real_qpu_by_bench = stats["real_qpu_by_bench"]
+            real_elapsed_by_bench = stats["real_elapsed_by_bench"]
+            for s in sizes:
+                row = {
+                    "backend": backend_name,
+                    "method": method_name,
+                    "size": s,
+                    "mitigation_sec_total": by_size[s]["mitigation_sec_total"],
+                    "mitigation_sec_avg_per_bench": float(np.mean(list(mitigation_by_bench[s].values())))
+                    if mitigation_by_bench[s]
+                    else 0.0,
+                    "real_wait_sec_total": by_size[s]["real_wait_sec_total"],
+                    "real_wait_sec_avg_per_bench": float(np.mean(list(real_wait_by_bench[s].values())))
+                    if real_wait_by_bench[s]
+                    else 0.0,
+                    "real_qpu_sec_total": by_size[s]["real_qpu_sec_total"],
+                    "real_qpu_sec_avg_per_bench": float(np.mean(list(real_qpu_by_bench[s].values())))
+                    if real_qpu_by_bench[s]
+                    else 0.0,
+                    "real_elapsed_sec_total": by_size[s]["real_elapsed_sec_total"],
+                    "real_jobs": by_size[s]["real_jobs"],
+                    "real_jobs_qpu_unknown": by_size[s]["real_jobs_qpu_unknown"],
+                    "benches_with_mitigation": len(mitigation_by_bench[s]),
+                    "benches_with_real_jobs": len(real_elapsed_by_bench[s]),
+                }
+                rows1.append(row)
     csv1 = out_dir / f"qose_time_breakdown_{panel_tag}.csv"
     _write_rows_csv(csv1, rows1)
 

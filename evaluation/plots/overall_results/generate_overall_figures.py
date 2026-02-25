@@ -127,7 +127,7 @@ def main() -> None:
     parser.add_argument("--root", default=str(default_root))
     parser.add_argument("--sizes", default="12,24")
     parser.add_argument("--panel-methods", default="FrozenQubits,CutQC,QOS,QOSE")
-    parser.add_argument("--timebreak-methods", default="QOS,QOSE")
+    parser.add_argument("--timebreak-methods", default="QOSE")
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
