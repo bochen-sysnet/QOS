@@ -1,0 +1,47 @@
+# QOS requirements for conda env `quantum`
+#
+# Setup:
+#   conda create -n quantum python=3.10 -y
+#   conda activate quantum
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements-quantum.txt
+#
+# Notes:
+# - This file includes the packages used by QOS, evaluation, and OpenEvolve runs.
+# - Some optional scheduler/estimator features need extra packages listed below.
+
+# Core scientific stack
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.3.0
+matplotlib==3.10.3
+seaborn==0.13.2
+networkx==3.4.2
+scikit-learn==1.7.0
+joblib==1.5.1
+PyYAML==6.0.3
+
+# Quantum stack
+qiskit==2.2.3
+qiskit-aer==0.17.2
+qiskit-ibm-runtime==0.43.1
+qiskit-ibm-provider
+qiskit-algorithms==0.4.0
+qiskit-optimization
+mapomatic==0.14.0
+clingo==5.8.0
+dimod==0.12.21
+
+# OpenEvolve / LLM client stack
+openevolve==0.2.24
+openai==2.14.0
+anthropic==0.71.0
+google-genai
+
+# QOS backend + scheduler extras
+redis
+jsonpickle
+pymoo
+
+# Optional (needed by qos/scheduler/time_estimator/regression_estimator.py)
+# mqt-predictor
