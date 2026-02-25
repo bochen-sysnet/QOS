@@ -25,7 +25,6 @@ PyYAML==6.0.3
 qiskit==2.2.3
 qiskit-aer==0.17.2
 qiskit-ibm-runtime==0.43.1
-qiskit-ibm-provider
 qiskit-algorithms==0.4.0
 qiskit-optimization
 mapomatic==0.14.0
@@ -45,3 +44,7 @@ pymoo
 
 # Optional (needed by qos/scheduler/time_estimator/regression_estimator.py)
 # mqt-predictor
+#
+# Important compatibility note:
+# - Do NOT install `qiskit-ibm-provider` in this env with Qiskit 2.x.
+#   It relies on deprecated ProviderV1 APIs and can trigger stevedore load errors.
