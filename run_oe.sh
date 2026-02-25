@@ -28,6 +28,7 @@ Environment variables (override defaults):
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
   OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high|auto (default: auto)
   OPENEVOLVE_GEMINI_MAX_OUTPUT_TOKENS  Override maxOutputTokens for Gemini native calls
+  OPENAI_REASONING_EFFORT         Optional GPT-5 reasoning effort: minimal|low|medium|high|auto
 
 Flags:
   --resume-latest                Resume from latest checkpoint under output_dir

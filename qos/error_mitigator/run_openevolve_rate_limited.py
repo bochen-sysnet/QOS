@@ -467,6 +467,9 @@ def _install_gemini_overrides() -> None:
             service_tier = os.getenv("OPENAI_SERVICE_TIER", "").strip()
             if service_tier and "service_tier" not in params:
                 params["service_tier"] = service_tier
+            reasoning_effort = _openai_reasoning_effort_from_env()
+            if reasoning_effort and "reasoning_effort" not in params and "reasoning" not in params:
+                params["reasoning_effort"] = reasoning_effort
         return await original_call(self, params)
 
     async def wrapped_generate(self, system_message, messages, **kwargs):
@@ -491,6 +494,21 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if raw in {"0", "false", "no", "n"}:
         return False
     return default
+
+
+def _openai_reasoning_effort_from_env() -> str:
+    raw = os.getenv("OPENAI_REASONING_EFFORT", "").strip().lower()
+    if not raw:
+        raw = os.getenv("OPENEVOLVE_OPENAI_REASONING_EFFORT", "").strip().lower()
+    if raw in {"", "auto", "default", "none"}:
+        return ""
+    if raw in {"minimal", "low", "medium", "high"}:
+        return raw
+    _logger.warning(
+        "Ignoring unsupported OPENAI_REASONING_EFFORT=%r (expected one of: minimal, low, medium, high, auto)",
+        raw,
+    )
+    return ""
 
 
 def _select_diverse_programs(
