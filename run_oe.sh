@@ -196,7 +196,7 @@ record_run_environment() {
   env_path="$OUTPUT_DIR/run_env_vars.log"
   {
     echo "[$ts]"
-    env | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_|GEMINI_|RESUME_LATEST|QISKIT_|IBM_)=' | sort || true
+    env | sort | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_|GEMINI_|QISKIT_|IBM_)|^RESUME_LATEST=' || true
     echo
   } >> "$env_path"
 }

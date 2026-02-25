@@ -152,11 +152,11 @@ def _include_example_code_artifact() -> bool:
 
 
 def _example_code_path() -> Path:
-    raw = os.getenv(
-        "QOSE_EXAMPLE_CODE_PATH",
-        "/home/ryan/bo/QOS/openaievolve/evolution_seed.py",
-    ).strip()
-    return Path(raw)
+    raw = os.getenv("QOSE_EXAMPLE_CODE_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    # Default to the co-located seed file in qos/error_mitigator/.
+    return Path(__file__).resolve().with_name("evolution_seed.py")
 
 
 def _load_example_code_artifact() -> str | None:
