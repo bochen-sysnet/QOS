@@ -8,6 +8,74 @@ from qos.error_mitigator.analyser import *
 from qos.error_mitigator.optimiser import *
 
 _TRACE_QUEUE = None
+_COST_TIMEOUT_SENTINEL = 10**8
+
+
+class CostResult(tuple):
+    __slots__ = ()
+
+    def __new__(cls, cost: int, timed_out: bool):
+        return super().__new__(cls, (int(cost), bool(timed_out)))
+
+    @property
+    def cost(self) -> int:
+        return int(self[0])
+
+    @property
+    def timed_out(self) -> bool:
+        return bool(self[1])
+
+    def _coerce_other(self, other):
+        if isinstance(other, CostResult):
+            return float(other.cost)
+        if isinstance(other, tuple) and len(other) >= 1:
+            try:
+                return float(other[0])
+            except Exception:
+                return NotImplemented
+        try:
+            return float(other)
+        except Exception:
+            return NotImplemented
+
+    def __float__(self) -> float:
+        return float(self.cost)
+
+    def __int__(self) -> int:
+        return int(self.cost)
+
+    def __bool__(self) -> bool:
+        return bool(self.cost)
+
+    def __lt__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) < rhs
+
+    def __le__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) <= rhs
+
+    def __gt__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) > rhs
+
+    def __ge__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return NotImplemented
+        return float(self.cost) >= rhs
+
+    def __eq__(self, other):
+        rhs = self._coerce_other(other)
+        if rhs is NotImplemented:
+            return False
+        return float(self.cost) == rhs
 
 
 def _emit_trace(event: dict) -> None:
@@ -163,6 +231,21 @@ def _mark_timeout_trace(gv_time_trace, wc_time_trace) -> None:
         wc_time_trace.append(-1.0)
 
 
+def _parse_timeout_sec(value) -> float:
+    try:
+        sec = float(value)
+    except Exception:
+        return 0.0
+    return sec if sec > 0 else 0.0
+
+
+def _resolve_component_timeout_sec(kind: str, timeout_sec) -> float:
+    if timeout_sec is not None:
+        return _parse_timeout_sec(timeout_sec)
+    env_name = "QOS_GV_COST_TIMEOUT_SEC" if kind == "GV" else "QOS_WC_COST_TIMEOUT_SEC"
+    return _parse_timeout_sec(os.getenv(env_name, "0"))
+
+
 def _compute_cost_direct(kind: str, q: Qernel, size_to_reach: int) -> int:
     if kind == "GV":
         pass_obj = GVOptimalDecompositionPass(size_to_reach)
@@ -173,46 +256,96 @@ def _compute_cost_direct(kind: str, q: Qernel, size_to_reach: int) -> int:
     return int(cost_value.value)
 
 
+def _single_cost_worker(
+    kind: str, q: Qernel, size_to_reach: int, result_queue
+) -> None:
+    try:
+        cost = _compute_cost_direct(kind, q, size_to_reach)
+        result_queue.put({"ok": True, "cost": int(cost)})
+    except Exception as exc:
+        result_queue.put({"ok": False, "error": str(exc)})
+
+
+def _compute_cost_with_timeout(
+    kind: str, q: Qernel, size_to_reach: int, timeout_sec
+):
+    resolved_timeout_sec = _resolve_component_timeout_sec(kind, timeout_sec)
+    t0 = time.perf_counter()
+    if resolved_timeout_sec <= 0:
+        cost = _compute_cost_direct(kind, q, size_to_reach)
+        return int(cost), False, time.perf_counter() - t0
+
+    start_methods = mp.get_all_start_methods()
+    if "fork" not in start_methods:
+        # Fallback: cannot safely enforce per-call timeout without fork.
+        cost = _compute_cost_direct(kind, q, size_to_reach)
+        return int(cost), False, time.perf_counter() - t0
+
+    mp_ctx = mp.get_context("fork")
+    result_queue = mp_ctx.Queue()
+    proc = mp_ctx.Process(
+        target=_single_cost_worker, args=(kind, q, size_to_reach, result_queue)
+    )
+    proc.start()
+    proc.join(resolved_timeout_sec)
+    elapsed_sec = time.perf_counter() - t0
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return _COST_TIMEOUT_SENTINEL, True, elapsed_sec
+
+    try:
+        result = result_queue.get_nowait()
+    except queue_mod.Empty:
+        return _COST_TIMEOUT_SENTINEL, True, elapsed_sec
+
+    if not result.get("ok"):
+        error = result.get("error", "unknown error")
+        raise RuntimeError(f"{kind} cost computation failed: {error}")
+    return int(result["cost"]), False, elapsed_sec
+
+
 def compute_gv_cost(
     q: Qernel,
     size_to_reach: int,
-    *,
+    timeout_sec=0,
     emit_trace: bool = True,
 ):
-    t0 = time.perf_counter()
-    gv_cost = _compute_cost_direct("GV", q, size_to_reach)
-    gv_sec = time.perf_counter() - t0
+    gv_cost, timed_out, gv_sec = _compute_cost_with_timeout(
+        "GV", q, size_to_reach, timeout_sec
+    )
     if emit_trace:
         _emit_trace(
             {
                 "kind": "GV",
                 "size": size_to_reach,
                 "cost": gv_cost,
-                "sec": gv_sec,
+                "sec": (-1.0 if timed_out else gv_sec),
             }
         )
-    return int(gv_cost)
+    return CostResult(gv_cost, timed_out)
 
 
 def compute_wc_cost(
     q: Qernel,
     size_to_reach: int,
-    *,
+    timeout_sec=0,
     emit_trace: bool = True,
 ):
-    t0 = time.perf_counter()
-    wc_cost = _compute_cost_direct("WC", q, size_to_reach)
-    wc_sec = time.perf_counter() - t0
+    wc_cost, timed_out, wc_sec = _compute_cost_with_timeout(
+        "WC", q, size_to_reach, timeout_sec
+    )
     if emit_trace:
         _emit_trace(
             {
                 "kind": "WC",
                 "size": size_to_reach,
                 "cost": wc_cost,
-                "sec": wc_sec,
+                "sec": (-1.0 if timed_out else wc_sec),
             }
         )
-    return int(wc_cost)
+    return CostResult(wc_cost, timed_out)
 
 
 def _cost_search_worker(mitigator, q, size_to_reach, budget, result_queue, trace_queue):
@@ -286,16 +419,20 @@ class ErrorMitigator():
         if use_gv:
             self._gv_cost_calls += 1
             t0 = time.perf_counter()
-            gv_cost = compute_gv_cost(q, size_to_reach, emit_trace=False)
+            gv_cost, gv_timed_out = compute_gv_cost(q, size_to_reach, emit_trace=False)
             gv_sec = time.perf_counter() - t0
+            if gv_timed_out:
+                gv_sec = -1.0
         else:
             gv_cost = 1000
 
         if use_wc:
             self._wc_cost_calls += 1
             t0 = time.perf_counter()
-            wc_cost = compute_wc_cost(q, size_to_reach, emit_trace=False)
+            wc_cost, wc_timed_out = compute_wc_cost(q, size_to_reach, emit_trace=False)
             wc_sec = time.perf_counter() - t0
+            if wc_timed_out:
+                wc_sec = -1.0
         else:
             wc_cost = 1000
             
