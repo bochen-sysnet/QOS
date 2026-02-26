@@ -110,7 +110,6 @@ prompt:
       - Artifacts are organized as:
         * artifacts["summary"] (optional): aggregate/run-level metrics
         * artifacts["cases"] (optional): list of per-(bench,size) case metrics
-        * artifacts["example_code"] (optional): raw source text of example evolution
 
     EXECUTION OUTPUTS PROVIDED BY EVALUATOR (artifacts["summary"]):
       - qose_budget: budget used for all cases

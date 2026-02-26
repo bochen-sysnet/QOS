@@ -147,35 +147,8 @@ def _include_cases_artifact() -> bool:
     return _env_bool("QOSE_INCLUDE_CASES_ARTIFACT", True)
 
 
-def _include_example_code_artifact() -> bool:
-    return _env_bool("QOSE_INCLUDE_EXAMPLE_CODE", False)
-
-
-def _example_code_path() -> Path:
-    raw = os.getenv("QOSE_EXAMPLE_CODE_PATH", "").strip()
-    if raw:
-        return Path(raw)
-    # Default to the co-located seed file in qos/error_mitigator/.
-    return Path(__file__).resolve().with_name("evolution_seed.py")
-
-
-def _load_example_code_artifact() -> str | None:
-    if not _include_example_code_artifact():
-        return None
-    path = _example_code_path()
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Failed to load example code artifact from %s: %s", path, exc)
-        return None
-
-
 def _failure_artifacts(info: str) -> dict:
-    artifacts = {"info": info}
-    example_code_artifact = _load_example_code_artifact()
-    if example_code_artifact is not None:
-        artifacts["example_code"] = example_code_artifact
-    return artifacts
+    return {"info": info}
 
 
 def _failure_result(info: str):
@@ -1555,9 +1528,6 @@ def _evaluate_impl(program_path):
         artifacts["summary"] = summary
     if _include_cases_artifact():
         artifacts["cases"] = sample_res["cases"]
-    example_code_artifact = _load_example_code_artifact()
-    if example_code_artifact is not None:
-        artifacts["example_code"] = example_code_artifact
     return _round_float_values(metrics), _round_float_values(artifacts)
 
 

@@ -23,6 +23,8 @@ Environment variables (override defaults):
   QOSE_SCORE_MODE                 Score profile: legacy (default) or piecewise
   OPENEVOLVE_CONFIG_PATH          Optional explicit config YAML path (overrides score-profile selection)
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
+  QOSE_INCLUDE_EXAMPLE_CODE       If true, injects example evolution code into prompt system message (default: 0)
+  QOSE_EXAMPLE_CODE_PATH          Optional path for example code injection (default: qos/error_mitigator/evolution_seed.py)
   QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
@@ -140,17 +142,96 @@ if [[ -n "${OPENEVOLVE_CONFIG_PATH:-}" ]]; then
   CONFIG_PATH="$OPENEVOLVE_CONFIG_PATH"
 fi
 
-# Keep a copy of the evolve config in the output directory for reproducibility.
+is_true() {
+  local raw="${1:-}"
+  raw="$(echo "$raw" | tr '[:upper:]' '[:lower:]')"
+  [[ "$raw" == "1" || "$raw" == "true" || "$raw" == "yes" || "$raw" == "y" ]]
+}
+
+build_runtime_config() {
+  local base_config_path="$1"
+  local runtime_config_path="$2"
+  local include_example_raw="${QOSE_INCLUDE_EXAMPLE_CODE:-0}"
+  local example_path="${QOSE_EXAMPLE_CODE_PATH:-qos/error_mitigator/evolution_seed.py}"
+
+  if ! is_true "$include_example_raw"; then
+    cp -f "$base_config_path" "$runtime_config_path"
+    return
+  fi
+
+  if [[ ! -f "$example_path" ]]; then
+    echo "QOSE_INCLUDE_EXAMPLE_CODE is enabled but example file was not found: $example_path" >&2
+    echo "Proceeding without example injection." >&2
+    cp -f "$base_config_path" "$runtime_config_path"
+    return
+  fi
+
+  python3 - "$base_config_path" "$runtime_config_path" "$example_path" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+base_cfg = Path(sys.argv[1])
+runtime_cfg = Path(sys.argv[2])
+example_path = Path(sys.argv[3])
+
+text = base_cfg.read_text(encoding="utf-8")
+example_code = example_path.read_text(encoding="utf-8").rstrip("\n")
+
+# Keep config untouched if already injected.
+if "Example Evolution:" in text:
+    runtime_cfg.write_text(text, encoding="utf-8")
+    raise SystemExit(0)
+
+# Prefer text-level insertion to preserve comments/formatting of the original YAML.
+pattern = re.compile(
+    r"(^  system_message:\s*\|\n)(.*?)(?=^  [A-Za-z_][A-Za-z0-9_]*\s*:)",
+    re.MULTILINE | re.DOTALL,
+)
+match = pattern.search(text)
+if not match:
+    # Fallback: do not rewrite into escaped YAML if format is unexpected.
+    runtime_cfg.write_text(text, encoding="utf-8")
+    raise SystemExit(0)
+
+body = match.group(2).rstrip("\n")
+example_lines = [
+    "",
+    "    Example Evolution:",
+    "    ```python",
+]
+example_lines += [f"    {line}" if line else "    " for line in example_code.splitlines()]
+example_lines.append("    ```")
+new_body = body + "\n" + "\n".join(example_lines) + "\n"
+
+patched = text[: match.start(2)] + new_body + text[match.end(2) :]
+runtime_cfg.write_text(patched, encoding="utf-8")
+PY
+}
+
+# Keep a runtime copy of evolve config in the output directory for reproducibility.
 mkdir -p "$OUTPUT_DIR"
-cp -f "$CONFIG_PATH" "$OUTPUT_DIR/openevolve_config.yaml"
+RUNTIME_CONFIG_PATH="$OUTPUT_DIR/openevolve_config.yaml"
+build_runtime_config "$CONFIG_PATH" "$RUNTIME_CONFIG_PATH"
+CONFIG_PATH="$RUNTIME_CONFIG_PATH"
 
 # Load API key from file if provided and OPENAI_API_KEY is unset.
 if [[ -z "${OPENAI_API_KEY:-}" && -n "${OPENAI_API_KEY_FILE:-}" ]]; then
   if [[ -f "$OPENAI_API_KEY_FILE" ]]; then
     export OPENAI_API_KEY
-    OPENAI_API_KEY="$(<"$OPENAI_API_KEY_FILE")"
+    OPENAI_API_KEY="$(tr -d '\r\n' < "$OPENAI_API_KEY_FILE")"
   fi
 fi
+
+load_key_from_file() {
+  local key_file="$1"
+  if [[ ! -f "$key_file" ]]; then
+    return 1
+  fi
+  export OPENAI_API_KEY
+  OPENAI_API_KEY="$(tr -d '\r\n' < "$key_file")"
+  [[ -n "${OPENAI_API_KEY:-}" ]]
+}
 
 case "$PROFILE" in
   gpt)
@@ -238,15 +319,27 @@ if [[ "$PROFILE" == "gemini" && "$REPEAT" -gt 1 ]]; then
   for ((i=0; i<REPEAT; i++)); do
     key_index=$((KEY_START + i))
     key_file="${KEY_PREFIX}${key_index}.key"
-    if [[ -f "$key_file" ]]; then
-      export OPENAI_API_KEY
-      OPENAI_API_KEY="$(<"$key_file")"
+    if load_key_from_file "$key_file"; then
       echo "Using gemini key: $key_file"
     else
-      echo "Gemini key not found: $key_file" >&2
+      echo "Gemini key missing/empty: $key_file" >&2
+      exit 1
     fi
     run_once "$i"
   done
 else
+  if [[ "$PROFILE" == "gemini" && -z "${OPENAI_API_KEY:-}" ]]; then
+    key_file="${KEY_PREFIX}${KEY_START}.key"
+    if load_key_from_file "$key_file"; then
+      echo "Using gemini key: $key_file"
+    else
+      echo "OPENAI_API_KEY is not set and Gemini key missing/empty: $key_file" >&2
+      exit 1
+    fi
+  fi
+  if [[ "$PROFILE" == "gpt" && -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "OPENAI_API_KEY is not set for gpt profile." >&2
+    exit 1
+  fi
   run_once 0
 fi
