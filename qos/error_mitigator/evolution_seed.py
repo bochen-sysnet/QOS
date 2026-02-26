@@ -1,11 +1,5 @@
-from __future__ import annotations
-
-import math
-from typing import Callable, Dict, Tuple, Union, Any
-
 from qos.error_mitigator.run import compute_gv_cost, compute_wc_cost
 from qos.types.types import Qernel
-
 
 def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     metadata = q.get_metadata()
@@ -23,189 +17,197 @@ def evolved_cost_search(self, q: Qernel, size_to_reach: int, budget: int):
     measurement = metadata.get("measurement", 0.0)
     entanglement_ratio = metadata.get("entanglement_ratio", 0.0)
     critical_depth = metadata.get("critical_depth", 0.0)
-
     # OE_BEGIN
-    def _clamp_int(x: int, lo: int, hi: int) -> int:
-        if x < lo:
-            return lo
-        if x > hi:
-            return hi
-        return x
+    # Clamp into a meaningful active range; allow >= num_qubits only as explicit fallback.
+    nq = int(num_qubits) if num_qubits else 0
+    if nq <= 2:
+        s_fallback = int(size_to_reach) if size_to_reach is not None else 2
+        if s_fallback < 2:
+            s_fallback = 2
+        return s_fallback, "GV"
 
-    def _clamp_float(x: float, lo: float, hi: float) -> float:
-        if x < lo:
-            return lo
-        if x > hi:
-            return hi
-        return x
+    s_min = 2
+    s_max = nq - 1
+    s_in = int(size_to_reach) if size_to_reach is not None else s_max
+    if s_in < s_min:
+        s_in = s_min
+    elif s_in > s_max:
+        s_in = s_max
 
-    def _safe_cost_call(
-        fn: Callable[..., Any], s: int, timeout_sec: float
-    ) -> Tuple[float, bool]:
-        """
-        Returns (cost, timed_out). If the underlying helper doesn't support timeout
-        or doesn't return a timed_out flag, we fall back gracefully.
-        """
-        try:
-            out = fn(q, s, timeout_sec=timeout_sec)
-        except TypeError:
-            out = fn(q, s)
+    # Cheap heuristic to pick a good starting probe size (reduces search steps).
+    # Higher "complexity" -> bias to larger target sizes (less aggressive cutting).
+    denom_inst = float(number_instructions) if number_instructions else 1.0
+    cnot_ratio = float(num_cnot_gates) / denom_inst
+    depth_norm = float(depth) / max(1.0, float(nq))
+    crit_norm = float(critical_depth) / max(1.0, float(depth) if depth else 1.0)
 
-        # Common expected: (cost, timed_out)
-        if isinstance(out, tuple) and len(out) >= 2:
-            cost = float(out[0])
-            timed_out = bool(out[1])
+    complexity = 0.0
+    complexity += 0.35 * min(1.0, depth_norm / 5.0)
+    complexity += 0.30 * min(1.0, float(entanglement_ratio))
+    complexity += 0.20 * min(1.0, cnot_ratio)
+    complexity += 0.15 * min(1.0, crit_norm)
+
+    # Map complexity to a fraction of nq, then blend with the incoming size_to_reach.
+    frac = 0.40 + 0.40 * complexity  # in [0.40, 0.80]
+    s_guess = int(round(frac * nq))
+    if s_guess < s_min:
+        s_guess = s_min
+    elif s_guess > s_max:
+        s_guess = s_max
+
+    s0 = int(round(0.65 * s_in + 0.35 * s_guess))
+    if s0 < s_min:
+        s0 = s_min
+    elif s0 > s_max:
+        s0 = s_max
+
+    b = int(budget) if budget is not None else 0
+
+    cache = {}
+
+    def _get_cost(m: str, s: int) -> int:
+        key = (m, s)
+        if key in cache:
+            return cache[key]
+        if m == "GV":
+            v = compute_gv_cost(q, s)
         else:
-            cost = float(out)
-            timed_out = False
+            v = compute_wc_cost(q, s)
+        cache[key] = v
+        return v
 
-        # Defensive normalization
-        if math.isnan(cost) or cost < 0:
-            cost = float("inf")
-        if timed_out:
-            cost = float("inf")
-        return cost, timed_out
-
-    # Normalize metadata for scale-free heuristics (generalize across qubit counts).
-    n = int(num_qubits) if int(num_qubits) > 0 else max(2, int(size_to_reach) if int(size_to_reach) > 0 else 2)
-    n = max(2, n)
-    denom = float(max(1, n))
-
-    nonlocal_density = float(num_nonlocal_gates) / denom
-    instr_density = float(number_instructions) / denom
-    depth_density = float(depth) / denom
-    comp_penalty = math.log1p(max(0, int(num_connected_components) - 1))
-
-    # A smooth "complexity" proxy (bounded), only used to set timeouts / probing.
-    complexity = (
-        0.35 * nonlocal_density
-        + 0.25 * depth_density
-        + 0.20 * instr_density
-        + 0.10 * float(entanglement_ratio)
-        + 0.10 * comp_penalty
-    )
-    complexity = _clamp_float(complexity, 0.0, 6.0)
-
-    # Dynamic timeouts to avoid pathological cases (e.g., mid-size subgraphs) while
-    # remaining permissive on easy instances. Keep bounded for stability.
-    gv_timeout_sec = _clamp_float(0.15 + 0.65 * math.tanh(complexity / 2.0), 0.08, 0.90)
-    wc_timeout_sec = _clamp_float(0.20 + 0.90 * math.tanh(complexity / 2.0), 0.10, 1.20)
-
-    # Memoize cost evaluations to reduce repeated calls.
-    # cache[s] = (gv_cost, wc_cost)
-    cache: Dict[int, Tuple[float, float]] = {}
-
-    def _eval_size(s: int) -> Tuple[float, str, float, float]:
+    def _find_smallest_valid(method: str, start_s: int) -> (int, int):
         """
-        Evaluate costs at size s and return:
-        (best_cost, best_method, gv_cost, wc_cost)
+        Assume cost is monotone non-increasing w.r.t. size_to_reach (larger size => lower/equal cost).
+        Return (best_size, best_cost) where best_cost <= budget if feasible, else (nq, cost_at_s_max).
         """
-        s = max(2, int(s))
-        if s in cache:
-            gv_cost, wc_cost = cache[s]
+        c_start = _get_cost(method, start_s)
+
+        # If budget is non-positive, avoid search churn; pick a conservative no-op fallback
+        # only when even the loosest meaningful size is still expensive.
+        if b <= 0:
+            # Keep within action range (avoid no-op) unless clearly impossible (checked below).
+            c_loose = _get_cost(method, s_max)
+            if c_loose > b:
+                return nq, c_loose
+            return s_max, c_loose
+
+        if c_start <= b:
+            # Search downward to find an invalid lower bound quickly (exponential), then binary.
+            hi = start_s
+            c_hi = c_start
+            lo = s_min - 1  # conceptual invalid (below domain)
+            step = 1
+            # Exponential step-down (bounded).
+            for _ in range(5):
+                if hi <= s_min:
+                    break
+                cand = hi - step
+                if cand < s_min:
+                    cand = s_min
+                c_cand = _get_cost(method, cand)
+                if c_cand <= b:
+                    hi = cand
+                    c_hi = c_cand
+                    if hi == s_min:
+                        break
+                    step <<= 1
+                else:
+                    lo = cand
+                    break
+
+            if hi == s_min:
+                return hi, c_hi
+            if lo == s_min - 1:
+                # Even s_min is valid (or we never found invalid); return smallest meaningful size.
+                c_min = _get_cost(method, s_min)
+                return s_min, c_min
+
+            # Binary search in (lo, hi] for smallest valid.
+            for _ in range(6):
+                if hi - lo <= 1:
+                    break
+                mid = (lo + hi) // 2
+                c_mid = _get_cost(method, mid)
+                if c_mid <= b:
+                    hi = mid
+                    c_hi = c_mid
+                else:
+                    lo = mid
+            return hi, c_hi
+
         else:
-            gv_cost, _gv_to = _safe_cost_call(compute_gv_cost, s, gv_timeout_sec)
+            # Search upward to find a valid upper bound quickly (exponential), then binary.
+            lo = start_s  # known invalid
+            hi = start_s
+            c_hi = c_start
+            step = 1
+            for _ in range(6):
+                if hi >= s_max:
+                    break
+                cand = hi + step
+                if cand > s_max:
+                    cand = s_max
+                c_cand = _get_cost(method, cand)
+                lo = hi
+                hi = cand
+                c_hi = c_cand
+                if c_hi <= b:
+                    break
+                step <<= 1
 
-            # Compute WC only when it can change the decision:
-            # - GV infeasible (must try WC)
-            # - or near boundary / structurally "split" circuits where WC can win
-            #   (helps generalization; avoids overfitting to GV-only behavior).
-            want_wc = False
-            if gv_cost > float(budget):
-                want_wc = True
-            else:
-                # Boundary or structure-triggered exploration
-                near_budget = gv_cost >= float(budget) - 1.0
-                split_like = (int(num_connected_components) > 1) or (float(program_communication) > 0.15)
-                low_ent = float(entanglement_ratio) < 0.25
-                want_wc = near_budget or split_like or low_ent
+            if c_hi > b:
+                # Too expensive even at the loosest meaningful size; explicit no-op fallback.
+                c_loose = _get_cost(method, s_max)
+                return nq, c_loose
 
-            if want_wc:
-                wc_cost, _wc_to = _safe_cost_call(compute_wc_cost, s, wc_timeout_sec)
-            else:
-                wc_cost = float("inf")
+            # Binary search in (lo, hi] for smallest valid.
+            for _ in range(6):
+                if hi - lo <= 1:
+                    break
+                mid = (lo + hi) // 2
+                c_mid = _get_cost(method, mid)
+                if c_mid <= b:
+                    hi = mid
+                    c_hi = c_mid
+                else:
+                    lo = mid
+            return hi, c_hi
 
-            cache[s] = (gv_cost, wc_cost)
+    # Method prior: if circuit looks more entangled/communicating, prefer WC; else GV.
+    # (Only acts as a tie-breaker; cost feasibility still dominates.)
+    nonlocal_ratio = float(num_nonlocal_gates) / (float(number_instructions) if number_instructions else 1.0)
+    prefer_wc = (float(entanglement_ratio) >= 0.45) or (float(program_communication) >= 0.25) or (nonlocal_ratio >= 0.12)
 
-        best_cost = gv_cost
-        best_method = "GV"
-        if wc_cost < best_cost:
-            best_cost = wc_cost
-            best_method = "WC"
+    gv0 = _get_cost("GV", s0)
+    wc0 = _get_cost("WC", s0)
 
-        return best_cost, best_method, gv_cost, wc_cost
-
-    def _feasible(best_cost: float) -> bool:
-        return best_cost <= float(budget)
-
-    # Choose a robust starting point:
-    # - Respect caller-provided size_to_reach
-    # - Avoid starting too small on complex circuits (reduces oscillation/over-search)
-    base_start = int(size_to_reach) if int(size_to_reach) > 0 else n
-    # Complexity-adaptive floor (scale-free).
-    # For harder circuits, start closer to n; for easier ones, allow smaller start.
-    start_floor = int(round(n * (0.55 + 0.15 * math.tanh(complexity / 2.0))))
-    start = max(base_start, start_floor)
-    start = _clamp_int(start, 2, n)
-
-    # Ensure we have a feasible upper point (may need to expand up to n).
-    hi = start
-    hi_best_cost, hi_best_method, _, _ = _eval_size(hi)
-    if not _feasible(hi_best_cost):
-        # Expand toward n with doubling steps (few evaluations).
-        step = 1
-        while hi < n and not _feasible(hi_best_cost):
-            hi = min(n, hi + step)
-            hi_best_cost, hi_best_method, _, _ = _eval_size(hi)
-            step = min(step * 2, max(1, n))
-
-        # If still infeasible at n, return the best effort at n (avoids infinite loops).
-        if not _feasible(hi_best_cost):
-            # Force WC evaluation at final size to avoid missing a feasible alternative.
-            _, _, gv_c, wc_c = _eval_size(hi)
-            if wc_c < gv_c:
-                return hi, "WC"
-            return hi, "GV"
-
-    # Step-down search (coarse-to-fine) for the smallest feasible size.
-    candidate = hi
-    step = max(1, (candidate - 2) // 2)
-    while step >= 1:
-        trial = candidate - step
-        if trial < 2:
-            step //= 2
-            continue
-        t_cost, _t_method, _, _ = _eval_size(trial)
-        if _feasible(t_cost):
-            candidate = trial
+    # Choose initial method with feasibility and stable bias.
+    gv_ok = (gv0 <= b)
+    wc_ok = (wc0 <= b)
+    if gv_ok and not wc_ok:
+        chosen_method = "GV"
+    elif wc_ok and not gv_ok:
+        chosen_method = "WC"
+    elif gv_ok and wc_ok:
+        if prefer_wc:
+            chosen_method = "WC" if wc0 <= int(gv0 * 1.15) else "GV"
         else:
-            step //= 2
-
-    # Robustness margin: avoid picking a razor-thin boundary point that can fail
-    # on nearby sizes/qubit-subsets. If tight, allow bumping size slightly.
-    final_size = candidate
-    final_cost, final_method, _, _ = _eval_size(final_size)
-    slack = float(budget) - float(final_cost)
-
-    if slack < 1.0:
-        for bump in (1, 2):
-            s2 = final_size + bump
-            if s2 > n:
-                break
-            c2, m2, _, _ = _eval_size(s2)
-            if _feasible(c2) and (float(budget) - float(c2)) >= 1.0:
-                final_size, final_cost, final_method = s2, c2, m2
-                break
-
-    # Tie-breaker for stability if WC was skipped (inf) but could be competitive:
-    # if we are near budget, evaluate WC once at the final size.
-    if float(budget) - float(final_cost) <= 1.0:
-        gv_c, _ = _safe_cost_call(compute_gv_cost, final_size, gv_timeout_sec)
-        wc_c, _ = _safe_cost_call(compute_wc_cost, final_size, wc_timeout_sec)
-        if wc_c < gv_c and wc_c <= float(budget):
-            final_method = "WC"
+            chosen_method = "GV" if gv0 <= int(wc0 * 1.15) else "WC"
+    else:
+        # Neither ok at s0: pick the cheaper one to guide the upward search.
+        if prefer_wc:
+            chosen_method = "WC" if wc0 <= gv0 else "GV"
         else:
-            final_method = "GV"
+            chosen_method = "GV" if gv0 <= wc0 else "WC"
 
+    best_size, best_cost = _find_smallest_valid(chosen_method, s0)
+
+    # If we had to fall back to no-op, pick a reasonable method label (doesn't matter downstream).
+    if best_size >= nq:
+        # Keep label stable with the initial preference and observed costs at s0.
+        chosen_method = "WC" if (prefer_wc and wc0 <= gv0) else ("GV" if gv0 <= wc0 else "WC")
+        return int(best_size), chosen_method
+
+    return int(best_size), chosen_method
     # OE_END
-    return final_size, final_method

@@ -59,12 +59,9 @@ prompt:
       entanglement_ratio, critical_depth.
 
     COST HELPER APIS (from qos/error_mitigator/run.py):
-      - compute_gv_cost(q, size_to_reach, timeout_sec=0)
-      - compute_wc_cost(q, size_to_reach, timeout_sec=0)
-      - Each call returns (cost: int, timed_out: bool).
-      - timeout_sec is per-call; GV/WC can use different values.
-      - timeout_sec=0 means no per-call timeout.
-      - On timeout, cost is set high and timed_out=True.
+      - compute_gv_cost(q, size_to_reach)
+      - compute_wc_cost(q, size_to_reach)
+      - Each call returns cost: int.
 
     Inputs/Outputs:
       - Inputs:

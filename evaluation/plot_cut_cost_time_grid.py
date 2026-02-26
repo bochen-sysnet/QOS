@@ -67,10 +67,10 @@ def _compute_once(
     q = Qernel(qc.copy())
     t0 = time.perf_counter()
     if method == "GV":
-        cost, _ = compute_gv_cost(q, size_to_reach, timeout_sec=0)
+        cost = compute_gv_cost(q, size_to_reach)
         cost = float(cost)
     elif method == "WC":
-        cost, _ = compute_wc_cost(q, size_to_reach, timeout_sec=0)
+        cost = compute_wc_cost(q, size_to_reach)
         cost = float(cost)
     else:
         raise ValueError(f"Unknown method: {method}")
