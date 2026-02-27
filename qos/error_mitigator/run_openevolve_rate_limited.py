@@ -1,9 +1,14 @@
 import asyncio
+import datetime
+import fcntl
 import json
 import logging
+import math
 import os
 import random
 import re
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,7 +35,232 @@ _PROCESS_PARALLEL_PATCHED = False
 _PROMPT_CONFIG_PATCHED = False
 _LLM_CONFIG_PATCHED = False
 _EVALUATOR_CONFIG_PATCHED = False
+_RUNTIME_TRACKING_PATCHED = False
 _logger = logging.getLogger(__name__)
+
+_RUNTIME_SUMMARY_PATH = ""
+_RUNTIME_EVENTS_PATH = ""
+_RUNTIME_LOCK_PATH = ""
+_RUNTIME_TRACKING_READY = False
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    if not text:
+        return 0
+    # Lightweight approximation used when provider token accounting is unavailable.
+    return max(1, int(math.ceil(len(text) / 4.0)))
+
+
+def _cli_arg_value(flag: str) -> str:
+    for idx, arg in enumerate(sys.argv):
+        if arg == flag and idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+def _init_runtime_tracking_paths() -> None:
+    global _RUNTIME_TRACKING_READY
+    global _RUNTIME_SUMMARY_PATH
+    global _RUNTIME_EVENTS_PATH
+    global _RUNTIME_LOCK_PATH
+    if _RUNTIME_TRACKING_READY:
+        return
+    output_dir = os.getenv("OPENEVOLVE_OUTPUT_DIR", "").strip()
+    if not output_dir:
+        output_dir = _cli_arg_value("--output").strip()
+        if output_dir:
+            os.environ["OPENEVOLVE_OUTPUT_DIR"] = output_dir
+    if not output_dir:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    _RUNTIME_SUMMARY_PATH = os.path.join(output_dir, "runtime_metrics.summary.json")
+    _RUNTIME_EVENTS_PATH = os.path.join(output_dir, "runtime_metrics.events.jsonl")
+    _RUNTIME_LOCK_PATH = os.path.join(output_dir, "runtime_metrics.lock")
+    _RUNTIME_TRACKING_READY = True
+
+
+def _default_runtime_summary() -> dict:
+    now = _utc_now_iso()
+    return {
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "runs_started": 0,
+        "llm": {
+            "calls_total": 0,
+            "success_total": 0,
+            "error_total": 0,
+            "wall_time_sec_total": 0.0,
+            "rate_limit_wait_sec_total": 0.0,
+            "prompt_chars_total": 0,
+            "completion_chars_total": 0,
+            "prompt_tokens_est_total": 0,
+            "completion_tokens_est_total": 0,
+            "prompt_texts_total": 0,
+            "completion_texts_total": 0,
+        },
+        "evaluation": {
+            "calls_total": 0,
+            "success_total": 0,
+            "error_total": 0,
+            "wall_time_sec_total": 0.0,
+        },
+        "iteration": {
+            "calls_total": 0,
+            "success_total": 0,
+            "error_total": 0,
+            "iteration_wall_time_sec_total": 0.0,
+            "prompt_build_sec_total": 0.0,
+            "llm_phase_sec_total": 0.0,
+            "code_phase_sec_total": 0.0,
+            "evaluation_phase_sec_total": 0.0,
+        },
+        "last_run": {},
+    }
+
+
+def _read_runtime_summary_unlocked() -> dict:
+    if not _RUNTIME_SUMMARY_PATH or not os.path.exists(_RUNTIME_SUMMARY_PATH):
+        return _default_runtime_summary()
+    try:
+        with open(_RUNTIME_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return _default_runtime_summary()
+    if not isinstance(data, dict):
+        return _default_runtime_summary()
+    return data
+
+
+def _write_runtime_summary_unlocked(summary: dict) -> None:
+    summary["updated_at"] = _utc_now_iso()
+    directory = os.path.dirname(_RUNTIME_SUMMARY_PATH)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".runtime_metrics.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, _RUNTIME_SUMMARY_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _apply_event_to_summary(summary: dict, event: dict) -> None:
+    typ = str(event.get("type", ""))
+    payload = event.get("payload") or {}
+    if typ == "run_start":
+        summary["runs_started"] = int(summary.get("runs_started", 0)) + 1
+        summary["last_run"] = payload
+        return
+
+    if typ == "llm_call":
+        llm = summary.setdefault("llm", {})
+        llm["calls_total"] = int(llm.get("calls_total", 0)) + 1
+        if payload.get("success"):
+            llm["success_total"] = int(llm.get("success_total", 0)) + 1
+        else:
+            llm["error_total"] = int(llm.get("error_total", 0)) + 1
+        llm["wall_time_sec_total"] = float(llm.get("wall_time_sec_total", 0.0)) + float(
+            payload.get("wall_time_sec", 0.0)
+        )
+        llm["prompt_chars_total"] = int(llm.get("prompt_chars_total", 0)) + int(
+            payload.get("prompt_chars", 0)
+        )
+        llm["completion_chars_total"] = int(llm.get("completion_chars_total", 0)) + int(
+            payload.get("completion_chars", 0)
+        )
+        llm["prompt_tokens_est_total"] = int(llm.get("prompt_tokens_est_total", 0)) + int(
+            payload.get("prompt_tokens_est", 0)
+        )
+        llm["completion_tokens_est_total"] = int(
+            llm.get("completion_tokens_est_total", 0)
+        ) + int(payload.get("completion_tokens_est", 0))
+        llm["prompt_texts_total"] = int(llm.get("prompt_texts_total", 0)) + int(
+            payload.get("prompt_texts", 0)
+        )
+        llm["completion_texts_total"] = int(llm.get("completion_texts_total", 0)) + int(
+            payload.get("completion_texts", 0)
+        )
+        return
+
+    if typ == "rate_limit_wait":
+        llm = summary.setdefault("llm", {})
+        llm["rate_limit_wait_sec_total"] = float(
+            llm.get("rate_limit_wait_sec_total", 0.0)
+        ) + float(payload.get("wait_sec", 0.0))
+        return
+
+    if typ == "evaluation_call":
+        ev = summary.setdefault("evaluation", {})
+        ev["calls_total"] = int(ev.get("calls_total", 0)) + 1
+        if payload.get("success"):
+            ev["success_total"] = int(ev.get("success_total", 0)) + 1
+        else:
+            ev["error_total"] = int(ev.get("error_total", 0)) + 1
+        ev["wall_time_sec_total"] = float(ev.get("wall_time_sec_total", 0.0)) + float(
+            payload.get("wall_time_sec", 0.0)
+        )
+        return
+
+    if typ == "iteration":
+        it = summary.setdefault("iteration", {})
+        it["calls_total"] = int(it.get("calls_total", 0)) + 1
+        if payload.get("success"):
+            it["success_total"] = int(it.get("success_total", 0)) + 1
+        else:
+            it["error_total"] = int(it.get("error_total", 0)) + 1
+        it["iteration_wall_time_sec_total"] = float(
+            it.get("iteration_wall_time_sec_total", 0.0)
+        ) + float(payload.get("iteration_wall_time_sec", 0.0))
+        it["prompt_build_sec_total"] = float(it.get("prompt_build_sec_total", 0.0)) + float(
+            payload.get("prompt_build_sec", 0.0)
+        )
+        it["llm_phase_sec_total"] = float(it.get("llm_phase_sec_total", 0.0)) + float(
+            payload.get("llm_phase_sec", 0.0)
+        )
+        it["code_phase_sec_total"] = float(it.get("code_phase_sec_total", 0.0)) + float(
+            payload.get("code_phase_sec", 0.0)
+        )
+        it["evaluation_phase_sec_total"] = float(
+            it.get("evaluation_phase_sec_total", 0.0)
+        ) + float(payload.get("evaluation_phase_sec", 0.0)
+        )
+        return
+
+
+def _record_runtime_event(event_type: str, payload: dict) -> None:
+    _init_runtime_tracking_paths()
+    if not _RUNTIME_TRACKING_READY:
+        return
+    event = {
+        "ts": _utc_now_iso(),
+        "type": event_type,
+        "pid": os.getpid(),
+        "payload": payload or {},
+    }
+    os.makedirs(os.path.dirname(_RUNTIME_SUMMARY_PATH), exist_ok=True)
+    with open(_RUNTIME_LOCK_PATH, "a+", encoding="utf-8") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            summary = _read_runtime_summary_unlocked()
+            _apply_event_to_summary(summary, event)
+            _write_runtime_summary_unlocked(summary)
+            with open(_RUNTIME_EVENTS_PATH, "a", encoding="utf-8") as ef:
+                ef.write(json.dumps(event, sort_keys=True))
+                ef.write("\n")
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
 
 
 def _get_inspiration_limit(config) -> int:
@@ -129,6 +359,10 @@ def _patched_run_iteration_worker(
     logger = logging.getLogger("openevolve.process_parallel")
     try:
         process_parallel._lazy_init_worker_components()
+        prompt_build_sec = 0.0
+        llm_phase_sec = 0.0
+        code_phase_sec = 0.0
+        eval_phase_sec = 0.0
 
         programs = {
             pid: Program(**prog_dict)
@@ -158,6 +392,7 @@ def _patched_run_iteration_worker(
             : process_parallel._worker_config.prompt.num_top_programs
         ]
 
+        t_prompt_build = time.perf_counter()
         prompt = process_parallel._worker_prompt_sampler.build_prompt(
             current_program=parent.code,
             parent_program=parent.code,
@@ -171,18 +406,85 @@ def _patched_run_iteration_worker(
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
         )
+        prompt_build_sec = time.perf_counter() - t_prompt_build
 
         iteration_start = time.time()
+        llm_success = False
+        eval_success = False
+        prompt_text = f"{prompt.get('system', '')}\n{prompt.get('user', '')}"
+        prompt_chars = len(prompt_text)
+        prompt_tokens_est = _estimate_tokens_from_text(prompt_text)
 
         try:
+            t_llm = time.perf_counter()
             llm_response = asyncio.run(
                 process_parallel._worker_llm_ensemble.generate_with_context(
                     system_message=prompt["system"],
                     messages=[{"role": "user", "content": prompt["user"]}],
                 )
             )
+            llm_phase_sec = time.perf_counter() - t_llm
+            llm_success = True
+            completion_chars = len(llm_response or "")
+            completion_tokens_est = _estimate_tokens_from_text(llm_response or "")
+            _record_runtime_event(
+                "llm_call",
+                {
+                    "success": True,
+                    "wall_time_sec": llm_phase_sec,
+                    "api_base": str(
+                        getattr(process_parallel._worker_llm_ensemble, "api_base", "")
+                        or os.getenv("OPENAI_API_BASE", "")
+                    ),
+                    "model": str(
+                        getattr(process_parallel._worker_llm_ensemble, "model", "")
+                        or os.getenv("OPENAI_MODEL", "")
+                    ),
+                    "prompt_chars": int(prompt_chars),
+                    "prompt_tokens_est": int(prompt_tokens_est),
+                    "prompt_texts": 1 if prompt_chars > 0 else 0,
+                    "completion_chars": int(completion_chars),
+                    "completion_tokens_est": int(completion_tokens_est),
+                    "completion_texts": 1 if completion_chars > 0 else 0,
+                },
+            )
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
+            _record_runtime_event(
+                "llm_call",
+                {
+                    "success": False,
+                    "wall_time_sec": llm_phase_sec,
+                    "api_base": str(
+                        getattr(process_parallel._worker_llm_ensemble, "api_base", "")
+                        or os.getenv("OPENAI_API_BASE", "")
+                    ),
+                    "model": str(
+                        getattr(process_parallel._worker_llm_ensemble, "model", "")
+                        or os.getenv("OPENAI_MODEL", "")
+                    ),
+                    "prompt_chars": int(prompt_chars),
+                    "prompt_tokens_est": int(prompt_tokens_est),
+                    "prompt_texts": 1 if prompt_chars > 0 else 0,
+                    "completion_chars": 0,
+                    "completion_tokens_est": 0,
+                    "completion_texts": 0,
+                    "error": str(e),
+                },
+            )
+            _record_runtime_event(
+                "iteration",
+                {
+                    "success": False,
+                    "iteration": int(iteration),
+                    "stage": "llm",
+                    "iteration_wall_time_sec": time.time() - iteration_start,
+                    "prompt_build_sec": prompt_build_sec,
+                    "llm_phase_sec": llm_phase_sec,
+                    "code_phase_sec": code_phase_sec,
+                    "evaluation_phase_sec": eval_phase_sec,
+                },
+            )
             return process_parallel.SerializableResult(
                 error=f"LLM generation failed: {str(e)}", iteration=iteration
             )
@@ -192,6 +494,7 @@ def _patched_run_iteration_worker(
                 error="LLM returned None response", iteration=iteration
             )
 
+        t_code_phase = time.perf_counter()
         if process_parallel._worker_config.diff_based_evolution:
             from openevolve.utils.code_utils import (
                 apply_diff,
@@ -227,8 +530,22 @@ def _patched_run_iteration_worker(
 
             child_code = new_code
             changes_summary = "Full rewrite"
+        code_phase_sec = time.perf_counter() - t_code_phase
 
         if len(child_code) > process_parallel._worker_config.max_code_length:
+            _record_runtime_event(
+                "iteration",
+                {
+                    "success": False,
+                    "iteration": int(iteration),
+                    "stage": "length_check",
+                    "iteration_wall_time_sec": time.time() - iteration_start,
+                    "prompt_build_sec": prompt_build_sec,
+                    "llm_phase_sec": llm_phase_sec,
+                    "code_phase_sec": code_phase_sec,
+                    "evaluation_phase_sec": eval_phase_sec,
+                },
+            )
             return process_parallel.SerializableResult(
                 error=(
                     "Generated code exceeds maximum length "
@@ -240,9 +557,12 @@ def _patched_run_iteration_worker(
         import uuid
 
         child_id = str(uuid.uuid4())
+        t_eval = time.perf_counter()
         child_metrics = asyncio.run(
             process_parallel._worker_evaluator.evaluate_program(child_code, child_id)
         )
+        eval_phase_sec = time.perf_counter() - t_eval
+        eval_success = True
 
         artifacts = process_parallel._worker_evaluator.get_pending_artifacts(child_id)
 
@@ -262,6 +582,20 @@ def _patched_run_iteration_worker(
         )
 
         iteration_time = time.time() - iteration_start
+        _record_runtime_event(
+            "iteration",
+            {
+                "success": True,
+                "iteration": int(iteration),
+                "llm_success": llm_success,
+                "eval_success": eval_success,
+                "iteration_wall_time_sec": iteration_time,
+                "prompt_build_sec": prompt_build_sec,
+                "llm_phase_sec": llm_phase_sec,
+                "code_phase_sec": code_phase_sec,
+                "evaluation_phase_sec": eval_phase_sec,
+            },
+        )
 
         return process_parallel.SerializableResult(
             child_program_dict=child_program.to_dict(),
@@ -274,6 +608,15 @@ def _patched_run_iteration_worker(
         )
     except Exception as e:
         logger.exception(f"Unexpected error in worker iteration: {e}")
+        _record_runtime_event(
+            "iteration",
+            {
+                "success": False,
+                "iteration": int(iteration),
+                "stage": "worker_exception",
+                "error": str(e),
+            },
+        )
         return process_parallel.SerializableResult(
             error=f"Worker iteration error: {str(e)}", iteration=iteration
         )
@@ -300,6 +643,14 @@ def _install_rate_limit(rpm: float) -> None:
             else:
                 last_by_key[key] = now
         if wait_for > 0:
+            _record_runtime_event(
+                "rate_limit_wait",
+                {
+                    "wait_sec": float(wait_for),
+                    "api_base": str(self.api_base),
+                    "model": str(self.model),
+                },
+            )
             await asyncio.sleep(wait_for)
         return await original(self, system_message, messages, **kwargs)
 
@@ -436,6 +787,71 @@ def _gemini_native_request(api_key: str, params: dict) -> str:
 async def _gemini_native_request_async(api_key: str, params: dict) -> str:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: _gemini_native_request(api_key, params))
+
+
+def _install_runtime_tracking_overrides() -> None:
+    global _RUNTIME_TRACKING_PATCHED
+    if _RUNTIME_TRACKING_PATCHED:
+        return
+
+    original_generate = OpenAILLM.generate_with_context
+
+    async def wrapped_generate(self, system_message, messages, **kwargs):
+        start = time.perf_counter()
+        prompt_text_parts: list[str] = []
+        if isinstance(system_message, str) and system_message:
+            prompt_text_parts.append(system_message)
+        for msg in messages or []:
+            if isinstance(msg, dict):
+                prompt_text_parts.append(_flatten_message_content(msg.get("content", "")))
+            elif isinstance(msg, str):
+                prompt_text_parts.append(msg)
+        prompt_text = "\n".join(part for part in prompt_text_parts if part)
+        prompt_chars = len(prompt_text)
+        prompt_tokens_est = _estimate_tokens_from_text(prompt_text)
+        payload_base = {
+            "api_base": str(getattr(self, "api_base", "")),
+            "model": str(getattr(self, "model", "")),
+            "prompt_chars": int(prompt_chars),
+            "prompt_tokens_est": int(prompt_tokens_est),
+            "prompt_texts": 1 if prompt_chars > 0 else 0,
+        }
+        try:
+            response = await original_generate(self, system_message, messages, **kwargs)
+            wall_time = time.perf_counter() - start
+            completion_text = response if isinstance(response, str) else str(response)
+            completion_chars = len(completion_text)
+            completion_tokens_est = _estimate_tokens_from_text(completion_text)
+            _record_runtime_event(
+                "llm_call",
+                {
+                    **payload_base,
+                    "success": True,
+                    "wall_time_sec": float(wall_time),
+                    "completion_chars": int(completion_chars),
+                    "completion_tokens_est": int(completion_tokens_est),
+                    "completion_texts": 1 if completion_chars > 0 else 0,
+                },
+            )
+            return response
+        except Exception as exc:
+            wall_time = time.perf_counter() - start
+            _record_runtime_event(
+                "llm_call",
+                {
+                    **payload_base,
+                    "success": False,
+                    "wall_time_sec": float(wall_time),
+                    "completion_chars": 0,
+                    "completion_tokens_est": 0,
+                    "completion_texts": 0,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    OpenAILLM.generate_with_context = wrapped_generate
+    _RUNTIME_TRACKING_PATCHED = True
 
 
 def _install_gemini_overrides() -> None:
@@ -709,15 +1125,31 @@ def _install_evaluator_artifact_storage_overrides() -> None:
     original_evaluate = Evaluator.evaluate_program
 
     async def wrapped_evaluate(self, program_code, program_id=""):
-        metrics = await original_evaluate(self, program_code, program_id)
-        if program_id and getattr(self, "database", None) is not None:
-            artifacts = self.get_pending_artifacts(program_id)
-            if artifacts:
-                if self.database.get(program_id):
-                    self.database.store_artifacts(program_id, artifacts)
-                else:
-                    _PENDING_ARTIFACTS[program_id] = artifacts
-        return metrics
+        t0 = time.perf_counter()
+        try:
+            metrics = await original_evaluate(self, program_code, program_id)
+            success = True
+            return metrics
+        except Exception:
+            success = False
+            raise
+        finally:
+            wall_time = time.perf_counter() - t0
+            _record_runtime_event(
+                "evaluation_call",
+                {
+                    "success": success,
+                    "program_id": str(program_id or ""),
+                    "wall_time_sec": float(wall_time),
+                },
+            )
+            if success and program_id and getattr(self, "database", None) is not None:
+                artifacts = self.get_pending_artifacts(program_id)
+                if artifacts:
+                    if self.database.get(program_id):
+                        self.database.store_artifacts(program_id, artifacts)
+                    else:
+                        _PENDING_ARTIFACTS[program_id] = artifacts
 
     Evaluator.evaluate_program = wrapped_evaluate
     _EVALUATOR_ARTIFACTS_PATCHED = True
@@ -735,6 +1167,15 @@ def main() -> int:
     if path_parts:
         os.environ["PYTHONPATH"] = os.pathsep.join(path_parts)
     os.environ.setdefault("OPENEVOLVE_ENABLE_PATCHES", "1")
+    # Make output dir visible to worker processes for runtime tracking.
+    _init_runtime_tracking_paths()
+    _record_runtime_event(
+        "run_start",
+        {
+            "argv": sys.argv[1:],
+            "output_dir": os.getenv("OPENEVOLVE_OUTPUT_DIR", ""),
+        },
+    )
 
     _install_gemini_overrides()
     _install_prompt_config_overrides()
@@ -752,6 +1193,8 @@ def main() -> int:
         except ValueError:
             rpm = 0.0
         _install_rate_limit(rpm)
+    # Install after provider/rate-limit wrappers so tracked time reflects final behavior.
+    _install_runtime_tracking_overrides()
     return openevolve_main()
 
 
