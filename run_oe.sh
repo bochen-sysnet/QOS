@@ -26,7 +26,6 @@ Environment variables (override defaults):
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_INCLUDE_EXAMPLE_CODE       If true, injects example evolution code into prompt system message (default: 0)
   QOSE_EXAMPLE_CODE_PATH          Optional path for example code injection (default: qos/error_mitigator/evolution_seed.py)
-  QOSE_SURROGATE_STATE_CSV        Surrogate cache path (default: <output_dir>/qose_surrogate_state.csv)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
   OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high|auto (default: auto)
@@ -56,15 +55,6 @@ fi
 PROFILE="$1"
 OUTPUT_DIR="$2"
 shift 2
-
-# Default surrogate cache location: per-evolution output directory.
-# This keeps correlation/prediction state isolated by run unless explicitly overridden.
-if [[ -z "${QOSE_SURROGATE_STATE_CSV:-}" ]]; then
-  export QOSE_SURROGATE_STATE_CSV="$OUTPUT_DIR/qose_surrogate_state.csv"
-fi
-
-# Default: keep surrogate disabled unless explicitly enabled.
-export QOSE_SURROGATE_ENABLE="${QOSE_SURROGATE_ENABLE:-0}"
 
 export OPENEVOLVE_NUM_TOP_PROGRAMS="${OPENEVOLVE_NUM_TOP_PROGRAMS:-3}"
 export OPENEVOLVE_NUM_DIVERSE_PROGRAMS="${OPENEVOLVE_NUM_DIVERSE_PROGRAMS:-2}"
