@@ -20,6 +20,7 @@ Environment variables (override defaults):
   OPENEVOLVE_NUM_TOP_PROGRAMS     Override num_top_programs
   OPENEVOLVE_NUM_DIVERSE_PROGRAMS Override num_diverse_programs
   OPENEVOLVE_NUM_INSPIRATIONS     Override inspiration count
+  OPENEVOLVE_DIFF_BASED_EVOLUTION Optional bool override for diff_based_evolution (true/false)
   QOSE_SCORE_MODE                 Score profile: legacy (default) or piecewise
   OPENEVOLVE_CONFIG_PATH          Optional explicit config YAML path (overrides score-profile selection)
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
@@ -153,29 +154,24 @@ build_runtime_config() {
   local runtime_config_path="$2"
   local include_example_raw="${QOSE_INCLUDE_EXAMPLE_CODE:-0}"
   local example_path="${QOSE_EXAMPLE_CODE_PATH:-qos/error_mitigator/evolution_seed.py}"
+  local diff_mode_raw="${OPENEVOLVE_DIFF_BASED_EVOLUTION:-}"
 
-  if ! is_true "$include_example_raw"; then
-    cp -f "$base_config_path" "$runtime_config_path"
-    return
-  fi
+  cp -f "$base_config_path" "$runtime_config_path"
 
-  if [[ ! -f "$example_path" ]]; then
-    echo "QOSE_INCLUDE_EXAMPLE_CODE is enabled but example file was not found: $example_path" >&2
-    echo "Proceeding without example injection." >&2
-    cp -f "$base_config_path" "$runtime_config_path"
-    return
-  fi
-
-  python3 - "$base_config_path" "$runtime_config_path" "$example_path" <<'PY'
+  if is_true "$include_example_raw"; then
+    if [[ ! -f "$example_path" ]]; then
+      echo "QOSE_INCLUDE_EXAMPLE_CODE is enabled but example file was not found: $example_path" >&2
+      echo "Proceeding without example injection." >&2
+    else
+      python3 - "$runtime_config_path" "$example_path" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-base_cfg = Path(sys.argv[1])
-runtime_cfg = Path(sys.argv[2])
-example_path = Path(sys.argv[3])
+runtime_cfg = Path(sys.argv[1])
+example_path = Path(sys.argv[2])
 
-text = base_cfg.read_text(encoding="utf-8")
+text = runtime_cfg.read_text(encoding="utf-8")
 example_code = example_path.read_text(encoding="utf-8").rstrip("\n")
 
 # Keep config untouched if already injected.
@@ -207,6 +203,58 @@ new_body = body + "\n" + "\n".join(example_lines) + "\n"
 patched = text[: match.start(2)] + new_body + text[match.end(2) :]
 runtime_cfg.write_text(patched, encoding="utf-8")
 PY
+    fi
+  fi
+
+  if [[ -n "$diff_mode_raw" ]]; then
+    local diff_mode_bool="false"
+    if is_true "$diff_mode_raw"; then
+      diff_mode_bool="true"
+    fi
+    python3 - "$runtime_config_path" "$diff_mode_bool" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+cfg = Path(sys.argv[1])
+target = sys.argv[2].strip().lower()
+text = cfg.read_text(encoding="utf-8")
+patched, count = re.subn(
+    r"(?m)^diff_based_evolution:\s*(true|false)\s*$",
+    f"diff_based_evolution: {target}",
+    text,
+    count=1,
+)
+if count == 0:
+    patched = f"diff_based_evolution: {target}\n" + text
+
+if target == "true":
+    diff_output_block = (
+        "    OUTPUT FORMAT (CRITICAL):\n"
+        "    - Return ONLY SEARCH/REPLACE diff blocks.\n"
+        "    - Use exact format for each change:\n"
+        "      <<<<<<< SEARCH\n"
+        "      <exact existing code>\n"
+        "      =======\n"
+        "      <replacement code>\n"
+        "      >>>>>>> REPLACE\n"
+        "    - No explanations, no markdown fences, no extra text.\n\n"
+    )
+    full_rewrite_block = (
+        "    OUTPUT FORMAT (CRITICAL):\n"
+        "    - Return the full file contents of qos/error_mitigator/evolution_target.py.\n"
+        "    - Output code only: no explanations, no markdown fences, no extra text.\n\n"
+    )
+    if full_rewrite_block in patched:
+        patched = patched.replace(full_rewrite_block, diff_output_block, 1)
+    else:
+        pattern = re.compile(
+            r"(?ms)^    OUTPUT FORMAT \(CRITICAL\):\n.*?\n(?=    GENERALIZATION REQUIREMENT \(CRITICAL\):)"
+        )
+        patched, _ = pattern.subn(diff_output_block, patched, count=1)
+cfg.write_text(patched, encoding="utf-8")
+PY
+  fi
 }
 
 # Keep a runtime copy of evolve config in the output directory for reproducibility.
