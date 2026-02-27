@@ -42,6 +42,8 @@ _RUNTIME_SUMMARY_PATH = ""
 _RUNTIME_EVENTS_PATH = ""
 _RUNTIME_LOCK_PATH = ""
 _RUNTIME_TRACKING_READY = False
+_USAGE_WARN_LOCK = threading.Lock()
+_USAGE_WARNED: set[tuple[str, str, str, str]] = set()
 
 
 def _utc_now_iso() -> str:
@@ -53,6 +55,27 @@ def _estimate_tokens_from_text(text: str) -> int:
         return 0
     # Lightweight approximation used when provider token accounting is unavailable.
     return max(1, int(math.ceil(len(text) / 4.0)))
+
+
+def _warn_missing_usage_once(
+    *, api_base: str, model: str, source: str, missing_fields: list[str], available_fields: list[str]
+) -> None:
+    if not missing_fields:
+        return
+    key = (api_base or "", model or "", source or "", ",".join(sorted(missing_fields)))
+    with _USAGE_WARN_LOCK:
+        if key in _USAGE_WARNED:
+            return
+        _USAGE_WARNED.add(key)
+    _logger.warning(
+        "Could not extract expected usage fields from response (source=%s, api_base=%s, model=%s). "
+        "missing=%s available=%s",
+        source,
+        api_base or "",
+        model or "",
+        ",".join(missing_fields),
+        ",".join(available_fields),
+    )
 
 
 def _cli_arg_value(flag: str) -> str:
@@ -71,11 +94,11 @@ def _init_runtime_tracking_paths() -> None:
     global _RUNTIME_LOCK_PATH
     if _RUNTIME_TRACKING_READY:
         return
-    output_dir = os.getenv("OPENEVOLVE_OUTPUT_DIR", "").strip()
-    if not output_dir:
-        output_dir = _cli_arg_value("--output").strip()
-        if output_dir:
-            os.environ["OPENEVOLVE_OUTPUT_DIR"] = output_dir
+    # Always prefer explicit CLI --output over inherited environment variables.
+    cli_output_dir = _cli_arg_value("--output").strip()
+    output_dir = cli_output_dir or os.getenv("OPENEVOLVE_OUTPUT_DIR", "").strip()
+    if cli_output_dir:
+        os.environ["OPENEVOLVE_OUTPUT_DIR"] = cli_output_dir
     if not output_dir:
         return
     os.makedirs(output_dir, exist_ok=True)
@@ -104,6 +127,9 @@ def _default_runtime_summary() -> dict:
             "completion_tokens_est_total": 0,
             "prompt_texts_total": 0,
             "completion_texts_total": 0,
+            "reported_usage_calls": 0,
+            "reported_usage_missing_calls": 0,
+            "reported_usage_totals": {},
         },
         "evaluation": {
             "calls_total": 0,
@@ -192,6 +218,17 @@ def _apply_event_to_summary(summary: dict, event: dict) -> None:
         llm["completion_texts_total"] = int(llm.get("completion_texts_total", 0)) + int(
             payload.get("completion_texts", 0)
         )
+        reported_usage = payload.get("reported_usage")
+        if isinstance(reported_usage, dict) and reported_usage:
+            llm["reported_usage_calls"] = int(llm.get("reported_usage_calls", 0)) + 1
+            totals = llm.setdefault("reported_usage_totals", {})
+            for key, value in reported_usage.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[key] = float(totals.get(key, 0.0)) + float(value)
+        else:
+            llm["reported_usage_missing_calls"] = int(
+                llm.get("reported_usage_missing_calls", 0)
+            ) + 1
         return
 
     if typ == "rate_limit_wait":
@@ -411,9 +448,6 @@ def _patched_run_iteration_worker(
         iteration_start = time.time()
         llm_success = False
         eval_success = False
-        prompt_text = f"{prompt.get('system', '')}\n{prompt.get('user', '')}"
-        prompt_chars = len(prompt_text)
-        prompt_tokens_est = _estimate_tokens_from_text(prompt_text)
 
         try:
             t_llm = time.perf_counter()
@@ -425,53 +459,8 @@ def _patched_run_iteration_worker(
             )
             llm_phase_sec = time.perf_counter() - t_llm
             llm_success = True
-            completion_chars = len(llm_response or "")
-            completion_tokens_est = _estimate_tokens_from_text(llm_response or "")
-            _record_runtime_event(
-                "llm_call",
-                {
-                    "success": True,
-                    "wall_time_sec": llm_phase_sec,
-                    "api_base": str(
-                        getattr(process_parallel._worker_llm_ensemble, "api_base", "")
-                        or os.getenv("OPENAI_API_BASE", "")
-                    ),
-                    "model": str(
-                        getattr(process_parallel._worker_llm_ensemble, "model", "")
-                        or os.getenv("OPENAI_MODEL", "")
-                    ),
-                    "prompt_chars": int(prompt_chars),
-                    "prompt_tokens_est": int(prompt_tokens_est),
-                    "prompt_texts": 1 if prompt_chars > 0 else 0,
-                    "completion_chars": int(completion_chars),
-                    "completion_tokens_est": int(completion_tokens_est),
-                    "completion_texts": 1 if completion_chars > 0 else 0,
-                },
-            )
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            _record_runtime_event(
-                "llm_call",
-                {
-                    "success": False,
-                    "wall_time_sec": llm_phase_sec,
-                    "api_base": str(
-                        getattr(process_parallel._worker_llm_ensemble, "api_base", "")
-                        or os.getenv("OPENAI_API_BASE", "")
-                    ),
-                    "model": str(
-                        getattr(process_parallel._worker_llm_ensemble, "model", "")
-                        or os.getenv("OPENAI_MODEL", "")
-                    ),
-                    "prompt_chars": int(prompt_chars),
-                    "prompt_tokens_est": int(prompt_tokens_est),
-                    "prompt_texts": 1 if prompt_chars > 0 else 0,
-                    "completion_chars": 0,
-                    "completion_tokens_est": 0,
-                    "completion_texts": 0,
-                    "error": str(e),
-                },
-            )
             _record_runtime_event(
                 "iteration",
                 {
@@ -684,6 +673,292 @@ def _flatten_message_content(content) -> str:
     return str(content)
 
 
+def _extract_numeric_usage_fields(obj, prefix: str = "") -> dict[str, float]:
+    out: dict[str, float] = {}
+
+    if obj is None:
+        return out
+
+    if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        key = prefix.rstrip(".")
+        if key:
+            out[key] = float(obj)
+        return out
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.update(_extract_numeric_usage_fields(v, f"{prefix}{k}."))
+        return out
+
+    if isinstance(obj, (list, tuple)):
+        for idx, v in enumerate(obj):
+            out.update(_extract_numeric_usage_fields(v, f"{prefix}{idx}."))
+        return out
+
+    dump = None
+    for attr in ("model_dump", "dict"):
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                dump = fn()
+                break
+            except Exception:
+                pass
+    if isinstance(dump, dict):
+        out.update(_extract_numeric_usage_fields(dump, prefix))
+        return out
+
+    if hasattr(obj, "__dict__"):
+        try:
+            out.update(_extract_numeric_usage_fields(vars(obj), prefix))
+            return out
+        except Exception:
+            pass
+    return out
+
+
+def _extract_usage_fields_from_openai_response(response) -> dict[str, float]:
+    usage_obj = getattr(response, "usage", None)
+    usage_fields = _extract_numeric_usage_fields(usage_obj)
+    # Normalize common aliases so plots can use stable names.
+    normalized: dict[str, float] = {}
+    if "prompt_tokens" in usage_fields:
+        normalized["prompt_tokens"] = usage_fields["prompt_tokens"]
+    if "completion_tokens" in usage_fields:
+        normalized["completion_tokens"] = usage_fields["completion_tokens"]
+    if "total_tokens" in usage_fields:
+        normalized["total_tokens"] = usage_fields["total_tokens"]
+    if "input_tokens" in usage_fields and "prompt_tokens" not in normalized:
+        normalized["prompt_tokens"] = usage_fields["input_tokens"]
+    if "output_tokens" in usage_fields and "completion_tokens" not in normalized:
+        normalized["completion_tokens"] = usage_fields["output_tokens"]
+    if (
+        "total_tokens" not in normalized
+        and "prompt_tokens" in normalized
+        and "completion_tokens" in normalized
+    ):
+        normalized["total_tokens"] = normalized["prompt_tokens"] + normalized["completion_tokens"]
+    normalized.update(usage_fields)
+    return normalized
+
+
+def _messages_to_single_prompt(messages: list[dict]) -> str:
+    parts: list[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "user")).strip().lower()
+        content = _flatten_message_content(msg.get("content", ""))
+        if not content:
+            continue
+        parts.append(f"[{role}]\n{content}")
+    return "\n\n".join(parts)
+
+
+def _openai_model_prefers_completions(model_name: str) -> bool:
+    model = (model_name or "").strip().lower()
+    if not model:
+        return False
+    # Optional override list: comma-separated model names.
+    raw = os.getenv("OPENEVOLVE_OPENAI_COMPLETIONS_MODELS", "").strip()
+    if raw:
+        names = [m.strip().lower() for m in raw.split(",") if m.strip()]
+        if model in names:
+            return True
+    return False
+
+
+def _openai_model_prefers_responses(model_name: str) -> bool:
+    model = (model_name or "").strip().lower()
+    if not model:
+        return False
+    # GPT-5 codex variants are served on /v1/responses.
+    if model.startswith("gpt-5") and "codex" in model:
+        return True
+    raw = os.getenv("OPENEVOLVE_OPENAI_RESPONSES_MODELS", "").strip()
+    if raw:
+        names = [m.strip().lower() for m in raw.split(",") if m.strip()]
+        if model in names:
+            return True
+    return False
+
+
+def _completion_params_from_chat_params(params: dict) -> dict:
+    completion_params = {
+        "model": params.get("model"),
+        "prompt": _messages_to_single_prompt(params.get("messages") or []),
+        "max_tokens": params.get("max_tokens", params.get("max_completion_tokens")),
+    }
+    if "temperature" in params:
+        completion_params["temperature"] = params.get("temperature")
+    if "top_p" in params:
+        completion_params["top_p"] = params.get("top_p")
+    return {k: v for k, v in completion_params.items() if v is not None}
+
+
+def _responses_params_from_chat_params(params: dict) -> dict:
+    response_params = {
+        "model": params.get("model"),
+        "input": params.get("messages") or [],
+        "max_output_tokens": params.get("max_tokens", params.get("max_completion_tokens")),
+    }
+    if "temperature" in params:
+        response_params["temperature"] = params.get("temperature")
+    if "top_p" in params:
+        response_params["top_p"] = params.get("top_p")
+    reasoning_effort = params.get("reasoning_effort")
+    if reasoning_effort:
+        response_params["reasoning"] = {"effort": reasoning_effort}
+    if "service_tier" in params and params.get("service_tier") is not None:
+        response_params["service_tier"] = params.get("service_tier")
+    return {k: v for k, v in response_params.items() if v is not None}
+
+
+def _extract_text_from_responses_payload(raw: dict) -> str:
+    text = raw.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    out_parts: list[str] = []
+    for item in raw.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            ctext = content.get("text")
+            if isinstance(ctext, str) and ctext:
+                out_parts.append(ctext)
+    return "\n".join(p for p in out_parts if p).strip()
+
+
+def _call_openai_responses_request(api_base: str, api_key: str, payload: dict) -> tuple[str, dict[str, float]]:
+    base = (api_base or "").rstrip("/")
+    url = f"{base}/responses"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI responses HTTP {exc.code}: {body}") from exc
+    if isinstance(raw, dict) and raw.get("error"):
+        raise RuntimeError(f"OpenAI responses error: {raw['error']}")
+    text = _extract_text_from_responses_payload(raw or {})
+    if not text:
+        raise RuntimeError("OpenAI responses returned empty output text")
+    usage_fields = _extract_numeric_usage_fields((raw or {}).get("usage") or {})
+    normalized: dict[str, float] = {}
+    if "input_tokens" in usage_fields:
+        normalized["prompt_tokens"] = usage_fields["input_tokens"]
+    if "output_tokens" in usage_fields:
+        normalized["completion_tokens"] = usage_fields["output_tokens"]
+    if "total_tokens" in usage_fields:
+        normalized["total_tokens"] = usage_fields["total_tokens"]
+    normalized.update(usage_fields)
+    return text, normalized
+
+
+async def _call_openai_responses_and_capture_usage(self, params: dict) -> str:
+    api_base = str(getattr(self, "api_base", "") or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"))
+    api_key = str(
+        getattr(self, "api_key", "") or os.getenv("OPENAI_API_KEY", "")
+    ).strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for responses API call")
+    payload = _responses_params_from_chat_params(params)
+    loop = asyncio.get_event_loop()
+    text, usage_fields = await loop.run_in_executor(
+        None, lambda: _call_openai_responses_request(api_base, api_key, payload)
+    )
+    missing = [k for k in ("prompt_tokens", "completion_tokens") if k not in usage_fields]
+    if missing:
+        _warn_missing_usage_once(
+            api_base=api_base,
+            model=str(params.get("model", "")),
+            source="openai_responses",
+            missing_fields=missing,
+            available_fields=sorted(usage_fields.keys()),
+        )
+    setattr(self, "_oe_last_usage_fields", usage_fields)
+    return text
+
+
+async def _call_openai_compatible_and_capture_usage(self, params: dict) -> str:
+    loop = asyncio.get_event_loop()
+    model_name = str(params.get("model", ""))
+    force_responses_first = _openai_model_prefers_responses(model_name)
+    force_completions_first = _openai_model_prefers_completions(model_name)
+    if force_responses_first:
+        _logger.info(
+            "Using responses endpoint directly for model %s.", model_name
+        )
+        return await _call_openai_responses_and_capture_usage(self, params)
+    if force_completions_first:
+        _logger.info(
+            "Using completions endpoint directly for model %s.", model_name
+        )
+        completion_params = _completion_params_from_chat_params(params)
+        response = await loop.run_in_executor(
+            None, lambda: self.client.completions.create(**completion_params)
+        )
+        is_completion_fallback = True
+    else:
+        try:
+            response = await loop.run_in_executor(
+                None, lambda: self.client.chat.completions.create(**params)
+            )
+            is_completion_fallback = False
+        except Exception as exc:
+            exc_text = str(exc)
+            if "v1/responses" in exc_text.lower():
+                _logger.warning(
+                    "Model %s does not support chat/completions; falling back to responses endpoint.",
+                    model_name,
+                )
+                return await _call_openai_responses_and_capture_usage(self, params)
+            elif (
+                "not a chat model" in exc_text.lower()
+                or "v1/completions" in exc_text.lower()
+                or "use v1/completions" in exc_text.lower()
+            ):
+                _logger.warning(
+                    "Model %s does not support chat/completions; falling back to completions endpoint.",
+                    model_name,
+                )
+                completion_params = _completion_params_from_chat_params(params)
+                response = await loop.run_in_executor(
+                    None, lambda: self.client.completions.create(**completion_params)
+                )
+                is_completion_fallback = True
+            else:
+                raise
+
+    usage_fields = _extract_usage_fields_from_openai_response(response)
+    missing = [k for k in ("prompt_tokens", "completion_tokens") if k not in usage_fields]
+    if missing:
+        _warn_missing_usage_once(
+            api_base=str(getattr(self, "api_base", "")),
+            model=str(getattr(self, "model", "")),
+            source="openai_compatible",
+            missing_fields=missing,
+            available_fields=sorted(usage_fields.keys()),
+        )
+    setattr(self, "_oe_last_usage_fields", usage_fields)
+    if is_completion_fallback:
+        text_content = getattr(response.choices[0], "text", "")
+        return _flatten_message_content(text_content)
+    message_content = response.choices[0].message.content
+    return _flatten_message_content(message_content)
+
+
 def _split_system_and_user_from_messages(messages: list[dict]) -> tuple[str, str]:
     system_parts: list[str] = []
     conversation_parts: list[str] = []
@@ -704,7 +979,7 @@ def _split_system_and_user_from_messages(messages: list[dict]) -> tuple[str, str
     return "\n\n".join(system_parts), "\n\n".join(conversation_parts)
 
 
-def _gemini_native_request(api_key: str, params: dict) -> str:
+def _gemini_native_request(api_key: str, params: dict) -> tuple[str, dict[str, float]]:
     model = str(params.get("model", "")).strip()
     if not model:
         raise RuntimeError("Gemini native call requires a model name")
@@ -781,10 +1056,36 @@ def _gemini_native_request(api_key: str, params: dict) -> str:
     if not text:
         finish_reason = first.get("finishReason", "unknown")
         raise RuntimeError(f"Gemini native returned empty text (finishReason={finish_reason})")
-    return text
+    usage = (raw or {}).get("usageMetadata") or {}
+    usage_fields: dict[str, float] = {}
+    if isinstance(usage, dict):
+        # Normalize Gemini native accounting fields.
+        if "promptTokenCount" in usage:
+            usage_fields["prompt_tokens"] = float(usage.get("promptTokenCount", 0))
+        if "candidatesTokenCount" in usage:
+            usage_fields["completion_tokens"] = float(usage.get("candidatesTokenCount", 0))
+        if "totalTokenCount" in usage:
+            usage_fields["total_tokens"] = float(usage.get("totalTokenCount", 0))
+        if "thoughtsTokenCount" in usage:
+            usage_fields["thoughts_tokens"] = float(usage.get("thoughtsTokenCount", 0))
+        # Keep all raw numeric usage fields too (including nested keys, if present).
+        flat_usage = _extract_numeric_usage_fields(usage)
+        usage_fields.update({f"gemini_usage.{k}": float(v) for k, v in flat_usage.items()})
+    missing = [k for k in ("prompt_tokens", "completion_tokens") if k not in usage_fields]
+    if missing:
+        _warn_missing_usage_once(
+            api_base=_GEMINI_API_PREFIX,
+            model=model,
+            source="gemini_native",
+            missing_fields=missing,
+            available_fields=sorted(usage_fields.keys()),
+        )
+    return text, usage_fields
 
 
-async def _gemini_native_request_async(api_key: str, params: dict) -> str:
+async def _gemini_native_request_async(
+    api_key: str, params: dict
+) -> tuple[str, dict[str, float]]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: _gemini_native_request(api_key, params))
 
@@ -798,6 +1099,7 @@ def _install_runtime_tracking_overrides() -> None:
 
     async def wrapped_generate(self, system_message, messages, **kwargs):
         start = time.perf_counter()
+        setattr(self, "_oe_last_usage_fields", {})
         prompt_text_parts: list[str] = []
         if isinstance(system_message, str) and system_message:
             prompt_text_parts.append(system_message)
@@ -822,6 +1124,9 @@ def _install_runtime_tracking_overrides() -> None:
             completion_text = response if isinstance(response, str) else str(response)
             completion_chars = len(completion_text)
             completion_tokens_est = _estimate_tokens_from_text(completion_text)
+            reported_usage = getattr(self, "_oe_last_usage_fields", {}) or {}
+            if not isinstance(reported_usage, dict):
+                reported_usage = {}
             _record_runtime_event(
                 "llm_call",
                 {
@@ -831,11 +1136,15 @@ def _install_runtime_tracking_overrides() -> None:
                     "completion_chars": int(completion_chars),
                     "completion_tokens_est": int(completion_tokens_est),
                     "completion_texts": 1 if completion_chars > 0 else 0,
+                    "reported_usage": reported_usage,
                 },
             )
             return response
         except Exception as exc:
             wall_time = time.perf_counter() - start
+            reported_usage = getattr(self, "_oe_last_usage_fields", {}) or {}
+            if not isinstance(reported_usage, dict):
+                reported_usage = {}
             _record_runtime_event(
                 "llm_call",
                 {
@@ -846,6 +1155,7 @@ def _install_runtime_tracking_overrides() -> None:
                     "completion_tokens_est": 0,
                     "completion_texts": 0,
                     "error": str(exc),
+                    "reported_usage": reported_usage,
                 },
             )
             raise
@@ -855,7 +1165,6 @@ def _install_runtime_tracking_overrides() -> None:
 
 
 def _install_gemini_overrides() -> None:
-    original_call = OpenAILLM._call_api
     original_generate = OpenAILLM.generate_with_context
 
     async def wrapped_call(self, params):
@@ -873,7 +1182,9 @@ def _install_gemini_overrides() -> None:
                 api_key = os.getenv("OPENAI_API_KEY", "").strip()
                 if api_key:
                     try:
-                        return await _gemini_native_request_async(api_key, params)
+                        text, usage_fields = await _gemini_native_request_async(api_key, params)
+                        setattr(self, "_oe_last_usage_fields", usage_fields)
+                        return text
                     except Exception as exc:
                         _logger.warning(
                             "Gemini native call failed; falling back to OpenAI-compatible endpoint: %s",
@@ -886,7 +1197,7 @@ def _install_gemini_overrides() -> None:
             reasoning_effort = _openai_reasoning_effort_from_env()
             if reasoning_effort and "reasoning_effort" not in params and "reasoning" not in params:
                 params["reasoning_effort"] = reasoning_effort
-        return await original_call(self, params)
+        return await _call_openai_compatible_and_capture_usage(self, params)
 
     async def wrapped_generate(self, system_message, messages, **kwargs):
         response = await original_generate(self, system_message, messages, **kwargs)

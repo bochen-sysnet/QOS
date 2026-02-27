@@ -11,6 +11,7 @@ if _truthy(os.getenv("OPENEVOLVE_ENABLE_PATCHES", "")):
 
         for fn_name in (
             "_install_gemini_overrides",
+            "_install_runtime_tracking_overrides",
             "_install_prompt_artifact_overrides",
             "_install_process_parallel_overrides",
         ):
