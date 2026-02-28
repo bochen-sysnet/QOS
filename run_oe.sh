@@ -319,7 +319,8 @@ record_run_environment() {
   env_path="$OUTPUT_DIR/run_env_vars.log"
   {
     echo "[$ts]"
-    env | sort | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_|GEMINI_|QISKIT_|IBM_)|^RESUME_LATEST=' || true
+    env | sort | grep -E '^(QOSE_|OPENEVOLVE_|OPENAI_|GEMINI_|QISKIT_|IBM_)|^RESUME_LATEST=' | \
+      awk -F= 'BEGIN{IGNORECASE=1} $1 !~ /(API_)?KEY|TOKEN/ {print $0}' || true
     echo
   } >> "$env_path"
 }

@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import datetime
 import fcntl
 import json
@@ -8,7 +9,6 @@ import os
 import random
 import re
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -38,9 +38,7 @@ _EVALUATOR_CONFIG_PATCHED = False
 _RUNTIME_TRACKING_PATCHED = False
 _logger = logging.getLogger(__name__)
 
-_RUNTIME_SUMMARY_PATH = ""
-_RUNTIME_EVENTS_PATH = ""
-_RUNTIME_LOCK_PATH = ""
+_RUNTIME_ITERATION_CSV_PATH = ""
 _RUNTIME_TRACKING_READY = False
 _USAGE_WARN_LOCK = threading.Lock()
 _USAGE_WARNED: set[tuple[str, str, str, str]] = set()
@@ -89,9 +87,7 @@ def _cli_arg_value(flag: str) -> str:
 
 def _init_runtime_tracking_paths() -> None:
     global _RUNTIME_TRACKING_READY
-    global _RUNTIME_SUMMARY_PATH
-    global _RUNTIME_EVENTS_PATH
-    global _RUNTIME_LOCK_PATH
+    global _RUNTIME_ITERATION_CSV_PATH
     if _RUNTIME_TRACKING_READY:
         return
     # Always prefer explicit CLI --output over inherited environment variables.
@@ -102,202 +98,133 @@ def _init_runtime_tracking_paths() -> None:
     if not output_dir:
         return
     os.makedirs(output_dir, exist_ok=True)
-    _RUNTIME_SUMMARY_PATH = os.path.join(output_dir, "runtime_metrics.summary.json")
-    _RUNTIME_EVENTS_PATH = os.path.join(output_dir, "runtime_metrics.events.jsonl")
-    _RUNTIME_LOCK_PATH = os.path.join(output_dir, "runtime_metrics.lock")
+    _RUNTIME_ITERATION_CSV_PATH = os.path.join(output_dir, "runtime_metrics.iterations.csv")
     _RUNTIME_TRACKING_READY = True
 
 
-def _default_runtime_summary() -> dict:
-    now = _utc_now_iso()
-    return {
-        "version": 1,
-        "created_at": now,
-        "updated_at": now,
-        "runs_started": 0,
-        "llm": {
-            "calls_total": 0,
-            "success_total": 0,
-            "error_total": 0,
-            "wall_time_sec_total": 0.0,
-            "rate_limit_wait_sec_total": 0.0,
-            "prompt_chars_total": 0,
-            "completion_chars_total": 0,
-            "prompt_tokens_est_total": 0,
-            "completion_tokens_est_total": 0,
-            "prompt_texts_total": 0,
-            "completion_texts_total": 0,
-            "reported_usage_calls": 0,
-            "reported_usage_missing_calls": 0,
-            "reported_usage_totals": {},
-        },
-        "evaluation": {
-            "calls_total": 0,
-            "success_total": 0,
-            "error_total": 0,
-            "wall_time_sec_total": 0.0,
-        },
-        "iteration": {
-            "calls_total": 0,
-            "success_total": 0,
-            "error_total": 0,
-            "iteration_wall_time_sec_total": 0.0,
-            "prompt_build_sec_total": 0.0,
-            "llm_phase_sec_total": 0.0,
-            "code_phase_sec_total": 0.0,
-            "evaluation_phase_sec_total": 0.0,
-        },
-        "last_run": {},
-    }
+_RUNTIME_ITERATION_CSV_FIELDS = [
+    "ts",
+    "run_index",
+    "pid",
+    "iteration",
+    "success",
+    "stage",
+    "llm_elapsed_time_sec",
+    "evaluation_elapsed_time_sec",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "reasoning_tokens",
+    "combined_score",
+    "qose_depth",
+    "qose_cnot",
+    "qose_overhead",
+    "avg_run_time",
+    "error",
+]
 
 
-def _read_runtime_summary_unlocked() -> dict:
-    if not _RUNTIME_SUMMARY_PATH or not os.path.exists(_RUNTIME_SUMMARY_PATH):
-        return _default_runtime_summary()
+def _next_run_index_unlocked() -> int:
+    if not _RUNTIME_ITERATION_CSV_PATH or not os.path.exists(_RUNTIME_ITERATION_CSV_PATH):
+        return 1
+    max_run_index = 0
     try:
-        with open(_RUNTIME_SUMMARY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(_RUNTIME_ITERATION_CSV_PATH, "r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                raw = str(row.get("run_index", "")).strip()
+                if not raw:
+                    continue
+                try:
+                    max_run_index = max(max_run_index, int(raw))
+                except ValueError:
+                    continue
     except Exception:
-        return _default_runtime_summary()
-    if not isinstance(data, dict):
-        return _default_runtime_summary()
-    return data
+        return 1
+    return max_run_index + 1
 
 
-def _write_runtime_summary_unlocked(summary: dict) -> None:
-    summary["updated_at"] = _utc_now_iso()
-    directory = os.path.dirname(_RUNTIME_SUMMARY_PATH)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".runtime_metrics.", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp_path, _RUNTIME_SUMMARY_PATH)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+def _ensure_iteration_csv_header_unlocked() -> None:
+    if not _RUNTIME_ITERATION_CSV_PATH:
+        return
+    if os.path.exists(_RUNTIME_ITERATION_CSV_PATH) and os.path.getsize(_RUNTIME_ITERATION_CSV_PATH) > 0:
+        return
+    with open(_RUNTIME_ITERATION_CSV_PATH, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_RUNTIME_ITERATION_CSV_FIELDS)
+        writer.writeheader()
 
 
-def _apply_event_to_summary(summary: dict, event: dict) -> None:
-    typ = str(event.get("type", ""))
+def _append_iteration_csv_unlocked(event: dict) -> None:
+    if not _RUNTIME_ITERATION_CSV_PATH:
+        return
     payload = event.get("payload") or {}
-    if typ == "run_start":
-        summary["runs_started"] = int(summary.get("runs_started", 0)) + 1
-        summary["last_run"] = payload
-        return
-
-    if typ == "llm_call":
-        llm = summary.setdefault("llm", {})
-        llm["calls_total"] = int(llm.get("calls_total", 0)) + 1
-        if payload.get("success"):
-            llm["success_total"] = int(llm.get("success_total", 0)) + 1
-        else:
-            llm["error_total"] = int(llm.get("error_total", 0)) + 1
-        llm["wall_time_sec_total"] = float(llm.get("wall_time_sec_total", 0.0)) + float(
-            payload.get("wall_time_sec", 0.0)
-        )
-        llm["prompt_chars_total"] = int(llm.get("prompt_chars_total", 0)) + int(
-            payload.get("prompt_chars", 0)
-        )
-        llm["completion_chars_total"] = int(llm.get("completion_chars_total", 0)) + int(
-            payload.get("completion_chars", 0)
-        )
-        llm["prompt_tokens_est_total"] = int(llm.get("prompt_tokens_est_total", 0)) + int(
-            payload.get("prompt_tokens_est", 0)
-        )
-        llm["completion_tokens_est_total"] = int(
-            llm.get("completion_tokens_est_total", 0)
-        ) + int(payload.get("completion_tokens_est", 0))
-        llm["prompt_texts_total"] = int(llm.get("prompt_texts_total", 0)) + int(
-            payload.get("prompt_texts", 0)
-        )
-        llm["completion_texts_total"] = int(llm.get("completion_texts_total", 0)) + int(
-            payload.get("completion_texts", 0)
-        )
-        reported_usage = payload.get("reported_usage")
-        if isinstance(reported_usage, dict) and reported_usage:
-            llm["reported_usage_calls"] = int(llm.get("reported_usage_calls", 0)) + 1
-            totals = llm.setdefault("reported_usage_totals", {})
-            for key, value in reported_usage.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    totals[key] = float(totals.get(key, 0.0)) + float(value)
-        else:
-            llm["reported_usage_missing_calls"] = int(
-                llm.get("reported_usage_missing_calls", 0)
-            ) + 1
-        return
-
-    if typ == "rate_limit_wait":
-        llm = summary.setdefault("llm", {})
-        llm["rate_limit_wait_sec_total"] = float(
-            llm.get("rate_limit_wait_sec_total", 0.0)
-        ) + float(payload.get("wait_sec", 0.0))
-        return
-
-    if typ == "evaluation_call":
-        ev = summary.setdefault("evaluation", {})
-        ev["calls_total"] = int(ev.get("calls_total", 0)) + 1
-        if payload.get("success"):
-            ev["success_total"] = int(ev.get("success_total", 0)) + 1
-        else:
-            ev["error_total"] = int(ev.get("error_total", 0)) + 1
-        ev["wall_time_sec_total"] = float(ev.get("wall_time_sec_total", 0.0)) + float(
-            payload.get("wall_time_sec", 0.0)
-        )
-        return
-
-    if typ == "iteration":
-        it = summary.setdefault("iteration", {})
-        it["calls_total"] = int(it.get("calls_total", 0)) + 1
-        if payload.get("success"):
-            it["success_total"] = int(it.get("success_total", 0)) + 1
-        else:
-            it["error_total"] = int(it.get("error_total", 0)) + 1
-        it["iteration_wall_time_sec_total"] = float(
-            it.get("iteration_wall_time_sec_total", 0.0)
-        ) + float(payload.get("iteration_wall_time_sec", 0.0))
-        it["prompt_build_sec_total"] = float(it.get("prompt_build_sec_total", 0.0)) + float(
-            payload.get("prompt_build_sec", 0.0)
-        )
-        it["llm_phase_sec_total"] = float(it.get("llm_phase_sec_total", 0.0)) + float(
-            payload.get("llm_phase_sec", 0.0)
-        )
-        it["code_phase_sec_total"] = float(it.get("code_phase_sec_total", 0.0)) + float(
-            payload.get("code_phase_sec", 0.0)
-        )
-        it["evaluation_phase_sec_total"] = float(
-            it.get("evaluation_phase_sec_total", 0.0)
-        ) + float(payload.get("evaluation_phase_sec", 0.0)
-        )
-        return
+    usage = payload.get("reported_usage") or {}
+    if not isinstance(usage, dict):
+        usage = {}
+    _ensure_iteration_csv_header_unlocked()
+    row = {
+        "ts": event.get("ts", ""),
+        "run_index": payload.get("run_index", ""),
+        "pid": event.get("pid", ""),
+        "iteration": payload.get("iteration", ""),
+        "success": int(bool(payload.get("success", False))),
+        "stage": payload.get("stage", ""),
+        "llm_elapsed_time_sec": float(payload.get("llm_phase_sec", 0.0) or 0.0),
+        "evaluation_elapsed_time_sec": float(payload.get("evaluation_phase_sec", 0.0) or 0.0),
+        "prompt_tokens": float(usage.get("prompt_tokens", 0.0) or 0.0),
+        "completion_tokens": float(usage.get("completion_tokens", 0.0) or 0.0),
+        "total_tokens": float(usage.get("total_tokens", 0.0) or 0.0),
+        "cached_tokens": float(
+            usage.get("cached_tokens", usage.get("input_tokens_details.cached_tokens", 0.0)) or 0.0
+        ),
+        "reasoning_tokens": float(
+            usage.get(
+                "reasoning_tokens",
+                usage.get("output_tokens_details.reasoning_tokens", 0.0),
+            )
+            or 0.0
+        ),
+        "combined_score": payload.get("combined_score", ""),
+        "qose_depth": payload.get("qose_depth", ""),
+        "qose_cnot": payload.get("qose_cnot", ""),
+        "qose_overhead": payload.get("qose_overhead", ""),
+        "avg_run_time": payload.get("avg_run_time", ""),
+        "error": payload.get("error", ""),
+    }
+    with open(_RUNTIME_ITERATION_CSV_PATH, "a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_RUNTIME_ITERATION_CSV_FIELDS)
+        writer.writerow(row)
 
 
 def _record_runtime_event(event_type: str, payload: dict) -> None:
     _init_runtime_tracking_paths()
     if not _RUNTIME_TRACKING_READY:
         return
+    payload = dict(payload or {})
     event = {
         "ts": _utc_now_iso(),
         "type": event_type,
         "pid": os.getpid(),
-        "payload": payload or {},
+        "payload": payload,
     }
-    os.makedirs(os.path.dirname(_RUNTIME_SUMMARY_PATH), exist_ok=True)
-    with open(_RUNTIME_LOCK_PATH, "a+", encoding="utf-8") as lockf:
-        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+    os.makedirs(os.path.dirname(_RUNTIME_ITERATION_CSV_PATH), exist_ok=True)
+    with open(_RUNTIME_ITERATION_CSV_PATH, "a+", encoding="utf-8", newline="") as csv_lockf:
+        fcntl.flock(csv_lockf.fileno(), fcntl.LOCK_EX)
         try:
-            summary = _read_runtime_summary_unlocked()
-            _apply_event_to_summary(summary, event)
-            _write_runtime_summary_unlocked(summary)
-            with open(_RUNTIME_EVENTS_PATH, "a", encoding="utf-8") as ef:
-                ef.write(json.dumps(event, sort_keys=True))
-                ef.write("\n")
+            if event_type == "run_start":
+                run_index = _next_run_index_unlocked()
+                payload["run_index"] = run_index
+                event["payload"] = payload
+                os.environ["OPENEVOLVE_RUNTIME_RUN_INDEX"] = str(run_index)
+            elif "run_index" not in payload:
+                run_index = os.getenv("OPENEVOLVE_RUNTIME_RUN_INDEX", "").strip()
+                if run_index:
+                    payload["run_index"] = run_index
+                    event["payload"] = payload
+            if event_type == "iteration":
+                _append_iteration_csv_unlocked(event)
         finally:
-            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(csv_lockf.fileno(), fcntl.LOCK_UN)
 
 
 def _get_inspiration_limit(config) -> int:
@@ -400,6 +327,7 @@ def _patched_run_iteration_worker(
         llm_phase_sec = 0.0
         code_phase_sec = 0.0
         eval_phase_sec = 0.0
+        iteration_reported_usage: dict[str, float] = {}
 
         programs = {
             pid: Program(**prog_dict)
@@ -449,6 +377,49 @@ def _patched_run_iteration_worker(
         llm_success = False
         eval_success = False
 
+        def _consume_worker_llm_usage() -> dict[str, float]:
+            usage_totals: dict[str, float] = {}
+            ensemble = getattr(process_parallel, "_worker_llm_ensemble", None)
+            for model in getattr(ensemble, "models", []) or []:
+                fields = getattr(model, "_oe_last_usage_fields", {}) or {}
+                if isinstance(fields, dict):
+                    for key, value in fields.items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            usage_totals[key] = float(usage_totals.get(key, 0.0)) + float(value)
+                setattr(model, "_oe_last_usage_fields", {})
+            return usage_totals
+
+        def _record_iteration_runtime(
+            success: bool,
+            stage: str = "",
+            error: str = "",
+            combined_score=None,
+            child_metrics: dict | None = None,
+        ) -> None:
+            payload = {
+                "success": bool(success),
+                "iteration": int(iteration),
+                "iteration_wall_time_sec": time.time() - iteration_start,
+                "prompt_build_sec": prompt_build_sec,
+                "llm_phase_sec": llm_phase_sec,
+                "code_phase_sec": code_phase_sec,
+                "evaluation_phase_sec": eval_phase_sec,
+                "reported_usage": dict(iteration_reported_usage),
+            }
+            if stage:
+                payload["stage"] = stage
+            if error:
+                payload["error"] = error
+            if combined_score is not None:
+                payload["combined_score"] = combined_score
+            if isinstance(child_metrics, dict):
+                for key in ("qose_depth", "qose_cnot", "qose_overhead", "avg_run_time"):
+                    if key in child_metrics:
+                        payload[key] = child_metrics.get(key)
+            _record_runtime_event("iteration", payload)
+
+        _consume_worker_llm_usage()
+
         try:
             t_llm = time.perf_counter()
             llm_response = asyncio.run(
@@ -459,26 +430,16 @@ def _patched_run_iteration_worker(
             )
             llm_phase_sec = time.perf_counter() - t_llm
             llm_success = True
+            iteration_reported_usage = _consume_worker_llm_usage()
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            _record_runtime_event(
-                "iteration",
-                {
-                    "success": False,
-                    "iteration": int(iteration),
-                    "stage": "llm",
-                    "iteration_wall_time_sec": time.time() - iteration_start,
-                    "prompt_build_sec": prompt_build_sec,
-                    "llm_phase_sec": llm_phase_sec,
-                    "code_phase_sec": code_phase_sec,
-                    "evaluation_phase_sec": eval_phase_sec,
-                },
-            )
+            _record_iteration_runtime(False, stage="llm", error=str(e))
             return process_parallel.SerializableResult(
                 error=f"LLM generation failed: {str(e)}", iteration=iteration
             )
 
         if llm_response is None:
+            _record_iteration_runtime(False, stage="llm_none")
             return process_parallel.SerializableResult(
                 error="LLM returned None response", iteration=iteration
             )
@@ -495,6 +456,7 @@ def _patched_run_iteration_worker(
                 llm_response, process_parallel._worker_config.diff_pattern
             )
             if not diff_blocks:
+                _record_iteration_runtime(False, stage="diff_parse")
                 return process_parallel.SerializableResult(
                     error="No valid diffs found in response", iteration=iteration
                 )
@@ -513,6 +475,7 @@ def _patched_run_iteration_worker(
             )
 
             if not new_code:
+                _record_iteration_runtime(False, stage="rewrite_parse")
                 return process_parallel.SerializableResult(
                     error="No valid code found in response", iteration=iteration
                 )
@@ -522,19 +485,7 @@ def _patched_run_iteration_worker(
         code_phase_sec = time.perf_counter() - t_code_phase
 
         if len(child_code) > process_parallel._worker_config.max_code_length:
-            _record_runtime_event(
-                "iteration",
-                {
-                    "success": False,
-                    "iteration": int(iteration),
-                    "stage": "length_check",
-                    "iteration_wall_time_sec": time.time() - iteration_start,
-                    "prompt_build_sec": prompt_build_sec,
-                    "llm_phase_sec": llm_phase_sec,
-                    "code_phase_sec": code_phase_sec,
-                    "evaluation_phase_sec": eval_phase_sec,
-                },
-            )
+            _record_iteration_runtime(False, stage="length_check")
             return process_parallel.SerializableResult(
                 error=(
                     "Generated code exceeds maximum length "
@@ -547,11 +498,18 @@ def _patched_run_iteration_worker(
 
         child_id = str(uuid.uuid4())
         t_eval = time.perf_counter()
-        child_metrics = asyncio.run(
-            process_parallel._worker_evaluator.evaluate_program(child_code, child_id)
-        )
+        try:
+            child_metrics = asyncio.run(
+                process_parallel._worker_evaluator.evaluate_program(child_code, child_id)
+            )
+            eval_success = True
+        except Exception as e:
+            eval_phase_sec = time.perf_counter() - t_eval
+            _record_iteration_runtime(False, stage="evaluation", error=str(e))
+            return process_parallel.SerializableResult(
+                error=f"Evaluation failed: {str(e)}", iteration=iteration
+            )
         eval_phase_sec = time.perf_counter() - t_eval
-        eval_success = True
 
         artifacts = process_parallel._worker_evaluator.get_pending_artifacts(child_id)
 
@@ -571,19 +529,10 @@ def _patched_run_iteration_worker(
         )
 
         iteration_time = time.time() - iteration_start
-        _record_runtime_event(
-            "iteration",
-            {
-                "success": True,
-                "iteration": int(iteration),
-                "llm_success": llm_success,
-                "eval_success": eval_success,
-                "iteration_wall_time_sec": iteration_time,
-                "prompt_build_sec": prompt_build_sec,
-                "llm_phase_sec": llm_phase_sec,
-                "code_phase_sec": code_phase_sec,
-                "evaluation_phase_sec": eval_phase_sec,
-            },
+        _record_iteration_runtime(
+            True,
+            combined_score=child_metrics.get("combined_score") if isinstance(child_metrics, dict) else None,
+            child_metrics=child_metrics if isinstance(child_metrics, dict) else None,
         )
 
         return process_parallel.SerializableResult(
@@ -597,15 +546,7 @@ def _patched_run_iteration_worker(
         )
     except Exception as e:
         logger.exception(f"Unexpected error in worker iteration: {e}")
-        _record_runtime_event(
-            "iteration",
-            {
-                "success": False,
-                "iteration": int(iteration),
-                "stage": "worker_exception",
-                "error": str(e),
-            },
-        )
+        _record_iteration_runtime(False, stage="worker_exception", error=str(e))
         return process_parallel.SerializableResult(
             error=f"Worker iteration error: {str(e)}", iteration=iteration
         )
