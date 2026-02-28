@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import csv
 import datetime
 import fcntl
@@ -473,11 +474,21 @@ def _patched_run_iteration_worker(
             new_code = parse_full_rewrite(
                 llm_response, process_parallel._worker_config.language
             )
+            if process_parallel._worker_config.language == "python" and isinstance(new_code, str):
+                new_code = _salvage_python_module_from_response(new_code)
 
             if not new_code:
                 _record_iteration_runtime(False, stage="rewrite_parse")
                 return process_parallel.SerializableResult(
                     error="No valid code found in response", iteration=iteration
+                )
+            if (
+                process_parallel._worker_config.language == "python"
+                and not _is_valid_python_module(new_code)
+            ):
+                _record_iteration_runtime(False, stage="rewrite_parse")
+                return process_parallel.SerializableResult(
+                    error="No valid Python module found in response", iteration=iteration
                 )
 
             child_code = new_code
@@ -595,6 +606,62 @@ def _extract_code_block(text: str) -> str:
     if match:
         return match.group(1).strip()
     return text
+
+
+def _is_valid_python_module(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+    try:
+        ast.parse(text)
+        return True
+    except SyntaxError:
+        return False
+
+
+def _looks_like_python_start(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped:
+        return False
+    prefixes = (
+        "import ",
+        "from ",
+        "def ",
+        "async def ",
+        "class ",
+        "@",
+        "#",
+        '"""',
+        "'''",
+        "if ",
+        "try:",
+        "with ",
+        "async with ",
+        "for ",
+        "async for ",
+        "while ",
+        "match ",
+        "case ",
+    )
+    return stripped.startswith(prefixes)
+
+
+def _salvage_python_module_from_response(text: str) -> str:
+    candidate = _extract_code_block(text).strip()
+    if _is_valid_python_module(candidate):
+        return candidate
+
+    lines = text.splitlines()
+    start_indices = [idx for idx, line in enumerate(lines) if _looks_like_python_start(line)]
+    if 0 not in start_indices:
+        start_indices.insert(0, 0)
+
+    for start in start_indices:
+        for end in range(len(lines), start, -1):
+            block = "\n".join(lines[start:end]).strip()
+            if _is_valid_python_module(block):
+                return block
+
+    return candidate
 
 
 def _flatten_message_content(content) -> str:
