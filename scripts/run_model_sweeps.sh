@@ -55,6 +55,8 @@ run_gemini() {
   output_dir="$(next_output_dir "$output_base")"
 
   OPENAI_API_KEY="$(tr -d '\r\n' < "$GEMINI_KEY_FILE")" \
+  GEMINI_RPM=0 \
+  OPENEVOLVE_RPM=0 \
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
@@ -69,7 +71,8 @@ run_gemini() {
 
 run_gpt() {
   local model="$1"
-  local output_base="$2"
+  local service_tier="$2"
+  local output_base="$3"
   local output_dir
   output_dir="$(next_output_dir "$output_base")"
 
@@ -77,9 +80,10 @@ run_gpt() {
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
+  QOSE_INCLUDE_EXAMPLE_CODE=1 \
   OPENEVOLVE_DIFF_BASED_EVOLUTION=0 \
   OPENAI_MODEL="$model" \
-  OPENAI_SERVICE_TIER=default \
+  OPENAI_SERVICE_TIER="$service_tier" \
   ./run_oe.sh gpt "$output_dir" \
     --iterations "$ITERATIONS" \
     --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
@@ -96,6 +100,7 @@ run_claude() {
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
+  QOSE_INCLUDE_EXAMPLE_CODE=1 \
   OPENEVOLVE_DIFF_BASED_EVOLUTION=0 \
   OPENAI_MODEL="$model" \
   ./run_oe.sh custom "$output_dir" \
@@ -104,16 +109,10 @@ run_claude() {
 }
 
 for sweep in $(seq 1 "$SWEEP_COUNT"); do
-  run_gemini "gemini-3-pro-preview" "low" "1" \
-    "openevolve_output/gem3pro_pws8_22q_seed_low_full"
-
-  run_gemini "gemini-3-flash-preview" "low" "1" \
-    "openevolve_output/gem3flash_pws8_22q_seed_low_full"
-
-  run_gpt "gpt-5-mini" \
+  run_gpt "gpt-5-mini" "flex" \
     "openevolve_output/gpt5mini_pws8_22q_full"
 
-  run_gpt "gpt-5.3-codex" \
+  run_gpt "gpt-5.3-codex" "default" \
     "openevolve_output/gpt53codex_pws8_22q_full"
 
   run_claude "claude-sonnet-4-6" \
@@ -121,4 +120,10 @@ for sweep in $(seq 1 "$SWEEP_COUNT"); do
 
   run_claude "claude-opus-4-6" \
     "openevolve_output/claude_opus46_pws8_22q_full"
+
+  run_gemini "gemini-3-pro-preview" "low" "1" \
+    "openevolve_output/gem3pro_pws8_22q_seed_low_full"
+
+  run_gemini "gemini-3-flash-preview" "low" "1" \
+    "openevolve_output/gem3flash_pws8_22q_seed_low_full"
 done
