@@ -65,6 +65,7 @@ Thumbs.db
 openaievolve/
 openevolve_output/
 evolve_archive/
+openevolve_ablation/
 
 # account files
 evaluation/save_ibm_account.py
