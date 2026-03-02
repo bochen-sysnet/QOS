@@ -14,6 +14,7 @@ from matplotlib.patches import Patch
 ROOT = Path(__file__).resolve().parent
 PLOT_DATA = ROOT / "plot_data"
 OUT_DIR = ROOT / "paper_figures"
+JOB_COUNTS_CSV = PLOT_DATA / "job_counts_strictdry.csv"
 
 METHOD_SPECS = [
     ("FrozenQubits", "FQ", "#4C78A8"),
@@ -89,6 +90,42 @@ def _collect_relative_fidelity(rows_by_backend: Dict[str, List[dict]]) -> Dict[i
                 val = _safe_float(row.get(field_map[method]))
                 if val is not None:
                     out[size][method].append(val)
+    return out
+
+
+def _collect_relative_quantum_overhead_from_jobs(job_rows: List[dict], selected_backends: Iterable[str]) -> Dict[int, Dict[str, List[float]]]:
+    out: Dict[int, Dict[str, List[float]]] = {size: {method: [] for method, _, _ in METHOD_SPECS} for size in SIZES}
+    backend_name_map = {
+        "torino": "Torino",
+        "marrakesh": "Marrakesh",
+    }
+    active_backends = {backend_name_map[b] for b in selected_backends}
+
+    for size in SIZES:
+        for backend in active_backends:
+            qiskit_by_bench: Dict[str, float] = {}
+            for row in job_rows:
+                if (
+                    row.get("backend") == backend
+                    and int(row.get("size", 0) or 0) == size
+                    and str(row.get("method", "")).strip() == "Qiskit"
+                ):
+                    qiskit_jobs = _safe_float(row.get("jobs"))
+                    if qiskit_jobs is not None and qiskit_jobs > 0:
+                        qiskit_by_bench[str(row.get("bench", "")).strip()] = qiskit_jobs
+            for method, _, _ in METHOD_SPECS:
+                for row in job_rows:
+                    if (
+                        row.get("backend") != backend
+                        or int(row.get("size", 0) or 0) != size
+                        or str(row.get("method", "")).strip() != method
+                    ):
+                        continue
+                    bench = str(row.get("bench", "")).strip()
+                    qiskit_jobs = qiskit_by_bench.get(bench)
+                    method_jobs = _safe_float(row.get("jobs"))
+                    if qiskit_jobs is not None and qiskit_jobs > 0 and method_jobs is not None:
+                        out[size][method].append(method_jobs / qiskit_jobs)
     return out
 
 
@@ -201,19 +238,21 @@ def main() -> None:
         backend: _read_rows(PLOT_DATA / f"timing_{backend}.csv")
         for backend in selected_backends
     }
+    job_rows = _read_rows(JOB_COUNTS_CSV)
 
     fidelity = _collect_relative_fidelity(sim_rows)
     timing = _collect_timing(timing_rows)
+    overhead = _collect_relative_quantum_overhead_from_jobs(job_rows, selected_backends)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(15.6, 4.2))
     _draw_grouped_boxplot(
         axes[0],
         fidelity,
         ylabel="Simulated Fidelity / Qiskit",
-        title="Relative Simulated Fidelity",
+        title="",
         use_log=True,
         label_mode="top",
     )
@@ -221,9 +260,17 @@ def main() -> None:
         axes[1],
         timing,
         ylabel="Mitigation Time (s)",
-        title="Absolute Mitigation Time",
+        title="",
         use_log=True,
         label_mode="side",
+    )
+    _draw_grouped_boxplot(
+        axes[2],
+        overhead,
+        ylabel="Quantum Overhead / Qiskit",
+        title="",
+        use_log=True,
+        label_mode="top",
     )
 
     legend_handles = [Patch(facecolor=color, edgecolor="black", alpha=0.78, label=label) for _, label, color in METHOD_SPECS]
