@@ -334,16 +334,15 @@ def build_fieldnames() -> List[str]:
     ]
 
 
-def build_paths(out_dir: str, out_csv: str | None) -> tuple[Path, Path, Path]:
+def build_paths(out_dir: str, out_csv: str | None) -> tuple[Path, Path]:
     root = Path(out_dir)
     data_dir = root / "data"
     fig_dir = root / "figures"
     data_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     csv_path = Path(out_csv) if out_csv else data_dir / "ibm_qpu_metrics.csv"
-    queue_plot_path = fig_dir / "pending_jobs_over_time.pdf"
-    latest_queue_plot_path = fig_dir / "pending_jobs_over_time.png"
-    return csv_path, queue_plot_path, latest_queue_plot_path
+    figure_path = fig_dir / "ibm_qpu_metrics_over_time.pdf"
+    return csv_path, figure_path
 
 
 def _import_matplotlib():
@@ -368,44 +367,76 @@ def _import_matplotlib():
     return plt, mdates
 
 
-def plot_pending_jobs(csv_path: Path, out_pdf: Path, out_png: Path) -> None:
+def plot_metrics_panels(csv_path: Path, out_pdf: Path) -> None:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return
 
-    rows_by_backend: Dict[str, list[tuple[datetime, float]]] = {}
+    metric_keys = [
+        ("pending_jobs", "Pending Jobs"),
+        ("median_2q_gate_error", "Median 2Q Gate Error"),
+        ("median_1q_gate_error", "Median 1Q Gate Error"),
+        ("median_readout_metric", "Median Readout Metric"),
+    ]
+    rows_by_backend: Dict[str, Dict[str, list[tuple[datetime, float]]]] = {}
     with csv_path.open(newline="") as f:
         for row in csv.DictReader(f):
             backend = str(row.get("backend_name", "")).strip()
             ts_raw = str(row.get("timestamp_utc", "")).strip()
-            jobs_raw = str(row.get("pending_jobs", "")).strip()
-            if not backend or not ts_raw or not jobs_raw:
+            if not backend or not ts_raw:
                 continue
             try:
                 ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                jobs = float(jobs_raw)
             except Exception:
                 continue
-            rows_by_backend.setdefault(backend, []).append((ts, jobs))
+            per_backend = rows_by_backend.setdefault(backend, {key: [] for key, _label in metric_keys})
+            for key, _label in metric_keys:
+                raw = str(row.get(key, "")).strip()
+                if not raw:
+                    continue
+                try:
+                    value = float(raw)
+                except Exception:
+                    continue
+                per_backend[key].append((ts, value))
 
     if not rows_by_backend:
         return
 
     plt, mdates = _import_matplotlib()
-    fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
-    for backend, points in sorted(rows_by_backend.items()):
-        points.sort(key=lambda item: item[0])
-        xs = [ts for ts, _jobs in points]
-        ys = [jobs for _ts, jobs in points]
-        ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4.5, label=backend)
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 7.2), constrained_layout=True)
+    axes = axes.flatten()
 
-    ax.set_xlabel("UTC Time")
-    ax.set_ylabel("Pending Jobs")
-    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d\n%H:%M", tz=timezone.utc))
-    ax.legend(loc="upper left", ncol=2, frameon=True)
+    backend_names = sorted(rows_by_backend)
+    cmap = plt.get_cmap("tab10")
+    colors = {backend: cmap(idx % 10) for idx, backend in enumerate(backend_names)}
+
+    for ax, (key, ylabel) in zip(axes, metric_keys):
+        for backend in backend_names:
+            points = rows_by_backend[backend].get(key, [])
+            if not points:
+                continue
+            points.sort(key=lambda item: item[0])
+            xs = [ts for ts, _value in points]
+            ys = [value for _ts, value in points]
+            ax.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.8,
+                markersize=4.5,
+                label=backend,
+                color=colors[backend],
+            )
+        ax.set_xlabel("UTC Time")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d\n%H:%M", tz=timezone.utc))
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=3, frameon=True)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_pdf)
-    fig.savefig(out_png, dpi=180)
     plt.close(fig)
 
 
@@ -428,7 +459,7 @@ def main() -> int:
     args = parse_args()
 
     service = QiskitRuntimeService()
-    csv_path, queue_plot_pdf, queue_plot_png = build_paths(args.out_dir, args.out or None)
+    csv_path, figure_pdf = build_paths(args.out_dir, args.out or None)
 
     if args.backends and len(args.backends) > 0:
         backend_names = list(args.backends)
@@ -440,6 +471,9 @@ def main() -> int:
     print(f"[ibm_qpu_logger] logging {len(backend_names)} backends every {args.interval}s to: {csv_path}")
     print(f"[ibm_qpu_logger] backends: {', '.join(backend_names)}")
     print("[ibm_qpu_logger] Press Ctrl+C to stop.")
+    if csv_path.exists():
+        plot_metrics_panels(csv_path, figure_pdf)
+        print(f"[ibm_qpu_logger] refreshed existing figure from: {csv_path}")
 
     iteration = 0
     while not STOP_REQUESTED:
@@ -466,7 +500,7 @@ def main() -> int:
                 )
 
         append_rows(str(csv_path), fieldnames, rows)
-        plot_pending_jobs(csv_path, queue_plot_pdf, queue_plot_png)
+        plot_metrics_panels(csv_path, figure_pdf)
 
         elapsed = time.time() - started
         print(f"[ibm_qpu_logger] wrote {len(rows)} rows (iter={iteration}) in {elapsed:.1f}s @ {utc_now_iso()}")
@@ -478,8 +512,10 @@ def main() -> int:
             time.sleep(step)
             remaining -= step
 
+    if csv_path.exists():
+        plot_metrics_panels(csv_path, figure_pdf)
     print(f"[ibm_qpu_logger] stopping; CSV saved at: {csv_path}")
-    print(f"[ibm_qpu_logger] queue plot saved at: {queue_plot_pdf}")
+    print(f"[ibm_qpu_logger] figure saved at: {figure_pdf}")
     return 0
 
 
