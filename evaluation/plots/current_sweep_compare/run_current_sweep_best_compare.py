@@ -37,6 +37,22 @@ MODEL_FAMILIES = [
     ("claude_opus46", "Claude Opus 4.6", "claude_opus46_pws8_22q_full_v"),
 ]
 
+# Official published token prices as checked on 2026-03-04.
+# Sources:
+# - Gemini Developer API pricing: https://ai.google.dev/pricing
+# - OpenAI API pricing: https://platform.openai.com/docs/pricing/
+# - Anthropic model pages:
+#   https://www.anthropic.com/claude/sonnet
+#   https://www.anthropic.com/claude/opus
+MODEL_PRICING_USD_PER_1M = {
+    "gem3pro": {"input": 2.00, "output": 12.00, "cached_input": 0.20},
+    "gem3flash": {"input": 0.50, "output": 3.00, "cached_input": 0.05},
+    "gpt5mini": {"input": 0.125, "output": 1.00, "cached_input": 0.0125},  # flex tier
+    "gpt53codex": {"input": 1.75, "output": 14.00, "cached_input": 0.175},  # standard tier
+    "claude_sonnet46": {"input": 3.00, "output": 15.00, "cached_input": 0.0},
+    "claude_opus46": {"input": 5.00, "output": 25.00, "cached_input": 0.0},
+}
+
 
 def _safe_float(value: Any, default: float = float("nan")) -> float:
     try:
@@ -479,6 +495,241 @@ def _plot_best_overall_across_sizes(
     plt.close(fig)
 
 
+def _load_runtime_summary_for_run(run_name: str) -> dict[str, float]:
+    runtime_csv = ROOT / "openevolve_output" / run_name / "runtime_metrics.iterations.csv"
+    if not runtime_csv.exists():
+        raise FileNotFoundError(f"Runtime metrics CSV not found for {run_name}: {runtime_csv}")
+
+    totals = {
+        "llm_elapsed_time_sec_total": 0.0,
+        "evaluation_elapsed_time_sec_total": 0.0,
+        "prompt_tokens_total": 0.0,
+        "completion_tokens_total": 0.0,
+        "total_tokens_total": 0.0,
+        "reasoning_tokens_total": 0.0,
+        "cached_tokens_total": 0.0,
+        "iterations_total": 0.0,
+    }
+
+    rows = _load_rows_csv(runtime_csv)
+    for row in rows:
+        totals["llm_elapsed_time_sec_total"] += max(
+            0.0, _safe_float(row.get("llm_elapsed_time_sec"), 0.0)
+        )
+        totals["evaluation_elapsed_time_sec_total"] += max(
+            0.0, _safe_float(row.get("evaluation_elapsed_time_sec"), 0.0)
+        )
+        totals["prompt_tokens_total"] += max(0.0, _safe_float(row.get("prompt_tokens"), 0.0))
+        totals["completion_tokens_total"] += max(
+            0.0, _safe_float(row.get("completion_tokens"), 0.0)
+        )
+        totals["total_tokens_total"] += max(0.0, _safe_float(row.get("total_tokens"), 0.0))
+        totals["reasoning_tokens_total"] += max(
+            0.0, _safe_float(row.get("reasoning_tokens"), 0.0)
+        )
+        totals["cached_tokens_total"] += max(0.0, _safe_float(row.get("cached_tokens"), 0.0))
+        totals["iterations_total"] += 1.0
+
+    totals["runtime_metrics_csv"] = str(runtime_csv)
+    return totals
+
+
+def _plot_runtime_breakdown(summary_rows: list[dict[str, Any]], out_pdf: Path) -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 15,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 14,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    labels = [str(row["display_name"]) for row in summary_rows]
+    llm = [max(0.0, _safe_float(row.get("llm_elapsed_time_sec_total"), 0.0)) for row in summary_rows]
+    eval_t = [
+        max(0.0, _safe_float(row.get("evaluation_elapsed_time_sec_total"), 0.0))
+        for row in summary_rows
+    ]
+    totals = [a + b for a, b in zip(llm, eval_t)]
+    x = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(11.5, 4.6), constrained_layout=True)
+    ax.bar(
+        x,
+        llm,
+        width=0.7,
+        label="LLM",
+        color="#4C72B0",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    ax.bar(
+        x,
+        eval_t,
+        width=0.7,
+        bottom=llm,
+        label="Evaluation",
+        color="#55A868",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    for xpos, total in zip(x, totals):
+        ax.text(xpos, total * 1.01 if total > 0 else 0.0, f"{total/3600.0:.2f}h", ha="center", va="bottom", fontsize=10)
+
+    ax.set_ylabel("Total Time (s)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="upper left", ncol=2, frameon=True)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
+def _plot_token_breakdown(summary_rows: list[dict[str, Any]], out_pdf: Path) -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 15,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 14,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    labels = [str(row["display_name"]) for row in summary_rows]
+    prompt = [max(0.0, _safe_float(row.get("prompt_tokens_total"), 0.0)) for row in summary_rows]
+    completion = [
+        max(0.0, _safe_float(row.get("completion_tokens_total"), 0.0)) for row in summary_rows
+    ]
+    totals = [a + b for a, b in zip(prompt, completion)]
+    x = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(11.5, 4.6), constrained_layout=True)
+    ax.bar(
+        x,
+        prompt,
+        width=0.7,
+        label="Prompt",
+        color="#DD8452",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    ax.bar(
+        x,
+        completion,
+        width=0.7,
+        bottom=prompt,
+        label="Completion",
+        color="#8172B3",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    for xpos, total in zip(x, totals):
+        ax.text(xpos, total * 1.01 if total > 0 else 0.0, f"{total/1000.0:.1f}k", ha="center", va="bottom", fontsize=10)
+
+    ax.set_ylabel("Total Tokens")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="upper left", ncol=2, frameon=True)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
+def _build_price_rows(runtime_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    price_rows: list[dict[str, Any]] = []
+    for row in runtime_rows:
+        family = str(row["family"])
+        price = MODEL_PRICING_USD_PER_1M[family]
+        prompt_tokens = max(0.0, _safe_float(row.get("prompt_tokens_total"), 0.0))
+        completion_tokens = max(0.0, _safe_float(row.get("completion_tokens_total"), 0.0))
+        cached_tokens = max(0.0, _safe_float(row.get("cached_tokens_total"), 0.0))
+        non_cached_prompt = max(0.0, prompt_tokens - cached_tokens)
+        prompt_cost = (
+            non_cached_prompt * price["input"] + cached_tokens * price["cached_input"]
+        ) / 1_000_000.0
+        completion_cost = (completion_tokens * price["output"]) / 1_000_000.0
+        total_cost = prompt_cost + completion_cost
+        price_rows.append(
+            {
+                "family": family,
+                "display_name": row["display_name"],
+                "run_name": row["run_name"],
+                "prompt_tokens_total": prompt_tokens,
+                "completion_tokens_total": completion_tokens,
+                "cached_tokens_total": cached_tokens,
+                "input_price_per_1m_usd": price["input"],
+                "cached_input_price_per_1m_usd": price["cached_input"],
+                "output_price_per_1m_usd": price["output"],
+                "prompt_cost_usd": prompt_cost,
+                "completion_cost_usd": completion_cost,
+                "total_cost_usd": total_cost,
+            }
+        )
+    return price_rows
+
+
+def _plot_price_breakdown(price_rows: list[dict[str, Any]], out_pdf: Path) -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 15,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 14,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    labels = [str(row["display_name"]) for row in price_rows]
+    prompt_cost = [max(0.0, _safe_float(row.get("prompt_cost_usd"), 0.0)) for row in price_rows]
+    completion_cost = [
+        max(0.0, _safe_float(row.get("completion_cost_usd"), 0.0)) for row in price_rows
+    ]
+    totals = [a + b for a, b in zip(prompt_cost, completion_cost)]
+    x = np.arange(len(labels))
+
+    fig, ax = plt.subplots(figsize=(11.5, 4.6), constrained_layout=True)
+    ax.bar(
+        x,
+        prompt_cost,
+        width=0.7,
+        label="Prompt/Input Cost",
+        color="#4C72B0",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    ax.bar(
+        x,
+        completion_cost,
+        width=0.7,
+        bottom=prompt_cost,
+        label="Completion/Output Cost",
+        color="#DD8452",
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    for xpos, total in zip(x, totals):
+        ax.text(xpos, total * 1.01 if total > 0 else 0.0, f"${total:.2f}", ha="center", va="bottom", fontsize=10)
+
+    ax.set_ylabel("Estimated Total Cost (USD)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="upper left", ncol=2, frameon=True)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -538,9 +789,18 @@ def main() -> None:
     print(f"[start] wrote selected models: {selected_models_csv}")
 
     summary_rows: list[dict[str, Any]] = []
+    runtime_rows: list[dict[str, Any]] = []
     for row in selected:
         program = Path(row["best_program"])
         run_name = row["run_name"]
+        runtime_rows.append(
+            {
+                "family": row["family"],
+                "display_name": row["display_name"],
+                "run_name": run_name,
+                **_load_runtime_summary_for_run(run_name),
+            }
+        )
         metrics_csv = SIZE_SWEEP_DIR / f"size_sweep_{run_name}_metrics.csv"
         if not args.skip_eval:
             metrics_csv = _evaluate_program_across_sizes(
@@ -552,7 +812,8 @@ def main() -> None:
                 force_recompute=args.force_recompute,
             )
         elif not metrics_csv.exists():
-            raise FileNotFoundError(f"Cached metrics not found for {run_name}: {metrics_csv}")
+            print(f"[skip] cached metrics not found for {run_name}: {metrics_csv}")
+            continue
 
         summary = _load_summary_from_metrics(metrics_csv, sizes)
         summary_rows.append(
@@ -585,40 +846,101 @@ def main() -> None:
         writer.writerows(summary_rows)
     print(f"[done] wrote summary: {summary_csv}")
 
-    fig_path = FIGURES_DIR / "current_sweep_best_compare.pdf"
-    _plot_summary(summary_rows, fig_path)
-    print(f"[done] wrote figure: {fig_path}")
+    if summary_rows:
+        fig_path = FIGURES_DIR / "current_sweep_best_compare.pdf"
+        _plot_summary(summary_rows, fig_path)
+        print(f"[done] wrote figure: {fig_path}")
 
-    best_overall = max(summary_rows, key=lambda row: _safe_float(row.get("combined_score"), float("-inf")))
-    best_overall_csv = DATA_DIR / "best_overall_selected.csv"
-    with best_overall_csv.open("w", newline="") as f:
+    runtime_summary_csv = DATA_DIR / "current_sweep_runtime_summary.csv"
+    with runtime_summary_csv.open("w", newline="") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=[
                 "family",
                 "display_name",
                 "run_name",
-                "metrics_csv",
-                "depth_ratio",
-                "cnot_ratio",
-                "time_ratio_mean",
-                "time_ratio_sum",
-                "combined_score",
+                "runtime_metrics_csv",
+                "iterations_total",
+                "llm_elapsed_time_sec_total",
+                "evaluation_elapsed_time_sec_total",
+                "prompt_tokens_total",
+                "completion_tokens_total",
+                "total_tokens_total",
+                "reasoning_tokens_total",
+                "cached_tokens_total",
             ],
         )
         writer.writeheader()
-        writer.writerow(best_overall)
-    print(f"[done] wrote best-overall selection: {best_overall_csv}")
+        writer.writerows(runtime_rows)
+    print(f"[done] wrote runtime summary: {runtime_summary_csv}")
 
-    best_overall_fig = FIGURES_DIR / "best_overall_across_sizes.pdf"
-    _plot_best_overall_across_sizes(
-        metrics_csv=Path(str(best_overall["metrics_csv"])),
-        display_name=str(best_overall["display_name"]),
-        run_name=str(best_overall["run_name"]),
-        sizes=sizes,
-        out_pdf=best_overall_fig,
-    )
-    print(f"[done] wrote figure: {best_overall_fig}")
+    runtime_fig = FIGURES_DIR / "current_sweep_runtime_breakdown.pdf"
+    _plot_runtime_breakdown(runtime_rows, runtime_fig)
+    print(f"[done] wrote figure: {runtime_fig}")
+
+    token_fig = FIGURES_DIR / "current_sweep_token_breakdown.pdf"
+    _plot_token_breakdown(runtime_rows, token_fig)
+    print(f"[done] wrote figure: {token_fig}")
+
+    price_rows = _build_price_rows(runtime_rows)
+    price_summary_csv = DATA_DIR / "current_sweep_price_summary.csv"
+    with price_summary_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "family",
+                "display_name",
+                "run_name",
+                "prompt_tokens_total",
+                "completion_tokens_total",
+                "cached_tokens_total",
+                "input_price_per_1m_usd",
+                "cached_input_price_per_1m_usd",
+                "output_price_per_1m_usd",
+                "prompt_cost_usd",
+                "completion_cost_usd",
+                "total_cost_usd",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(price_rows)
+    print(f"[done] wrote price summary: {price_summary_csv}")
+
+    price_fig = FIGURES_DIR / "current_sweep_price_breakdown.pdf"
+    _plot_price_breakdown(price_rows, price_fig)
+    print(f"[done] wrote figure: {price_fig}")
+
+    if summary_rows:
+        best_overall = max(summary_rows, key=lambda row: _safe_float(row.get("combined_score"), float("-inf")))
+        best_overall_csv = DATA_DIR / "best_overall_selected.csv"
+        with best_overall_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "family",
+                    "display_name",
+                    "run_name",
+                    "metrics_csv",
+                    "depth_ratio",
+                    "cnot_ratio",
+                    "time_ratio_mean",
+                    "time_ratio_sum",
+                    "combined_score",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(best_overall)
+        print(f"[done] wrote best-overall selection: {best_overall_csv}")
+
+        best_overall_fig = FIGURES_DIR / "best_overall_across_sizes.pdf"
+        _plot_best_overall_across_sizes(
+            metrics_csv=Path(str(best_overall["metrics_csv"])),
+            display_name=str(best_overall["display_name"]),
+            run_name=str(best_overall["run_name"]),
+            sizes=sizes,
+            out_pdf=best_overall_fig,
+        )
+        print(f"[done] wrote figure: {best_overall_fig}")
 
 
 if __name__ == "__main__":

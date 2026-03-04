@@ -349,7 +349,7 @@ run_once() {
   fi
 
   echo "Using target: $TARGET_PATH"
-  conda run -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
+  conda run --no-capture-output -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
     "$TARGET_PATH" \
     qos/error_mitigator/evaluator.py \
     --config "$CONFIG_PATH" \

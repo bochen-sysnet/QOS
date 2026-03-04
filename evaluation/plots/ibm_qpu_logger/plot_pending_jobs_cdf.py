@@ -70,6 +70,7 @@ def _plot_cdf(data: dict[str, list[float]], out_path: Path) -> None:
 
     ax.set_xlabel("Pending Jobs")
     ax.set_ylabel("CDF")
+    ax.set_xscale("symlog", linthresh=1.0)
     ax.set_ylim(0.0, 1.0)
     ax.grid(True, linestyle="--", alpha=0.35)
     ax.legend(loc="lower right", frameon=True)
