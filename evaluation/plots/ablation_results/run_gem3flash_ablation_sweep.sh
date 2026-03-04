@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$ROOT_DIR"
+
+SWEEP_COUNT="${SWEEP_COUNT:-1}"
+ITERATIONS="${ITERATIONS:-100}"
+NUM_TOP="${NUM_TOP:-3}"
+NUM_DIVERSE="${NUM_DIVERSE:-2}"
+NUM_INSPIRE="${NUM_INSPIRE:-3}"
+
+GEMINI_KEY_FILE="${GEMINI_KEY_FILE:-keys/gemini-ge0.key}"
+REFERENCE_FULL_PREFIX="${REFERENCE_FULL_PREFIX:-openevolve_output/gem3flash_pws8_22q_seed_low_full_v}"
+
+require_file() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    echo "Missing required file: $path" >&2
+    exit 1
+  fi
+}
+
+require_file "$GEMINI_KEY_FILE"
+
+latest_matching_dir() {
+  local prefix="$1"
+  local path best="" best_v=-1
+  shopt -s nullglob
+  for path in "${prefix}"*; do
+    [[ -d "$path" ]] || continue
+    if [[ "$path" =~ _v([0-9]+)$ ]]; then
+      local version="${BASH_REMATCH[1]}"
+      if (( version > best_v )); then
+        best="$path"
+        best_v="$version"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  if [[ -n "$best" ]]; then
+    echo "$best"
+  fi
+}
+
+next_output_dir() {
+  local base="$1"
+  local max_v=0
+  local path name suffix version
+  shopt -s nullglob
+  for path in "${base}"_v*; do
+    [[ -d "$path" ]] || continue
+    name="$(basename "$path")"
+    suffix="${name##*_v}"
+    if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+      version="$suffix"
+      if (( version > max_v )); then
+        max_v="$version"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  echo "${base}_v$((max_v + 1))"
+}
+
+run_variant() {
+  local variant_name="$1"
+  local include_example="$2"
+  local include_cases="$3"
+  local include_summary="$4"
+  local output_base="$5"
+  local output_dir
+  output_dir="$(next_output_dir "$output_base")"
+
+  echo "Running ${variant_name} -> ${output_dir}"
+
+  OPENAI_API_KEY="$(tr -d '\r\n' < "$GEMINI_KEY_FILE")" \
+  GEMINI_RPM=0 \
+  OPENEVOLVE_RPM=0 \
+  QOSE_SIZE_MIN=22 \
+  QOSE_SIZE_MAX=22 \
+  QOSE_SCORE_MODE=piecewise \
+  QOSE_INCLUDE_EXAMPLE_CODE="$include_example" \
+  QOSE_INCLUDE_CASES_ARTIFACT="$include_cases" \
+  QOSE_INCLUDE_SUMMARY_ARTIFACT="$include_summary" \
+  OPENAI_MODEL="gemini-3-flash-preview" \
+  OPENEVOLVE_GEMINI_THINKING_LEVEL=low \
+  OPENEVOLVE_DIFF_BASED_EVOLUTION=0 \
+  ./run_oe.sh gemini "$output_dir" \
+    --iterations "$ITERATIONS" \
+    --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
+}
+
+reference_full="$(latest_matching_dir "$REFERENCE_FULL_PREFIX")"
+if [[ -n "${reference_full:-}" ]]; then
+  echo "Reference full run: ${reference_full}"
+else
+  echo "Reference full run not found under prefix: ${REFERENCE_FULL_PREFIX}" >&2
+fi
+
+for sweep in $(seq 1 "$SWEEP_COUNT"); do
+  run_variant \
+    "full_without_seed" \
+    "0" "1" "1" \
+    "openevolve_ablation/gem3flash_pws8_22q_noseed_full"
+
+  run_variant \
+    "full_without_seed_no_cases" \
+    "0" "0" "1" \
+    "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases"
+
+  run_variant \
+    "full_without_seed_no_cases_no_summary" \
+    "0" "0" "0" \
+    "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases_no_summary"
+done
