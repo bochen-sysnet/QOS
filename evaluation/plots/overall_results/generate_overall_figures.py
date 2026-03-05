@@ -321,6 +321,172 @@ def _plot_qose_time_breakdown_aggregated(
     plt.close(fig)
 
 
+def _plot_qos_component_breakdown_12_24(
+    timing_torino_csv: Path,
+    timing_marrakesh_csv: Path,
+    out_pdf: Path,
+    sizes: List[int],
+) -> None:
+    """
+    QOS component breakdown (different components as different bars),
+    grouped by size (12q/24q), with log-scale y-axis, error bars, and value labels.
+    """
+    plt = fe._import_matplotlib()
+    np = fe.np
+
+    stage_skip = {"bench", "size", "method", "total", "overall", "simulation", "cost_search_calls"}
+    stage_alias = {"qaoa_analysis": "analysis"}
+    stage_order_pref = ["analysis", "qf", "gv", "wc", "qr", "cost_search"]
+    stage_label_map = {
+        "analysis": "Analysis",
+        "qf": "QF",
+        "gv": "GV",
+        "wc": "WC",
+        "qr": "QR",
+        "cost_search": "Search",
+    }
+
+    def _stage_values_merged(row: Dict[str, object]) -> Dict[str, float]:
+        merged_vals: Dict[str, float] = {}
+        for key, val in row.items():
+            if key in stage_skip:
+                continue
+            stage = stage_alias.get(key, key)
+            sec = max(fe._safe_float(val, 0.0), 0.0)
+            if sec <= 0.0:
+                continue
+            merged_vals[stage] = merged_vals.get(stage, 0.0) + sec
+        return merged_vals
+
+    timing_rows = fe._read_rows_csv(timing_torino_csv) + fe._read_rows_csv(timing_marrakesh_csv)
+    size_set = {int(s) for s in sizes}
+    stage_vals_by_size: Dict[int, Dict[str, List[float]]] = {int(s): {} for s in sizes}
+
+    for row in timing_rows:
+        if str(row.get("method", "")).strip() != "QOS":
+            continue
+        size = fe._safe_int(row.get("size", ""), -1)
+        if size not in size_set:
+            continue
+        merged = _stage_values_merged(row)
+        if not merged:
+            continue
+        for stage, sec in merged.items():
+            stage_vals_by_size[size].setdefault(stage, []).append(float(sec))
+
+    stage_set = set()
+    for s in size_set:
+        stage_set.update(stage_vals_by_size[s].keys())
+    stage_order = [s for s in stage_order_pref if s in stage_set] + sorted(stage_set - set(stage_order_pref))
+    if not stage_order:
+        stage_order = ["analysis"]
+
+    # Keep components with any signal across requested sizes.
+    keep_stages = []
+    for stage in stage_order:
+        has_signal = any(sum(stage_vals_by_size[int(sz)].get(stage, [])) > 0.0 for sz in sizes)
+        if has_signal:
+            keep_stages.append(stage)
+    stage_order = keep_stages if keep_stages else stage_order
+
+    means: Dict[int, List[float]] = {int(s): [] for s in sizes}
+    stds: Dict[int, List[float]] = {int(s): [] for s in sizes}
+    for sz in sizes:
+        sz = int(sz)
+        for stage in stage_order:
+            vals = stage_vals_by_size[sz].get(stage, [])
+            if vals:
+                means[sz].append(float(np.mean(vals)))
+                stds[sz].append(float(np.std(vals)))
+            else:
+                means[sz].append(0.0)
+                stds[sz].append(0.0)
+
+    plt.rcParams.update(
+        {
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 13,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    x = np.arange(len(stage_order))
+    width = 0.34
+    y_eps = 1e-4
+    fig, ax = plt.subplots(1, 1, figsize=(8.8, 4.4))
+
+    colors = {int(sizes[0]): "#4C78A8", int(sizes[1]): "#F58518"} if len(sizes) >= 2 else {int(sizes[0]): "#4C78A8"}
+    hatches = {int(sizes[0]): "///", int(sizes[1]): "\\\\\\",}
+
+    size_a = int(sizes[0])
+    vals_a = [max(v, y_eps) for v in means[size_a]]
+    err_a = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_a, stds[size_a])]
+    bars_a = ax.bar(
+        x - width / 2.0,
+        vals_a,
+        width=width,
+        yerr=err_a,
+        capsize=4,
+        color=colors[size_a],
+        edgecolor="black",
+        linewidth=0.7,
+        label=f"{size_a} qubit",
+    )
+    for b in bars_a:
+        b.set_hatch(hatches[size_a])
+
+    bars_b = []
+    if len(sizes) >= 2:
+        size_b = int(sizes[1])
+        vals_b = [max(v, y_eps) for v in means[size_b]]
+        err_b = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_b, stds[size_b])]
+        bars_b = ax.bar(
+            x + width / 2.0,
+            vals_b,
+            width=width,
+            yerr=err_b,
+            capsize=4,
+            color=colors[size_b],
+            edgecolor="black",
+            linewidth=0.7,
+            label=f"{size_b} qubit",
+        )
+        for b in bars_b:
+            b.set_hatch(hatches[size_b])
+
+    # Annotate mean value on top of each bar.
+    def _annotate(bar_container, raw_vals: List[float], err_vals: List[float]) -> None:
+        for bar, raw, err in zip(bar_container, raw_vals, err_vals):
+            shown = max(float(raw), y_eps)
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                max(shown + float(err), shown) * 1.08,
+                f"{float(raw):.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=10,
+            )
+
+    _annotate(bars_a, means[size_a], err_a)
+    if len(sizes) >= 2:
+        _annotate(bars_b, means[size_b], err_b)
+
+    stage_labels = [stage_label_map.get(s, s) for s in stage_order]
+    ax.set_xticks(x, stage_labels)
+    ax.set_ylabel("Time (s)")
+    ax.set_yscale("log")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(loc="upper left", frameon=True)
+
+    fig.tight_layout()
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -433,6 +599,12 @@ def main() -> None:
             out_dir / "panel_avg_jobs_per_bench.pdf",
             sizes=sizes,
         )
+        _plot_qos_component_breakdown_12_24(
+            timing_torino_csv=timing_torino,
+            timing_marrakesh_csv=timing_marrakesh,
+            out_pdf=out_dir / "qos_component_breakdown_12_24.pdf",
+            sizes=sizes,
+        )
         for p in brk_paths:
             if p.suffix.lower() == ".pdf" and "qose_time_breakdown" in p.name:
                 _unlink_if_exists(p)
@@ -452,6 +624,7 @@ def main() -> None:
         "qose_time_breakdown_torino_marrakesh.pdf",
         "mitigation_stage_breakdown_qos_qose.pdf",
         "panel_avg_jobs_per_bench.pdf",
+        "qos_component_breakdown_12_24.pdf",
     ]:
         path = out_dir / name
         print(path)

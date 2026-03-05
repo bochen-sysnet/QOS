@@ -238,20 +238,18 @@ def main() -> None:
         backend: _read_rows(PLOT_DATA / f"timing_{backend}.csv")
         for backend in selected_backends
     }
-    job_rows = _read_rows(JOB_COUNTS_CSV)
 
     fidelity = _collect_relative_fidelity(sim_rows)
     timing = _collect_timing(timing_rows)
-    overhead = _collect_relative_quantum_overhead_from_jobs(job_rows, selected_backends)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.6, 4.2))
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
     _draw_grouped_boxplot(
         axes[0],
         fidelity,
-        ylabel="Simulated Fidelity / Qiskit",
+        ylabel="Relative Fidelity",
         title="",
         use_log=True,
         label_mode="top",
@@ -264,25 +262,19 @@ def main() -> None:
         use_log=True,
         label_mode="side",
     )
-    _draw_grouped_boxplot(
-        axes[2],
-        overhead,
-        ylabel="Quantum Overhead / Qiskit",
-        title="",
-        use_log=True,
-        label_mode="top",
-    )
 
     legend_handles = [Patch(facecolor=color, edgecolor="black", alpha=0.78, label=label) for _, label, color in METHOD_SPECS]
-    fig.legend(
-        handles=legend_handles,
-        labels=[label for _, label, _ in METHOD_SPECS],
-        loc="upper center",
-        ncol=3,
-        frameon=False,
-        fontsize=14,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    legend_labels = [label for _, label, _ in METHOD_SPECS]
+    for ax in axes:
+        ax.legend(
+            handles=legend_handles,
+            labels=legend_labels,
+            loc="upper left",
+            ncol=1,
+            frameon=True,
+            fontsize=12,
+        )
+    fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(out_path)
