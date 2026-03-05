@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
 from pathlib import Path
 from typing import Iterable, List
@@ -116,6 +117,210 @@ def _plot_avg_jobs_from_strict_csv(csv_path: Path, out_pdf: Path, sizes: List[in
     plt.close(fig)
 
 
+def _plot_qose_time_breakdown_aggregated(
+    timing_torino_csv: Path,
+    timing_marrakesh_csv: Path,
+    job_torino_jsonl: Path,
+    job_marrakesh_jsonl: Path,
+    out_pdf: Path,
+    sizes: List[int],
+) -> None:
+    """
+    Aggregated (Torino + Marrakesh) QOSE per-job time breakdown in one bar figure.
+    Each qubit size has separate bars for:
+    - Mitigation
+    - Queue/Network
+    - QPU
+    """
+    plt = fe._import_matplotlib()
+    np = fe.np
+
+    backend_timing = {
+        "torino": fe._read_rows_csv(timing_torino_csv),
+        "marrakesh": fe._read_rows_csv(timing_marrakesh_csv),
+    }
+    backend_jobs = {
+        "torino": job_torino_jsonl,
+        "marrakesh": job_marrakesh_jsonl,
+    }
+
+    per_job_mit: list[float] = []
+    per_job_wait: list[float] = []
+    per_job_qpu: list[float] = []
+    per_job_mit_err: list[float] = []
+    per_job_wait_err: list[float] = []
+    per_job_qpu_err: list[float] = []
+    size_labels = [f"{int(s)} qubit" for s in sizes]
+
+    for size in sizes:
+        size = int(size)
+        mitigation_sum = 0.0
+        jobs = 0.0
+        wait_sum = 0.0
+        qpu_sum = 0.0
+        backend_m_vals: list[float] = []
+        backend_w_vals: list[float] = []
+        backend_q_vals: list[float] = []
+
+        for backend, rows in backend_timing.items():
+            mitigation_sum_b = 0.0
+            for r in rows:
+                if str(r.get("method", "")).strip() != "QOSE":
+                    continue
+                if int(r.get("size", 0) or 0) != size:
+                    continue
+                total = fe._safe_float(r.get("total"))
+                if total is not None:
+                    mitigation_sum += float(total)
+                    mitigation_sum_b += float(total)
+
+            jobs_b = 0.0
+            wait_sum_b = 0.0
+            qpu_sum_b = 0.0
+            with open(backend_jobs[backend], "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(rec.get("method", "")).strip() != "QOSE":
+                        continue
+                    if int(rec.get("size", 0) or 0) != size:
+                        continue
+                    elapsed = fe._safe_float(rec.get("elapsed_sec"), 0.0)
+                    qpu = fe._safe_float(rec.get("qpu_sec"), 0.0)
+                    wait = max(float(elapsed) - float(qpu), 0.0)
+                    jobs += 1.0
+                    jobs_b += 1.0
+                    wait_sum += wait
+                    wait_sum_b += wait
+                    qpu_sum += float(qpu)
+                    qpu_sum_b += float(qpu)
+
+            if jobs_b > 0:
+                backend_m_vals.append(mitigation_sum_b / jobs_b)
+                backend_w_vals.append(wait_sum_b / jobs_b)
+                backend_q_vals.append(qpu_sum_b / jobs_b)
+
+        if jobs > 0:
+            per_job_mit.append(mitigation_sum / jobs)
+            per_job_wait.append(wait_sum / jobs)
+            per_job_qpu.append(qpu_sum / jobs)
+        else:
+            per_job_mit.append(0.0)
+            per_job_wait.append(0.0)
+            per_job_qpu.append(0.0)
+
+        per_job_mit_err.append(float(np.std(backend_m_vals)) if len(backend_m_vals) >= 2 else 0.0)
+        per_job_wait_err.append(float(np.std(backend_w_vals)) if len(backend_w_vals) >= 2 else 0.0)
+        per_job_qpu_err.append(float(np.std(backend_q_vals)) if len(backend_q_vals) >= 2 else 0.0)
+
+    colors = {
+        "Mitigation": "#4C78A8",
+        "Queue/Network": "#F58518",
+        "QPU": "#54A24B",
+    }
+    x = np.arange(len(sizes))
+    width = 0.24
+    y_eps = 1e-3
+
+    plt.rcParams.update(
+        {
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "legend.fontsize": 14,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.2))
+
+    vals_m = [max(v, y_eps) for v in per_job_mit]
+    vals_w = [max(v, y_eps) for v in per_job_wait]
+    vals_q = [max(v, y_eps) for v in per_job_qpu]
+    err_m = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_m, per_job_mit_err)]
+    err_w = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_w, per_job_wait_err)]
+    err_q = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_q, per_job_qpu_err)]
+
+    b1 = ax.bar(
+        x - width,
+        vals_m,
+        width=width,
+        yerr=err_m,
+        capsize=4,
+        color=colors["Mitigation"],
+        edgecolor="black",
+        linewidth=0.7,
+    )
+    b2 = ax.bar(
+        x,
+        vals_w,
+        width=width,
+        yerr=err_w,
+        capsize=4,
+        color=colors["Queue/Network"],
+        edgecolor="black",
+        linewidth=0.7,
+    )
+    b3 = ax.bar(
+        x + width,
+        vals_q,
+        width=width,
+        yerr=err_q,
+        capsize=4,
+        color=colors["QPU"],
+        edgecolor="black",
+        linewidth=0.7,
+    )
+
+    for bar in b1:
+        bar.set_hatch("///")
+    for bar in b2:
+        bar.set_hatch("\\\\\\")
+    for bar in b3:
+        bar.set_hatch("xx")
+
+    def _annotate(container, raw_vals, err_vals):
+        for bar, raw, err in zip(container, raw_vals, err_vals):
+            shown = max(float(raw), y_eps)
+            label = f"{float(raw):.2f}" if float(raw) > 0 else "0"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                max(shown + float(err), shown) * 1.08,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=11,
+            )
+
+    _annotate(b1, per_job_mit, err_m)
+    _annotate(b2, per_job_wait, err_w)
+    _annotate(b3, per_job_qpu, err_q)
+
+    ax.set_xticks(x, size_labels)
+    ax.set_ylabel("Time (s)")
+    ax.set_yscale("log")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    fig.legend(
+        [b1[0], b2[0], b3[0]],
+        ["Mitigation", "Queue/Network", "QPU"],
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.01),
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -211,9 +416,13 @@ def main() -> None:
             primary_label="torino",
             secondary_label="marrakesh",
         )
-        _replace(
-            _pick_pdf(brk_paths, "qose_time_breakdown"),
-            out_dir / "qose_time_breakdown_torino_marrakesh.pdf",
+        _plot_qose_time_breakdown_aggregated(
+            timing_torino_csv=timing_torino,
+            timing_marrakesh_csv=timing_marrakesh,
+            job_torino_jsonl=job_torino,
+            job_marrakesh_jsonl=job_marrakesh,
+            out_pdf=out_dir / "qose_time_breakdown_torino_marrakesh.pdf",
+            sizes=sizes,
         )
         _replace(
             _pick_pdf(brk_paths, "mitigation_stage_breakdown_qos_qose"),
@@ -225,6 +434,8 @@ def main() -> None:
             sizes=sizes,
         )
         for p in brk_paths:
+            if p.suffix.lower() == ".pdf" and "qose_time_breakdown" in p.name:
+                _unlink_if_exists(p)
             if p.suffix.lower() == ".pdf" and "real_jobs_avg_per_bench" in p.name:
                 _unlink_if_exists(p)
             if p.suffix.lower() == ".csv":
