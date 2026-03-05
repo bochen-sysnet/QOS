@@ -487,6 +487,119 @@ def _plot_qos_component_breakdown_12_24(
     plt.close(fig)
 
 
+def _plot_mitigation_stage_breakdown_qos_qsa_24(
+    timing_torino_csv: Path,
+    timing_marrakesh_csv: Path,
+    out_pdf: Path,
+    size: int = 24,
+) -> None:
+    """
+    Single-bar mitigation breakdown per benchmark for QOS (left) and QSA (right),
+    where QSA is QOSE renamed in the plot. Only uses one qubit size (default: 24).
+    """
+    plt = fe._import_matplotlib()
+    np = fe.np
+
+    rows = fe._read_rows_csv(timing_torino_csv) + fe._read_rows_csv(timing_marrakesh_csv)
+    bench_order = [b for b, _ in fe.BENCHES]
+    method_map = {"QOS": "QOS", "QOSE": "QSA"}
+
+    stage_skip = {"bench", "size", "method", "overall", "simulation", "cost_search_calls"}
+
+    def _row_total(row: dict) -> float:
+        total = fe._safe_float(row.get("total"))
+        if total is not None and total > 0:
+            return float(total)
+        s = 0.0
+        for k, v in row.items():
+            if k in stage_skip:
+                continue
+            s += max(fe._safe_float(v, 0.0), 0.0)
+        return s
+
+    values: dict[str, dict[str, list[float]]] = {
+        "QOS": {b: [] for b in bench_order},
+        "QOSE": {b: [] for b in bench_order},
+    }
+
+    for r in rows:
+        method = str(r.get("method", "")).strip()
+        if method not in values:
+            continue
+        if fe._safe_int(r.get("size", -1), -1) != int(size):
+            continue
+        bench = str(r.get("bench", "")).strip()
+        if bench not in values[method]:
+            continue
+        t = _row_total(r)
+        if t > 0:
+            values[method][bench].append(t)
+
+    benches = [
+        b
+        for b in bench_order
+        if values["QOS"].get(b) or values["QOSE"].get(b)
+    ]
+    if not benches:
+        benches = bench_order
+
+    means = {
+        method: [
+            float(np.mean(values[method][b])) if values[method][b] else 0.0
+            for b in benches
+        ]
+        for method in ("QOS", "QOSE")
+    }
+
+    y_eps = 1e-4
+    x = np.arange(len(benches))
+    cmap = plt.get_cmap("tab10")
+    colors = [cmap(i % 10) for i in range(len(benches))]
+    hatches = ["///", "\\\\\\", "xxx", "...", "++", "--", "||", "oo", "**", "///"]
+    with plt.rc_context(
+        {
+            "font.size": 16,
+            "axes.labelsize": 18,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 15,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(13.6, 4.3), sharey=True)
+        for ax, method in zip(axes, ("QOS", "QOSE")):
+            vals = [max(v, y_eps) for v in means[method]]
+            bars = ax.bar(
+                x,
+                vals,
+                color=colors,
+                edgecolor="black",
+                linewidth=0.7,
+            )
+            for i, b in enumerate(bars):
+                b.set_hatch(hatches[i % len(hatches)])
+                raw = means[method][i]
+                y = max(raw, y_eps) * 1.08
+                ax.text(
+                    b.get_x() + b.get_width() / 2.0,
+                    y,
+                    f"{raw:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=11,
+                )
+
+            ax.set_title(method_map[method], fontsize=18)
+            ax.set_xticks(x, benches, rotation=32, ha="right")
+            ax.set_yscale("log")
+            ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+        axes[0].set_ylabel("Time (s)")
+        fig.tight_layout()
+        fig.savefig(out_pdf)
+        plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -590,9 +703,11 @@ def main() -> None:
             out_pdf=out_dir / "qose_time_breakdown_torino_marrakesh.pdf",
             sizes=sizes,
         )
-        _replace(
-            _pick_pdf(brk_paths, "mitigation_stage_breakdown_qos_qose"),
-            out_dir / "mitigation_stage_breakdown_qos_qose.pdf",
+        _plot_mitigation_stage_breakdown_qos_qsa_24(
+            timing_torino_csv=timing_torino,
+            timing_marrakesh_csv=timing_marrakesh,
+            out_pdf=out_dir / "mitigation_stage_breakdown_qos_qose.pdf",
+            size=24,
         )
         _plot_avg_jobs_from_strict_csv(
             job_counts_strictdry,
@@ -607,6 +722,8 @@ def main() -> None:
         )
         for p in brk_paths:
             if p.suffix.lower() == ".pdf" and "qose_time_breakdown" in p.name:
+                _unlink_if_exists(p)
+            if p.suffix.lower() == ".pdf" and "mitigation_stage_breakdown_qos_qose" in p.name:
                 _unlink_if_exists(p)
             if p.suffix.lower() == ".pdf" and "real_jobs_avg_per_bench" in p.name:
                 _unlink_if_exists(p)
