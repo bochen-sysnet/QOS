@@ -26,6 +26,7 @@ Environment variables (override defaults):
   RESUME_LATEST=1                 Resume from latest checkpoint under output_dir
   QOSE_INCLUDE_EXAMPLE_CODE       If true, injects example evolution code into prompt system message (default: 0)
   QOSE_EXAMPLE_CODE_PATH          Optional path for example code injection (default: qos/error_mitigator/evolution_seed.py)
+  QOSE_INCLUDE_LEVERS             If false, removes "POSSIBLE LEVERS TO EXPLORE" block from system prompt (default: 1)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
   OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high|auto (default: auto)
@@ -146,6 +147,7 @@ build_runtime_config() {
   local base_config_path="$1"
   local runtime_config_path="$2"
   local include_example_raw="${QOSE_INCLUDE_EXAMPLE_CODE:-0}"
+  local include_levers_raw="${QOSE_INCLUDE_LEVERS:-1}"
   local example_path="${QOSE_EXAMPLE_CODE_PATH:-qos/error_mitigator/evolution_seed.py}"
   local diff_mode_raw="${OPENEVOLVE_DIFF_BASED_EVOLUTION:-}"
 
@@ -197,6 +199,33 @@ patched = text[: match.start(2)] + new_body + text[match.end(2) :]
 runtime_cfg.write_text(patched, encoding="utf-8")
 PY
     fi
+  fi
+
+  if ! is_true "$include_levers_raw"; then
+    python3 - "$runtime_config_path" <<'PY'
+import sys
+from pathlib import Path
+
+cfg = Path(sys.argv[1])
+text = cfg.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+
+out = []
+skipping = False
+for line in lines:
+    if not skipping and line.startswith("    POSSIBLE LEVERS TO EXPLORE:"):
+        skipping = True
+        continue
+    if skipping:
+        # Keep skipping the lever bullets and trailing blank lines.
+        if line.startswith("      ") or line.strip() == "":
+            continue
+        # First non-lever line resumes normal copy.
+        skipping = False
+    out.append(line)
+
+cfg.write_text("".join(out), encoding="utf-8")
+PY
   fi
 
   if [[ -n "$diff_mode_raw" ]]; then
