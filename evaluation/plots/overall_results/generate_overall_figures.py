@@ -61,60 +61,63 @@ def _plot_avg_jobs_from_strict_csv(csv_path: Path, out_pdf: Path, sizes: List[in
     cmap_jobs = plt.get_cmap("tab10")
     y_eps = 1e-2
 
-    panel_specs = [("Torino", int(s)) for s in sizes] + [("Marrakesh", int(s)) for s in sizes]
-    fig, axes = plt.subplots(1, len(panel_specs), figsize=(5.5 * len(panel_specs), 4.6), squeeze=False)
+    panel_specs = [int(s) for s in sizes]
+    with plt.rc_context(
+        {
+            "font.size": 15,
+            "axes.labelsize": 18,
+            "xtick.labelsize": 14,
+            "ytick.labelsize": 14,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    ):
+        fig, axes = plt.subplots(1, len(panel_specs), figsize=(5.9 * len(panel_specs), 4.8), squeeze=False)
 
-    legend_handles = []
-    legend_labels: List[str] = []
-    for panel_idx, (backend, size) in enumerate(panel_specs):
-        ax = axes[0, panel_idx]
-        sub = [r for r in rows if str(r.get("backend", "")) == backend and int(r.get("size", 0)) == size]
-        methods = [m for m in method_priority if any(str(r.get("method", "")) == m for r in sub)]
-        x = np.arange(len(methods))
-        vals = []
-        for m in methods:
-            m_rows = [r for r in sub if str(r.get("method", "")) == m]
-            avg = fe._safe_float(m_rows[0].get("avg_jobs_per_bench_active"), 0.0) if m_rows else 0.0
-            vals.append(max(avg, y_eps))
-        colors = [cmap_jobs(i % 10) for i in range(len(methods))]
-        bars = ax.bar(x, vals, color=colors, edgecolor="black", linewidth=0.7)
-        for i, bar in enumerate(bars):
-            bar.set_hatch(hatch_patterns[i % len(hatch_patterns)])
-            if panel_idx == 0:
-                legend_handles.append(bar)
-                legend_labels.append(methods[i])
-            m_rows = [r for r in sub if str(r.get("method", "")) == methods[i]]
-            raw = fe._safe_float(m_rows[0].get("avg_jobs_per_bench_active"), 0.0) if m_rows else 0.0
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                max(vals[i], y_eps) * 1.08,
-                f"{raw:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
-        ax.set_title(f"{backend} - {size} qubits", fontsize=13)
-        ax.set_ylabel("Avg jobs per bench", fontsize=11)
-        ax.set_xticks(x)
-        ax.set_xticklabels(methods, rotation=32, ha="right", fontsize=9)
-        ax.tick_params(axis="y", labelsize=10)
-        ax.set_yscale("log")
-        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        for panel_idx, size in enumerate(panel_specs):
+            ax = axes[0, panel_idx]
+            sub = [r for r in rows if int(r.get("size", 0) or 0) == size]
+            methods = [m for m in method_priority if any(str(r.get("method", "")) == m for r in sub)]
+            x = np.arange(len(methods))
+            vals = []
+            for m in methods:
+                m_rows = [r for r in sub if str(r.get("method", "")) == m]
+                jobs_vals = [
+                    fe._safe_float(r.get("jobs"), 0.0)
+                    for r in m_rows
+                    if fe._safe_float(r.get("jobs"), 0.0) > 0.0
+                ]
+                avg = float(sum(jobs_vals) / len(jobs_vals)) if jobs_vals else 0.0
+                vals.append(max(avg, y_eps))
+            colors = [cmap_jobs(i % 10) for i in range(len(methods))]
+            bars = ax.bar(x, vals, color=colors, edgecolor="black", linewidth=0.7)
+            for i, bar in enumerate(bars):
+                bar.set_hatch(hatch_patterns[i % len(hatch_patterns)])
+                m_rows = [r for r in sub if str(r.get("method", "")) == methods[i]]
+                jobs_vals = [
+                    fe._safe_float(r.get("jobs"), 0.0)
+                    for r in m_rows
+                    if fe._safe_float(r.get("jobs"), 0.0) > 0.0
+                ]
+                raw = float(sum(jobs_vals) / len(jobs_vals)) if jobs_vals else 0.0
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    max(vals[i], y_eps) * 1.08,
+                    f"{raw:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                )
+            ax.set_title(f"{size} qubits", fontsize=17)
+            ax.set_ylabel("#Jobs Per Circuit")
+            ax.set_xticks(x)
+            ax.set_xticklabels(methods, rotation=32, ha="right")
+            ax.set_yscale("log")
+            ax.grid(axis="y", linestyle="--", alpha=0.3)
 
-    if legend_handles:
-        fig.legend(
-            legend_handles,
-            legend_labels,
-            ncol=max(1, len(legend_labels)),
-            fontsize=10,
-            loc="upper center",
-            frameon=False,
-        )
-        fig.tight_layout(rect=(0, 0, 1, 0.90))
-    else:
         fig.tight_layout()
-    fig.savefig(out_pdf)
-    plt.close(fig)
+        fig.savefig(out_pdf)
+        plt.close(fig)
 
 
 def _plot_qose_time_breakdown_aggregated(
@@ -126,11 +129,11 @@ def _plot_qose_time_breakdown_aggregated(
     sizes: List[int],
 ) -> None:
     """
-    Aggregated (Torino + Marrakesh) QOSE per-job time breakdown in one bar figure.
+    Aggregated (Torino + Marrakesh) QOSE time breakdown in one bar figure.
     Each qubit size has separate bars for:
-    - Mitigation
-    - Queue/Network
-    - QPU
+    - Mitigation (avg per bench)
+    - Queue/Network (avg per job)
+    - QPU (avg per job)
     """
     plt = fe._import_matplotlib()
     np = fe.np
@@ -144,10 +147,10 @@ def _plot_qose_time_breakdown_aggregated(
         "marrakesh": job_marrakesh_jsonl,
     }
 
-    per_job_mit: list[float] = []
+    per_bench_mit: list[float] = []
     per_job_wait: list[float] = []
     per_job_qpu: list[float] = []
-    per_job_mit_err: list[float] = []
+    per_bench_mit_err: list[float] = []
     per_job_wait_err: list[float] = []
     per_job_qpu_err: list[float] = []
     size_labels = [f"{int(s)} qubit" for s in sizes]
@@ -155,6 +158,7 @@ def _plot_qose_time_breakdown_aggregated(
     for size in sizes:
         size = int(size)
         mitigation_sum = 0.0
+        benches_total = 0.0
         jobs = 0.0
         wait_sum = 0.0
         qpu_sum = 0.0
@@ -164,6 +168,7 @@ def _plot_qose_time_breakdown_aggregated(
 
         for backend, rows in backend_timing.items():
             mitigation_sum_b = 0.0
+            bench_seen_b: set[str] = set()
             for r in rows:
                 if str(r.get("method", "")).strip() != "QOSE":
                     continue
@@ -173,6 +178,9 @@ def _plot_qose_time_breakdown_aggregated(
                 if total is not None:
                     mitigation_sum += float(total)
                     mitigation_sum_b += float(total)
+                bench = str(r.get("bench", "")).strip()
+                if bench:
+                    bench_seen_b.add(bench)
 
             jobs_b = 0.0
             wait_sum_b = 0.0
@@ -201,20 +209,25 @@ def _plot_qose_time_breakdown_aggregated(
                     qpu_sum_b += float(qpu)
 
             if jobs_b > 0:
-                backend_m_vals.append(mitigation_sum_b / jobs_b)
+                bench_count_b = float(len(bench_seen_b))
+                benches_total += bench_count_b
+                backend_m_vals.append(mitigation_sum_b / bench_count_b if bench_count_b > 0 else 0.0)
                 backend_w_vals.append(wait_sum_b / jobs_b)
                 backend_q_vals.append(qpu_sum_b / jobs_b)
 
+        if benches_total > 0:
+            per_bench_mit.append(mitigation_sum / benches_total)
+        else:
+            per_bench_mit.append(0.0)
+
         if jobs > 0:
-            per_job_mit.append(mitigation_sum / jobs)
             per_job_wait.append(wait_sum / jobs)
             per_job_qpu.append(qpu_sum / jobs)
         else:
-            per_job_mit.append(0.0)
             per_job_wait.append(0.0)
             per_job_qpu.append(0.0)
 
-        per_job_mit_err.append(float(np.std(backend_m_vals)) if len(backend_m_vals) >= 2 else 0.0)
+        per_bench_mit_err.append(float(np.std(backend_m_vals)) if len(backend_m_vals) >= 2 else 0.0)
         per_job_wait_err.append(float(np.std(backend_w_vals)) if len(backend_w_vals) >= 2 else 0.0)
         per_job_qpu_err.append(float(np.std(backend_q_vals)) if len(backend_q_vals) >= 2 else 0.0)
 
@@ -241,10 +254,10 @@ def _plot_qose_time_breakdown_aggregated(
 
     fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.2))
 
-    vals_m = [max(v, y_eps) for v in per_job_mit]
+    vals_m = [max(v, y_eps) for v in per_bench_mit]
     vals_w = [max(v, y_eps) for v in per_job_wait]
     vals_q = [max(v, y_eps) for v in per_job_qpu]
-    err_m = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_m, per_job_mit_err)]
+    err_m = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_m, per_bench_mit_err)]
     err_w = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_w, per_job_wait_err)]
     err_q = [min(max(e, 0.0), max(v * 0.8, 0.0)) for v, e in zip(vals_q, per_job_qpu_err)]
 
@@ -299,7 +312,7 @@ def _plot_qose_time_breakdown_aggregated(
                 fontsize=11,
             )
 
-    _annotate(b1, per_job_mit, err_m)
+    _annotate(b1, per_bench_mit, err_m)
     _annotate(b2, per_job_wait, err_w)
     _annotate(b3, per_job_qpu, err_q)
 
