@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT_DIR"
 
-SWEEP_COUNT="${SWEEP_COUNT:-1}"
+# Total number of sweeps to keep per variant (including existing runs).
+# Backward-compatible: SWEEP_COUNT can still be used.
+TARGET_TOTAL_SWEEPS="${TARGET_TOTAL_SWEEPS:-${SWEEP_COUNT:-3}}"
 ITERATIONS="${ITERATIONS:-100}"
 NUM_TOP="${NUM_TOP:-3}"
 NUM_DIVERSE="${NUM_DIVERSE:-2}"
@@ -63,6 +65,26 @@ next_output_dir() {
   echo "${base}_v$((max_v + 1))"
 }
 
+latest_version_num() {
+  local base="$1"
+  local max_v=0
+  local path name suffix version
+  shopt -s nullglob
+  for path in "${base}"_v*; do
+    [[ -d "$path" ]] || continue
+    name="$(basename "$path")"
+    suffix="${name##*_v}"
+    if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+      version="$suffix"
+      if (( version > max_v )); then
+        max_v="$version"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  echo "$max_v"
+}
+
 run_variant() {
   local variant_name="$1"
   local include_example="$2"
@@ -86,9 +108,28 @@ run_variant() {
   OPENAI_MODEL="gemini-3-flash-preview" \
   OPENEVOLVE_GEMINI_THINKING_LEVEL=low \
   OPENEVOLVE_DIFF_BASED_EVOLUTION=0 \
-  ./run_oe.sh gemini "$output_dir" \
+  bash ./run_oe.sh gemini "$output_dir" \
     --iterations "$ITERATIONS" \
     --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
+}
+
+run_variant_for_round() {
+  local round="$1"
+  local variant_name="$2"
+  local include_example="$3"
+  local include_cases="$4"
+  local include_summary="$5"
+  local output_base="$6"
+  local existing
+  existing="$(latest_version_num "$output_base")"
+
+  if (( existing >= round )); then
+    echo "Round ${round}: skip ${variant_name} (already has v${existing})"
+    return 0
+  fi
+
+  echo "Round ${round}: run ${variant_name} (current=v${existing}, target round=v${round})"
+  run_variant "$variant_name" "$include_example" "$include_cases" "$include_summary" "$output_base"
 }
 
 reference_full="$(latest_matching_dir "$REFERENCE_FULL_PREFIX")"
@@ -98,19 +139,24 @@ else
   echo "Reference full run not found under prefix: ${REFERENCE_FULL_PREFIX}" >&2
 fi
 
-for sweep in $(seq 1 "$SWEEP_COUNT"); do
-  run_variant \
-    "full_without_seed" \
+for round in $(seq 1 "$TARGET_TOTAL_SWEEPS"); do
+  # Required execution order per round:
+  # 111 -> 110 -> 100
+  run_variant_for_round \
+    "$round" \
+    "111_full_without_seed" \
     "0" "1" "1" \
     "openevolve_ablation/gem3flash_pws8_22q_noseed_full"
 
-  run_variant \
-    "full_without_seed_no_cases" \
+  run_variant_for_round \
+    "$round" \
+    "110_full_without_seed_no_cases" \
     "0" "0" "1" \
     "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases"
 
-  run_variant \
-    "full_without_seed_no_cases_no_summary" \
+  run_variant_for_round \
+    "$round" \
+    "100_full_without_seed_no_cases_no_summary" \
     "0" "0" "0" \
     "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases_no_summary"
 done
