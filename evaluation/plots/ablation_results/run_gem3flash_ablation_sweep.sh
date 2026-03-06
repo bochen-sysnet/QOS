@@ -65,6 +65,20 @@ next_output_dir() {
   echo "${base}_v$((max_v + 1))"
 }
 
+version_output_dir() {
+  local base="$1"
+  local round="$2"
+  echo "${base}_v${round}"
+}
+
+version_completed() {
+  local base="$1"
+  local round="$2"
+  local out_dir
+  out_dir="$(version_output_dir "$base" "$round")"
+  [[ -f "$out_dir/best/best_program_info.json" ]]
+}
+
 latest_version_num() {
   local base="$1"
   local max_v=0
@@ -90,15 +104,19 @@ run_variant() {
   local include_example="$2"
   local include_cases="$3"
   local include_summary="$4"
-  local output_base="$5"
-  local output_dir
-  output_dir="$(next_output_dir "$output_base")"
+  local output_dir="$5"
 
   echo "Running ${variant_name} -> ${output_dir}"
+
+  local resume_latest="0"
+  if [[ -d "$output_dir/checkpoints" ]]; then
+    resume_latest="1"
+  fi
 
   OPENAI_API_KEY="$(tr -d '\r\n' < "$GEMINI_KEY_FILE")" \
   GEMINI_RPM=0 \
   OPENEVOLVE_RPM=0 \
+  RESUME_LATEST="$resume_latest" \
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
@@ -120,16 +138,16 @@ run_variant_for_round() {
   local include_cases="$4"
   local include_summary="$5"
   local output_base="$6"
-  local existing
-  existing="$(latest_version_num "$output_base")"
+  local output_dir
+  output_dir="$(version_output_dir "$output_base" "$round")"
 
-  if (( existing >= round )); then
-    echo "Round ${round}: skip ${variant_name} (already has v${existing})"
+  if version_completed "$output_base" "$round"; then
+    echo "Round ${round}: skip ${variant_name} (completed: ${output_dir})"
     return 0
   fi
 
-  echo "Round ${round}: run ${variant_name} (current=v${existing}, target round=v${round})"
-  run_variant "$variant_name" "$include_example" "$include_cases" "$include_summary" "$output_base"
+  echo "Round ${round}: run ${variant_name} -> ${output_dir}"
+  run_variant "$variant_name" "$include_example" "$include_cases" "$include_summary" "$output_dir"
 }
 
 reference_full="$(latest_matching_dir "$REFERENCE_FULL_PREFIX")"

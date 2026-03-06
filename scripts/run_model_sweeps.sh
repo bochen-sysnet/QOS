@@ -46,6 +46,26 @@ next_output_dir() {
   echo "${base}_v$((max_v + 1))"
 }
 
+latest_version_num() {
+  local base="$1"
+  local max_v=0
+  local path name suffix version
+  shopt -s nullglob
+  for path in "${base}"_v*; do
+    [[ -d "$path" ]] || continue
+    name="$(basename "$path")"
+    suffix="${name##*_v}"
+    if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+      version="$suffix"
+      if (( version > max_v )); then
+        max_v="$version"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  echo "$max_v"
+}
+
 run_gemini() {
   local model="$1"
   local thinking="$2"
@@ -69,6 +89,22 @@ run_gemini() {
     --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
 }
 
+run_gemini_for_round() {
+  local round="$1"
+  local model="$2"
+  local thinking="$3"
+  local include_example="$4"
+  local output_base="$5"
+  local existing
+  existing="$(latest_version_num "$output_base")"
+  if (( existing >= round )); then
+    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+    return 0
+  fi
+  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
+  run_gemini "$model" "$thinking" "$include_example" "$output_base"
+}
+
 run_gpt() {
   local model="$1"
   local service_tier="$2"
@@ -87,6 +123,21 @@ run_gpt() {
   ./run_oe.sh gpt "$output_dir" \
     --iterations "$ITERATIONS" \
     --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
+}
+
+run_gpt_for_round() {
+  local round="$1"
+  local model="$2"
+  local service_tier="$3"
+  local output_base="$4"
+  local existing
+  existing="$(latest_version_num "$output_base")"
+  if (( existing >= round )); then
+    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+    return 0
+  fi
+  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
+  run_gpt "$model" "$service_tier" "$output_base"
 }
 
 run_claude() {
@@ -108,22 +159,38 @@ run_claude() {
     --num-top "$NUM_TOP" --num-diverse "$NUM_DIVERSE" --num-inspire "$NUM_INSPIRE"
 }
 
-for sweep in $(seq 1 "$SWEEP_COUNT"); do
-  run_gpt "gpt-5-mini" "flex" \
+run_claude_for_round() {
+  local round="$1"
+  local model="$2"
+  local output_base="$3"
+  local existing
+  existing="$(latest_version_num "$output_base")"
+  if (( existing >= round )); then
+    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+    return 0
+  fi
+  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
+  run_claude "$model" "$output_base"
+}
+
+for round in $(seq 1 "$SWEEP_COUNT"); do
+  # Fixed order per round:
+  # gpt5mini -> gpt53codex -> claude sonnet -> claude opus -> gemini pro -> gemini flash
+  run_gpt_for_round "$round" "gpt-5-mini" "flex" \
     "openevolve_output/gpt5mini_pws8_22q_full"
 
-  run_gpt "gpt-5.3-codex" "default" \
+  run_gpt_for_round "$round" "gpt-5.3-codex" "default" \
     "openevolve_output/gpt53codex_pws8_22q_full"
 
-  run_claude "claude-sonnet-4-6" \
+  run_claude_for_round "$round" "claude-sonnet-4-6" \
     "openevolve_output/claude_sonnet46_pws8_22q_full"
 
-  run_claude "claude-opus-4-6" \
+  run_claude_for_round "$round" "claude-opus-4-6" \
     "openevolve_output/claude_opus46_pws8_22q_full"
 
-  run_gemini "gemini-3-pro-preview" "low" "1" \
+  run_gemini_for_round "$round" "gemini-3-pro-preview" "low" "1" \
     "openevolve_output/gem3pro_pws8_22q_seed_low_full"
 
-  run_gemini "gemini-3-flash-preview" "low" "1" \
+  run_gemini_for_round "$round" "gemini-3-flash-preview" "low" "1" \
     "openevolve_output/gem3flash_pws8_22q_seed_low_full"
 done

@@ -378,12 +378,15 @@ run_once() {
   fi
 
   echo "Using target: $TARGET_PATH"
-  conda run --no-capture-output -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited \
-    "$TARGET_PATH" \
-    qos/error_mitigator/evaluator.py \
-    --config "$CONFIG_PATH" \
-    --output "$OUTPUT_DIR" \
-    "${run_args[@]}"
+  local -a cmd=(
+    conda run --no-capture-output -n quantum python -m qos.error_mitigator.run_openevolve_rate_limited
+    "$TARGET_PATH"
+    qos/error_mitigator/evaluator.py
+    --config "$CONFIG_PATH"
+    --output "$OUTPUT_DIR"
+  )
+  cmd+=("${run_args[@]}")
+  "${cmd[@]}"
 }
 
 if [[ "$PROFILE" == "gemini" && "$REPEAT" -gt 1 ]]; then
