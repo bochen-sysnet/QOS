@@ -21,6 +21,7 @@ FIGURES_DIR = OUT_DIR / "figures"
 
 OUTPUT_ROOT = ROOT / "openevolve_output"
 ABLATION_ROOT = ROOT / "openevolve_ablation"
+ABLATION_THINKING_ROOT = ABLATION_ROOT / "thinking"
 
 # Keep same figure size as plot_gem3flash_seed_diff_full_compare.py
 FIGSIZE = (6.6, 4.3)
@@ -91,11 +92,16 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def _collect_series_rows(series_specs: list[tuple[str, Path, str]]) -> list[dict]:
+def _collect_series_rows(series_specs: list[tuple[str, list[Path], str]]) -> list[dict]:
     rows: list[dict] = []
-    for label, root, prefix in series_specs:
-        version_dirs = _list_version_dirs(root, prefix)
-        for version, run_dir in sorted(version_dirs.items()):
+    for label, roots, prefix in series_specs:
+        # Prefer the first root in `roots` when the same version exists in multiple roots.
+        versions: dict[int, Path] = {}
+        for root in roots:
+            version_dirs = _list_version_dirs(root, prefix)
+            for version in sorted(version_dirs.keys()):
+                versions.setdefault(version, version_dirs[version])
+        for version, run_dir in sorted(versions.items()):
             score, source = _read_combined_score_with_fallback(run_dir)
             rows.append(
                 {
@@ -228,10 +234,10 @@ def main() -> None:
 
     # Figure 1: Ablation variants aggregated across all available versions.
     ablation_specs = [
-        ("111", OUTPUT_ROOT, "gem3flash_pws8_22q_seed_low_full_v"),
-        ("011", ABLATION_ROOT, "gem3flash_pws8_22q_noseed_full_v"),
-        ("001", ABLATION_ROOT, "gem3flash_pws8_22q_noseed_no_cases_v"),
-        ("000", ABLATION_ROOT, "gem3flash_pws8_22q_noseed_no_cases_no_summary_v"),
+        ("111", [OUTPUT_ROOT], "gem3flash_pws8_22q_seed_low_full_v"),
+        ("011", [ABLATION_ROOT], "gem3flash_pws8_22q_noseed_full_v"),
+        ("001", [ABLATION_ROOT], "gem3flash_pws8_22q_noseed_no_cases_v"),
+        ("000", [ABLATION_ROOT], "gem3flash_pws8_22q_noseed_no_cases_no_summary_v"),
     ]
     ablation_order = [s[0] for s in ablation_specs]
     ablation_rows = _collect_series_rows(ablation_specs)
@@ -253,9 +259,9 @@ def main() -> None:
 
     # Figure 2: Thinking levels aggregated across all available versions.
     thinking_specs = [
-        ("Low (Original)", OUTPUT_ROOT, "gem3flash_pws8_22q_seed_low_full_v"),
-        ("Medium", ABLATION_ROOT, "gem3flash_pws8_22q_seed_medium_full_v"),
-        ("High", ABLATION_ROOT, "gem3flash_pws8_22q_seed_high_full_v"),
+        ("Low (Original)", [OUTPUT_ROOT], "gem3flash_pws8_22q_seed_low_full_v"),
+        ("Medium", [ABLATION_THINKING_ROOT, ABLATION_ROOT], "gem3flash_pws8_22q_seed_medium_full_v"),
+        ("High", [ABLATION_THINKING_ROOT, ABLATION_ROOT], "gem3flash_pws8_22q_seed_high_full_v"),
     ]
     thinking_order = [s[0] for s in thinking_specs]
     thinking_rows = _collect_series_rows(thinking_specs)

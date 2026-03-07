@@ -46,6 +46,20 @@ next_output_dir() {
   echo "${base}_v$((max_v + 1))"
 }
 
+version_output_dir() {
+  local base="$1"
+  local round="$2"
+  echo "${base}_v${round}"
+}
+
+version_completed() {
+  local base="$1"
+  local round="$2"
+  local out_dir
+  out_dir="$(version_output_dir "$base" "$round")"
+  [[ -f "$out_dir/best/best_program_info.json" ]]
+}
+
 latest_version_num() {
   local base="$1"
   local max_v=0
@@ -70,13 +84,13 @@ run_gemini() {
   local model="$1"
   local thinking="$2"
   local include_example="$3"
-  local output_base="$4"
-  local output_dir
-  output_dir="$(next_output_dir "$output_base")"
+  local output_dir="$4"
+  local resume_latest="${5:-0}"
 
   OPENAI_API_KEY="$(tr -d '\r\n' < "$GEMINI_KEY_FILE")" \
   GEMINI_RPM=0 \
   OPENEVOLVE_RPM=0 \
+  RESUME_LATEST="$resume_latest" \
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
@@ -95,24 +109,30 @@ run_gemini_for_round() {
   local thinking="$3"
   local include_example="$4"
   local output_base="$5"
-  local existing
-  existing="$(latest_version_num "$output_base")"
-  if (( existing >= round )); then
-    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+  local output_dir
+  output_dir="$(version_output_dir "$output_base" "$round")"
+  if version_completed "$output_base" "$round"; then
+    echo "Round ${round}: skip ${output_base} (completed: ${output_dir})"
     return 0
   fi
-  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
-  run_gemini "$model" "$thinking" "$include_example" "$output_base"
+  local resume_latest="0"
+  if [[ -d "$output_dir/checkpoints" ]]; then
+    resume_latest="1"
+    echo "Round ${round}: resume ${output_base} at ${output_dir}"
+  else
+    echo "Round ${round}: run ${output_base} -> ${output_dir}"
+  fi
+  run_gemini "$model" "$thinking" "$include_example" "$output_dir" "$resume_latest"
 }
 
 run_gpt() {
   local model="$1"
   local service_tier="$2"
-  local output_base="$3"
-  local output_dir
-  output_dir="$(next_output_dir "$output_base")"
+  local output_dir="$3"
+  local resume_latest="${4:-0}"
 
   OPENAI_API_KEY="$(tr -d '\r\n' < "$OPENAI_KEY_FILE")" \
+  RESUME_LATEST="$resume_latest" \
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
@@ -130,24 +150,30 @@ run_gpt_for_round() {
   local model="$2"
   local service_tier="$3"
   local output_base="$4"
-  local existing
-  existing="$(latest_version_num "$output_base")"
-  if (( existing >= round )); then
-    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+  local output_dir
+  output_dir="$(version_output_dir "$output_base" "$round")"
+  if version_completed "$output_base" "$round"; then
+    echo "Round ${round}: skip ${output_base} (completed: ${output_dir})"
     return 0
   fi
-  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
-  run_gpt "$model" "$service_tier" "$output_base"
+  local resume_latest="0"
+  if [[ -d "$output_dir/checkpoints" ]]; then
+    resume_latest="1"
+    echo "Round ${round}: resume ${output_base} at ${output_dir}"
+  else
+    echo "Round ${round}: run ${output_base} -> ${output_dir}"
+  fi
+  run_gpt "$model" "$service_tier" "$output_dir" "$resume_latest"
 }
 
 run_claude() {
   local model="$1"
-  local output_base="$2"
-  local output_dir
-  output_dir="$(next_output_dir "$output_base")"
+  local output_dir="$2"
+  local resume_latest="${3:-0}"
 
   OPENAI_API_BASE="https://api.anthropic.com/v1/" \
   OPENAI_API_KEY="$(tr -d '\r\n' < "$CLAUDE_KEY_FILE")" \
+  RESUME_LATEST="$resume_latest" \
   QOSE_SIZE_MIN=22 \
   QOSE_SIZE_MAX=22 \
   QOSE_SCORE_MODE=piecewise \
@@ -163,14 +189,20 @@ run_claude_for_round() {
   local round="$1"
   local model="$2"
   local output_base="$3"
-  local existing
-  existing="$(latest_version_num "$output_base")"
-  if (( existing >= round )); then
-    echo "Round ${round}: skip ${output_base} (already has v${existing})"
+  local output_dir
+  output_dir="$(version_output_dir "$output_base" "$round")"
+  if version_completed "$output_base" "$round"; then
+    echo "Round ${round}: skip ${output_base} (completed: ${output_dir})"
     return 0
   fi
-  echo "Round ${round}: run ${output_base} (current=v${existing}, target=v${round})"
-  run_claude "$model" "$output_base"
+  local resume_latest="0"
+  if [[ -d "$output_dir/checkpoints" ]]; then
+    resume_latest="1"
+    echo "Round ${round}: resume ${output_base} at ${output_dir}"
+  else
+    echo "Round ${round}: run ${output_base} -> ${output_dir}"
+  fi
+  run_claude "$model" "$output_dir" "$resume_latest"
 }
 
 for round in $(seq 1 "$SWEEP_COUNT"); do

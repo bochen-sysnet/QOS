@@ -14,15 +14,16 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 ABLATION_DIR = ROOT / "openevolve_ablation"
+ABLATION_DIFF_DIR = ABLATION_DIR / "diff"
 OUT_DIR = Path(__file__).resolve().parent
 DATA_DIR = OUT_DIR / "data"
 FIGURES_DIR = OUT_DIR / "figures"
 
 RUNS = [
-    ("No Seed", "Full", ABLATION_DIR / "gem3flash_pws8_22q_noseed_low_full"),
-    ("No Seed", "Diff", ABLATION_DIR / "gem3flash_pws8_22q_noseed_low_diff"),
-    ("Seed", "Full", ABLATION_DIR / "gem3flash_pws8_22q_seed_low_full"),
-    ("Seed", "Diff", ABLATION_DIR / "gem3flash_pws8_22q_seed_low_diff"),
+    ("No Seed", "Full", ["gem3flash_pws8_22q_noseed_low_full"]),
+    ("No Seed", "Diff", ["gem3flash_pws8_22q_noseed_low_diff"]),
+    ("Seed", "Full", ["gem3flash_pws8_22q_seed_low_full"]),
+    ("Seed", "Diff", ["gem3flash_pws8_22q_seed_low_diff"]),
 ]
 
 COLORS = {
@@ -44,9 +45,21 @@ def _read_combined_score(run_dir: Path) -> float:
     return float(score)
 
 
+def _resolve_run_dir(names: list[str]) -> Path:
+    roots = [ABLATION_DIFF_DIR, ABLATION_DIR]
+    for name in names:
+        for root in roots:
+            candidate = root / name
+            if candidate.exists():
+                return candidate
+    tried = [str(root / name) for root in roots for name in names]
+    raise FileNotFoundError(f"Could not find run dir. Tried: {tried}")
+
+
 def main() -> None:
     rows: list[dict[str, object]] = []
-    for seed_group, variant, run_dir in RUNS:
+    for seed_group, variant, run_names in RUNS:
+        run_dir = _resolve_run_dir(run_names)
         rows.append(
             {
                 "seed_group": seed_group,
