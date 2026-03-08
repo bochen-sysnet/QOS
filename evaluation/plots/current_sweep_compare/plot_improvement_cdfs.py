@@ -59,16 +59,17 @@ def _model_family(name: str) -> str:
     return m.group(1) if m else name
 
 
-def _parse_run_improvements(run_dir: Path) -> Tuple[float, int, Dict[int, float]]:
+def _parse_run_improvements(run_dir: Path) -> Tuple[float, float, int, Dict[int, float]]:
     """
     Returns:
     - first_improvement_iteration (1..100, or 101 when no improvement in first 100)
+    - last_improvement_iteration (1..100, or 101 when no improvement in first 100)
     - number_of_improvements_within_100_iterations
     - iteration->score map for successful iterations
     """
     logs_dir = run_dir / "logs"
     if not logs_dir.exists():
-        return float(NO_IMPROVEMENT_SENTINEL), 0, {}
+        return float(NO_IMPROVEMENT_SENTINEL), float(NO_IMPROVEMENT_SENTINEL), 0, {}
 
     events: Dict[int, Tuple[str, float]] = {}
     first_eval_score = float("nan")
@@ -125,6 +126,7 @@ def _parse_run_improvements(run_dir: Path) -> Tuple[float, int, Dict[int, float]
 
     improvements = 0
     first_improvement_iter = NO_IMPROVEMENT_SENTINEL
+    last_improvement_iter = NO_IMPROVEMENT_SENTINEL
     best_so_far = baseline
     successful_scores: Dict[int, float] = {}
     eps = 1e-12
@@ -139,9 +141,10 @@ def _parse_run_improvements(run_dir: Path) -> Tuple[float, int, Dict[int, float]
                 improvements += 1
                 if first_improvement_iter == NO_IMPROVEMENT_SENTINEL:
                     first_improvement_iter = iteration
+                last_improvement_iter = iteration
                 best_so_far = score
 
-    return float(first_improvement_iter), improvements, successful_scores
+    return float(first_improvement_iter), float(last_improvement_iter), improvements, successful_scores
 
 
 def _cdf_xy(values: List[float]) -> Tuple[List[float], List[float]]:
@@ -173,21 +176,24 @@ def main() -> None:
 
     run_rows: List[Dict[str, object]] = []
     first_improv_by_model: Dict[str, List[float]] = defaultdict(list)
+    last_improv_by_model: Dict[str, List[float]] = defaultdict(list)
     improv_count_by_model: Dict[str, List[float]] = defaultdict(list)
 
     for run_dir in sorted(BASE_DIR.glob("*_v*")):
         if not run_dir.is_dir():
             continue
         family = _model_family(run_dir.name)
-        first_iter, n_impr, _ = _parse_run_improvements(run_dir)
+        first_iter, last_iter, n_impr, _ = _parse_run_improvements(run_dir)
 
         first_improv_by_model[family].append(first_iter)
+        last_improv_by_model[family].append(last_iter)
         improv_count_by_model[family].append(float(n_impr))
         run_rows.append(
             {
                 "run_name": run_dir.name,
                 "model_family": family,
                 "first_improvement_iteration": int(first_iter),
+                "last_improvement_iteration": int(last_iter),
                 "improvements_within_100_iter": int(n_impr),
             }
         )
@@ -197,6 +203,12 @@ def main() -> None:
     all_first = [
         v
         for vals in first_improv_by_model.values()
+        for v in vals
+        if v <= MAX_ITER
+    ]
+    all_last = [
+        v
+        for vals in last_improv_by_model.values()
         for v in vals
         if v <= MAX_ITER
     ]
@@ -219,14 +231,16 @@ def main() -> None:
         }
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.3), constrained_layout=True)
-    ax_first, ax_count = axes
+    fig, axes = plt.subplots(1, 3, figsize=(17.8, 4.3), constrained_layout=True)
+    ax_first, ax_last, ax_count = axes
 
     # Deterministic plotting order: known models first, then unknown.
-    if all_first and all_counts:
+    if all_first and all_last and all_counts:
         x1, y1 = _cdf_xy(all_first)
+        x_last, y_last = _cdf_xy(all_last)
         x2, y2 = _cdf_xy(all_counts)
         ax_first.step(x1, y1, where="post", linewidth=2.8, color="black", label="All Runs")
+        ax_last.step(x_last, y_last, where="post", linewidth=2.8, color="black", label="All Runs")
         ax_count.step(x2, y2, where="post", linewidth=2.8, color="black", label="All Runs")
 
     ax_first.set_xlabel("Iteration of First Improvement")
@@ -254,6 +268,31 @@ def main() -> None:
         ax_first.set_xticks([1, 20, 40, 60, 80, 100])
     ax_first.grid(axis="both", linestyle="--", alpha=0.3)
 
+    ax_last.set_xlabel("Iteration of Last Improvement")
+    ax_last.set_ylabel("CDF")
+    if all_last:
+        lx_min = max(1, int(min(all_last)) - 1)
+        lx_max = min(MAX_ITER, int(max(all_last)) + 1)
+        if lx_max <= lx_min:
+            lx_max = min(MAX_ITER, lx_min + 1)
+        ax_last.set_xlim(lx_min, lx_max)
+        lspan = lx_max - lx_min
+        if lspan <= 10:
+            lticks = list(range(lx_min, lx_max + 1))
+        else:
+            n = 6
+            step = lspan / float(n - 1)
+            lticks = sorted({int(round(lx_min + i * step)) for i in range(n)})
+            if lticks[0] != lx_min:
+                lticks = [lx_min] + lticks
+            if lticks[-1] != lx_max:
+                lticks = lticks + [lx_max]
+        ax_last.set_xticks(lticks)
+    else:
+        ax_last.set_xlim(1, MAX_ITER)
+        ax_last.set_xticks([1, 20, 40, 60, 80, 100])
+    ax_last.grid(axis="both", linestyle="--", alpha=0.3)
+
     ax_count.set_xlabel("Number of Improvements in 100 Iterations")
     ax_count.set_ylabel("CDF")
     if all_counts:
@@ -271,6 +310,7 @@ def main() -> None:
             "run_name",
             "model_family",
             "first_improvement_iteration",
+            "last_improvement_iteration",
             "improvements_within_100_iter",
         ],
     )

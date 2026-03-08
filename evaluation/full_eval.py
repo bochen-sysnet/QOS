@@ -2185,6 +2185,11 @@ def _plot_panel(
     ylabel: str,
     err_data: Optional[Dict[str, Dict[str, float]]] = None,
     show_avg: bool = False,
+    avg_label_fontsize: int = 10,
+    xtick_fontsize: int = 11,
+    ylabel_fontsize: int = 12,
+    title_fontsize: int = 14,
+    ytick_fontsize: int = 11,
 ) -> None:
     x = np.arange(len(methods))
     width = 0.08
@@ -2223,9 +2228,9 @@ def _plot_panel(
 
     if show_avg:
         max_val = max(all_vals) if all_vals else 0.0
-        pad = max(0.02, max_val * 0.06)
+        pad = max(0.04, max_val * 0.08)
         if max_val > 0:
-            ax.set_ylim(top=max(ax.get_ylim()[1], max_val + pad * 2))
+            ax.set_ylim(top=max(ax.get_ylim()[1], max_val + pad * 3.2))
         for idx, method in enumerate(methods):
             vals = [rel_data[bench].get(method, np.nan) for bench, _ in benches]
             vals = [v for v in vals if np.isfinite(v)]
@@ -2239,14 +2244,16 @@ def _plot_panel(
                 f"avg {avg:.2f}",
                 ha="center",
                 va="bottom",
-                fontsize=10,
+                fontsize=avg_label_fontsize,
             )
+        # Leave enough headroom so avg labels do not touch/cross the top edge.
+        ax.margins(y=0.10)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=11)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=14)
-    ax.tick_params(axis="y", labelsize=11)
+    ax.set_xticklabels(methods, fontsize=xtick_fontsize)
+    ax.set_ylabel(ylabel, fontsize=ylabel_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.tick_params(axis="y", labelsize=ytick_fontsize)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
 
 
@@ -2287,7 +2294,7 @@ def _plot_combined(
         )
         _plot_panel(
             axes[row, 1],
-            f"Number of CNOT gates - {size} qubits (lower is better)",
+            f"# of CNOT - {size} qubits (lower is better)",
             rel_nonlocal,
             benches,
             methods,
@@ -3209,6 +3216,13 @@ def _plot_cached_panels(
     # Figure 1: depth / CNOT in one row (12-depth, 12-cnot, 24-depth, 24-cnot).
     fig, axes = plt.subplots(1, len(sizes) * 2, figsize=(6.2 * len(sizes) * 2, 4.0))
     axes = np.array(axes).reshape(1, len(sizes) * 2)
+    depth_cnot_font_kwargs = {
+        "avg_label_fontsize": 14,
+        "xtick_fontsize": 16,
+        "ylabel_fontsize": 17,
+        "title_fontsize": 19,
+        "ytick_fontsize": 16,
+    }
     for idx, size in enumerate(sizes):
         rel_depth, rel_nonlocal = sim_rel_by_size[size]
         _plot_panel(
@@ -3219,19 +3233,21 @@ def _plot_cached_panels(
             methods,
             "Relative to Qiskit",
             show_avg=True,
+            **depth_cnot_font_kwargs,
         )
         _plot_panel(
             axes[0, idx * 2 + 1],
-            f"Number of CNOT gates - {size} qubits (lower is better)",
+            f"# of CNOT - {size} qubits (lower is better)",
             rel_nonlocal,
             benches,
             methods,
             "Relative to Qiskit",
             show_avg=True,
+            **depth_cnot_font_kwargs,
         )
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=11, loc="upper center")
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=17, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
     depth_cnot_path = out_dir / f"relative_properties_panels_depth_cnot_{panel_tag}.pdf"
     fig.savefig(depth_cnot_path)
     plt.close(fig)

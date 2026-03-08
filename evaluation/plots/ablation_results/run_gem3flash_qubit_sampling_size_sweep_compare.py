@@ -671,6 +671,66 @@ def _plot_per_size_metrics(
     plt.close(fig)
 
 
+def _plot_randq_reward(
+    per_size_rows: list[dict[str, Any]],
+    sizes: list[int],
+    out_pdf: Path,
+) -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 14,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 13,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    x: list[int] = []
+    means: list[float] = []
+    stds: list[float] = []
+    for size in sizes:
+        rec = next(
+            (
+                row
+                for row in per_size_rows
+                if row["variant_key"] == "randq"
+                and int(row["size"]) == int(size)
+                and row["metric_key"] == "combined_score"
+            ),
+            None,
+        )
+        if rec is None:
+            continue
+        x.append(int(size))
+        means.append(_safe_float(rec.get("mean")))
+        stds.append(max(0.0, _safe_float(rec.get("std"), 0.0)))
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    ax.errorbar(
+        x,
+        means,
+        yerr=stds,
+        color="black",
+        marker="^",
+        markersize=6.0,
+        linewidth=2.0,
+        capsize=3.5,
+        alpha=0.95,
+    )
+    ax.set_xlabel("# Qubits")
+    ax.set_ylabel("Reward")
+    ax.set_xticks(x)
+    if x:
+        ax.set_xlim(min(x) - 0.6, max(x) + 0.6)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_pdf, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -895,10 +955,16 @@ def main() -> None:
         sizes=sizes,
         out_pdf=FIGURES_DIR / "gem3flash_qubit_sampling_size_sweep_per_size_metrics.pdf",
     )
+    _plot_randq_reward(
+        per_size_metric_summary_rows,
+        sizes=sizes,
+        out_pdf=FIGURES_DIR / "gem3flash_qubit_sampling_randq_reward_vs_qubits.pdf",
+    )
 
     print("Wrote data under:", DATA_DIR)
     print("Wrote figure:", FIGURES_DIR / "gem3flash_qubit_sampling_size_sweep_compare.pdf")
     print("Wrote figure:", FIGURES_DIR / "gem3flash_qubit_sampling_size_sweep_per_size_metrics.pdf")
+    print("Wrote figure:", FIGURES_DIR / "gem3flash_qubit_sampling_randq_reward_vs_qubits.pdf")
 
 
 if __name__ == "__main__":

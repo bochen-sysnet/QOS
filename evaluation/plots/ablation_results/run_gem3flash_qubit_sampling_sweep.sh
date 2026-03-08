@@ -13,9 +13,11 @@ NUM_DIVERSE="${NUM_DIVERSE:-2}"
 NUM_INSPIRE="${NUM_INSPIRE:-3}"
 
 GEMINI_KEY_FILE="${GEMINI_KEY_FILE:-keys/gemini-ge0.key}"
-# Keep random 12-24 variant comparable across runs by default.
-# Override with QOSE_RANDOM_SAMPLE_SEED if needed.
-RANDOM_VARIANT_SAMPLE_SEED="${QOSE_RANDOM_SAMPLE_SEED:-123}"
+# Random 12-24 seed behavior:
+# - per_round (default): seed = base + (round - 1)
+# - fixed: always use the same seed across rounds
+RANDOM_VARIANT_SEED_STRATEGY="${RANDOM_VARIANT_SEED_STRATEGY:-per_round}"
+RANDOM_VARIANT_SAMPLE_SEED_BASE="${QOSE_RANDOM_SAMPLE_SEED_BASE:-${QOSE_RANDOM_SAMPLE_SEED:-123}}"
 
 require_file() {
   local path="$1"
@@ -59,6 +61,18 @@ version_completed() {
   local out_dir
   out_dir="$(version_output_dir "$base" "$round")"
   [[ -f "$out_dir/best/best_program_info.json" ]]
+}
+
+random_seed_for_round() {
+  local round="$1"
+  local base="$RANDOM_VARIANT_SAMPLE_SEED_BASE"
+  local mode="${RANDOM_VARIANT_SEED_STRATEGY,,}"
+  if [[ "$mode" == "fixed" ]]; then
+    echo "$base"
+    return 0
+  fi
+  # default: per_round
+  echo $((base + round - 1))
 }
 
 run_variant() {
@@ -115,6 +129,9 @@ run_variant_for_round() {
 }
 
 for round in $(seq 1 "$TARGET_TOTAL_SWEEPS"); do
+  random_seed="$(random_seed_for_round "$round")"
+  echo "Round ${round}: random-12to24 sample seed=${random_seed} (strategy=${RANDOM_VARIANT_SEED_STRATEGY})"
+
   run_variant_for_round \
     "$round" \
     "12q-only" \
@@ -132,5 +149,5 @@ for round in $(seq 1 "$TARGET_TOTAL_SWEEPS"); do
     "random-12to24" \
     "12" "24" \
     "openevolve_ablation/gem3flash_pws8_12to24_random_seed_low_full" \
-    "$RANDOM_VARIANT_SAMPLE_SEED"
+    "$random_seed"
 done
