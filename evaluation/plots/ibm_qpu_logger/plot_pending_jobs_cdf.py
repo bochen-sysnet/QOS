@@ -40,40 +40,71 @@ def _load_pending_jobs(csv_path: Path) -> dict[str, list[float]]:
     return dict(sorted(by_backend.items()))
 
 
-def _plot_cdf(data: dict[str, list[float]], out_path: Path) -> None:
+def _nearest_rank_percentiles(values: np.ndarray, percentiles: np.ndarray) -> np.ndarray:
+    """Return nearest-rank percentile values (always observed samples)."""
+    arr = np.sort(np.asarray(values, dtype=float))
+    n = len(arr)
+    if n == 0:
+        return np.asarray([], dtype=float)
+    out: list[float] = []
+    for p in percentiles:
+        rank = int(np.ceil((float(p) / 100.0) * n))
+        rank = max(1, min(rank, n))
+        out.append(float(arr[rank - 1]))
+    return np.asarray(out, dtype=float)
+
+
+def _plot_percentiles(data: dict[str, list[float]], out_path: Path) -> None:
     plt.rcParams.update(
         {
-            "font.size": 15,
-            "axes.labelsize": 17,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 14,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
-    fig, ax = plt.subplots(figsize=(7.4, 4.6), constrained_layout=True)
+    fig, ax_pct = plt.subplots(1, 1, figsize=(8.8, 5.2), constrained_layout=True)
 
-    for backend, values in data.items():
-        if not values:
-            continue
-        arr = np.sort(np.asarray(values, dtype=float))
-        y = np.arange(1, len(arr) + 1, dtype=float) / len(arr)
-        ax.step(
-            arr,
-            y,
-            where="post",
-            linewidth=2.4,
+    percentiles = np.array([95, 99, 99.9], dtype=float)
+    backends = [b for b, vals in data.items() if vals]
+    x = np.arange(len(percentiles), dtype=float)
+    width = 0.82 / max(1, len(backends))
+    for idx, backend in enumerate(backends):
+        arr = np.asarray(data[backend], dtype=float)
+        pvals = _nearest_rank_percentiles(arr, percentiles)
+        offsets = (idx - (len(backends) - 1) / 2.0) * width
+        bars = ax_pct.bar(
+            x + offsets,
+            pvals,
+            width=width,
             color=COLORS.get(backend),
-            label=f"{backend} (n={len(arr)})",
+            edgecolor="black",
+            linewidth=0.7,
+            label=backend.replace("ibm_", ""),
         )
+        for bar, value in zip(bars, pvals):
+            ax_pct.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{int(round(value))}",
+                ha="center",
+                va="bottom",
+                fontsize=14,
+                rotation=18,
+            )
 
-    ax.set_xlabel("Pending Jobs")
-    ax.set_ylabel("CDF")
-    ax.set_xscale("symlog", linthresh=1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="lower right", frameon=True)
+    ax_pct.set_xticks(x)
+    ax_pct.set_xticklabels(
+        [f"{int(p)}th" if float(p).is_integer() else f"{p:.1f}th" for p in percentiles]
+    )
+    ax_pct.set_xlabel("Percentile")
+    ax_pct.set_ylabel("Pending Jobs")
+    ax_pct.set_yscale("symlog", linthresh=1.0)
+    ax_pct.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax_pct.legend(loc="upper left", frameon=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -93,7 +124,7 @@ def main() -> None:
     if not data:
         raise RuntimeError(f"No valid pending-jobs data found in: {args.input_csv}")
 
-    _plot_cdf(data, args.out_pdf)
+    _plot_percentiles(data, args.out_pdf)
     print(f"Wrote figure: {args.out_pdf}")
 
 

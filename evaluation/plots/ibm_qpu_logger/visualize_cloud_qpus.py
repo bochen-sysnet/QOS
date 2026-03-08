@@ -15,24 +15,24 @@ OUT_PDF = ROOT / "figures" / "cloud_accessible_qpus.pdf"
 
 def main() -> None:
     providers = [
-        "IBM Quantum",
-        "AWS Braket",
-        "Azure Quantum",
-        "Google Quantum AI",
+        "IBM",
+        "AWS",
+        "Azure",
+        "Google",
     ]
     qpu_counts = [
-        11,
-        7,
-        5,
+        12,
+        8,
+        6,
         2,
     ]
 
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -47,7 +47,7 @@ def main() -> None:
         linewidth=0.8,
     )
 
-    ax.set_title("Cloud-Accessible Universal Gate-Model QPUs (Approximate)")
+    # ax.set_title("Cloud-Accessible Universal Gate-Model QPUs (Approximate)")
     ax.set_ylabel("Number of QPUs")
     ax.tick_params(axis="x", rotation=18)
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
