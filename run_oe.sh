@@ -27,6 +27,7 @@ Environment variables (override defaults):
   QOSE_INCLUDE_EXAMPLE_CODE       If true, injects example evolution code into prompt system message (default: 0)
   QOSE_EXAMPLE_CODE_PATH          Optional path for example code injection (default: qos/error_mitigator/evolution_seed.py)
   QOSE_INCLUDE_LEVERS             If false, removes "POSSIBLE LEVERS TO EXPLORE" block from system prompt (default: 1)
+  QOSE_INCLUDE_METADATA           If false, removes metadata-context block from system prompt (default: 1)
   QOSE_FIXED_BENCH_SIZE_PAIRS     Optional fixed sampled pairs (JSON list), e.g. [["qaoa_r3",22],["bv",20]]
   OPENEVOLVE_GEMINI_NATIVE        Use Gemini native generateContent API for gemini endpoint (default: 1)
   OPENEVOLVE_GEMINI_THINKING_LEVEL Optional Gemini thinking level: low|medium|high|auto (default: auto)
@@ -146,8 +147,10 @@ is_true() {
 build_runtime_config() {
   local base_config_path="$1"
   local runtime_config_path="$2"
+  local target_path="$3"
   local include_example_raw="${QOSE_INCLUDE_EXAMPLE_CODE:-0}"
   local include_levers_raw="${QOSE_INCLUDE_LEVERS:-1}"
+  local include_metadata_raw="${QOSE_INCLUDE_METADATA:-1}"
   local example_path="${QOSE_EXAMPLE_CODE_PATH:-qos/error_mitigator/evolution_seed.py}"
   local diff_mode_raw="${OPENEVOLVE_DIFF_BASED_EVOLUTION:-}"
 
@@ -228,6 +231,40 @@ cfg.write_text("".join(out), encoding="utf-8")
 PY
   fi
 
+  if ! is_true "$include_metadata_raw"; then
+    python3 - "$runtime_config_path" <<'PY'
+import sys
+from pathlib import Path
+
+cfg = Path(sys.argv[1])
+text = cfg.read_text(encoding="utf-8")
+lines = text.splitlines(keepends=True)
+out: list[str] = []
+skipping_context = False
+for line in lines:
+    if not skipping_context and line.startswith("    CONTEXT:"):
+        skipping_context = True
+        continue
+    if skipping_context:
+        # Stop skipping right before the next heading in the same section.
+        if line.startswith("    COST HELPER APIS"):
+            skipping_context = False
+            out.append(line)
+        continue
+    # Remove the metadata-only heuristic line.
+    if "Use cheap metadata heuristics first; only call compute_*_cost when needed." in line:
+        continue
+    # Keep prompt coherent after metadata removal.
+    line = line.replace(
+        "the Qernel (quantum circuit container) whose metadata informs the decision.",
+        "the Qernel (quantum circuit container).",
+    )
+    out.append(line)
+
+cfg.write_text("".join(out), encoding="utf-8")
+PY
+  fi
+
   if [[ -n "$diff_mode_raw" ]]; then
     local diff_mode_bool="false"
     if is_true "$diff_mode_raw"; then
@@ -277,12 +314,24 @@ if target == "true":
 cfg.write_text(patched, encoding="utf-8")
 PY
   fi
+
+  # Align prompt file-path references with --target.
+  python3 - "$runtime_config_path" "$target_path" <<'PY'
+import sys
+from pathlib import Path
+
+cfg = Path(sys.argv[1])
+target = sys.argv[2]
+text = cfg.read_text(encoding="utf-8")
+patched = text.replace("qos/error_mitigator/evolution_target.py", target)
+cfg.write_text(patched, encoding="utf-8")
+PY
 }
 
 # Keep a runtime copy of evolve config in the output directory for reproducibility.
 mkdir -p "$OUTPUT_DIR"
 RUNTIME_CONFIG_PATH="$OUTPUT_DIR/openevolve_config.yaml"
-build_runtime_config "$CONFIG_PATH" "$RUNTIME_CONFIG_PATH"
+build_runtime_config "$CONFIG_PATH" "$RUNTIME_CONFIG_PATH" "$TARGET_PATH"
 CONFIG_PATH="$RUNTIME_CONFIG_PATH"
 
 # Load API key from file if provided and OPENAI_API_KEY is unset.
