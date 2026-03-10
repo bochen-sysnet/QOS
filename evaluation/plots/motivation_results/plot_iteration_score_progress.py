@@ -28,6 +28,7 @@ LEGEND_FONT_SIZE = 20
 class IterScore:
     iteration: int
     score: float
+    time_ratio: float
 
 
 def _to_float(raw: str) -> float | None:
@@ -50,10 +51,15 @@ def _load_scores(csv_path: Path) -> list[IterScore]:
             except ValueError:
                 continue
             score = _to_float((row.get("combined_score") or "").strip())
-            if score is None:
+            time_ratio = _to_float((row.get("avg_run_time") or "").strip())
+            if score is None or time_ratio is None:
                 continue
             # Keep latest seen row for an iteration if duplicated.
-            per_iteration[iteration] = IterScore(iteration=iteration, score=score)
+            per_iteration[iteration] = IterScore(
+                iteration=iteration,
+                score=score,
+                time_ratio=time_ratio,
+            )
 
     scores = sorted(per_iteration.values(), key=lambda x: x.iteration)
     if not scores:
@@ -91,7 +97,7 @@ def _find_latest_checkpoint(run_dir: Path) -> Path:
     return latest_ckpt
 
 
-def _find_initial_score(run_dir: Path) -> float:
+def _find_initial_metric(run_dir: Path, metric_key: str) -> float:
     latest_ckpt = _find_latest_checkpoint(run_dir)
 
     for prog_json in sorted((latest_ckpt / "programs").glob("*.json")):
@@ -101,10 +107,10 @@ def _find_initial_score(run_dir: Path) -> float:
             continue
         if int(row.get("generation", -1)) != 0:
             continue
-        score = _to_float((row.get("metrics", {}) or {}).get("combined_score"))
-        if score is not None:
-            return score
-    raise RuntimeError(f"Could not find generation-0 initial program score in {latest_ckpt}")
+        metric = _to_float((row.get("metrics", {}) or {}).get(metric_key))
+        if metric is not None:
+            return metric
+    raise RuntimeError(f"Could not find generation-0 initial program metric '{metric_key}' in {latest_ckpt}")
 
 
 def _load_iteration_child_parent(run_dir: Path) -> dict[int, tuple[str, str]]:
@@ -170,6 +176,7 @@ def _plot(
     scores: list[IterScore],
     output_path: Path,
     initial_score: float,
+    initial_time_ratio: float,
     generation_by_iteration: dict[int, int],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +189,7 @@ def _plot(
 
     x = [0] + list(range(1, 101))
     y = [initial_score] + [by_it[i] for i in range(1, 101)]
+    time_by_it = {item.iteration: item.time_ratio for item in scores}
 
     improved_x: list[int] = []
     improved_y: list[float] = []
@@ -235,11 +243,50 @@ def _plot(
     ax.scatter(no_improve_x, no_improve_y, color="#7f7f7f", marker="o", s=35, zorder=2, label="No Impr")
     ax.scatter(improved_x, improved_y, color="#d62728", marker="*", s=110, zorder=5, label="Impr")
 
+    # Annotate each improvement point with its time ratio.
+    ann_font = LEGEND_FONT_SIZE + 2
+    prev_it: int | None = None
+    for idx, (it, score) in enumerate(zip(improved_x, improved_y)):
+        tr = time_by_it[it]
+        x_text = float(it)
+        # Avoid overlap when improvement iterations are very close (e.g., first two points).
+        if prev_it is not None and (it - prev_it) <= 3:
+            x_text += 1.2 if (idx % 2 == 0) else -1.2
+        ax.annotate(
+            f"r={tr:.2f}",
+            xy=(it, score),
+            xytext=(x_text, -18),
+            textcoords="data",
+            ha="center",
+            va="center",
+            fontsize=ann_font,
+            rotation=90,
+            arrowprops={"arrowstyle": "->", "lw": 1.0, "color": "#444444"},
+            color="#222222",
+        )
+        prev_it = it
+    ax.annotate(
+        f"r={initial_time_ratio:.2f}",
+        xy=(0, initial_score),
+        xytext=(0, -18),
+        textcoords="data",
+        ha="center",
+        va="center",
+        fontsize=ann_font,
+        rotation=90,
+        arrowprops={"arrowstyle": "->", "lw": 1.0, "color": "#444444"},
+        color="#222222",
+    )
+
     ax.set_xlabel("Iteration", fontsize=FONT_SIZE)
     ax.tick_params(axis="both", labelsize=FONT_SIZE)
     ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend(loc="lower left", fontsize=LEGEND_FONT_SIZE, frameon=True)
+    ax.legend(loc="lower right", fontsize=LEGEND_FONT_SIZE, frameon=True)
     ax.set_ylabel("Reward", fontsize=FONT_SIZE, labelpad=8)
+    ymin = min(min(y), -16.0)
+    ymax = max(y)
+    pad = max(0.3, 0.05 * (ymax - ymin))
+    ax.set_ylim(ymin - pad, ymax + pad)
     ax.yaxis.set_label_position("left")
     ax.yaxis.tick_left()
     fig.subplots_adjust(left=0.07, right=0.995, bottom=0.14, top=0.99, wspace=0.30)
@@ -274,9 +321,10 @@ def main() -> None:
     output_path = args.output or (DEFAULT_OUT_DIR / "iter_progress.pdf")
 
     scores = _load_scores(csv_path)
-    initial_score = _find_initial_score(args.run_dir)
+    initial_score = _find_initial_metric(args.run_dir, "combined_score")
+    initial_time_ratio = _find_initial_metric(args.run_dir, "avg_run_time")
     generation_by_iteration = _load_generation_by_iteration(args.run_dir)
-    _plot(scores, output_path, initial_score, generation_by_iteration)
+    _plot(scores, output_path, initial_score, initial_time_ratio, generation_by_iteration)
     print(f"Wrote figure: {output_path}")
 
 
