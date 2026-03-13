@@ -63,13 +63,13 @@ def _plot(per_size: dict[int, list[float]], out_pdf: Path) -> None:
             "axes.labelsize": 24,
             "xtick.labelsize": 24,
             "ytick.labelsize": 24,
-            "legend.fontsize": 24,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
-    fig, ax = plt.subplots(figsize=(9.5, 6.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(6.4, 4.2), constrained_layout=True)
 
     for size in SIZE_ORDER:
         vals = sorted(v for v in per_size.get(size, []) if v > 0)

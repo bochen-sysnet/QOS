@@ -317,7 +317,7 @@ def _plot_qose_time_breakdown_aggregated(
     _annotate(b3, per_job_qpu, err_q)
 
     ax.set_xticks(x, size_labels)
-    ax.set_ylabel("Time (s)")
+    ax.set_ylabel("Mitigation Time (s)")
     ax.set_yscale("log")
     ax.grid(axis="y", linestyle="--", alpha=0.3)
 
@@ -341,23 +341,19 @@ def _plot_qos_component_breakdown_12_24(
     sizes: List[int],
 ) -> None:
     """
-    QOS component breakdown (different components as different bars),
-    grouped by size (12q/24q), with log-scale y-axis, error bars, and value labels.
+    QOS component breakdown with three grouped components:
+    - FQ: frozen qubits time
+    - Cutting: cost_search + GV + WC
+    - QR: qubit reuse
+    Analysis time is intentionally excluded.
     """
     plt = fe._import_matplotlib()
     np = fe.np
 
     stage_skip = {"bench", "size", "method", "total", "overall", "simulation", "cost_search_calls"}
     stage_alias = {"qaoa_analysis": "analysis"}
-    stage_order_pref = ["analysis", "qf", "gv", "wc", "qr", "cost_search"]
-    stage_label_map = {
-        "analysis": "Analysis",
-        "qf": "QF",
-        "gv": "GV",
-        "wc": "WC",
-        "qr": "QR",
-        "cost_search": "Search",
-    }
+    component_order = ["qf", "cutting", "qr"]
+    component_label_map = {"qf": "Frozen", "cutting": "Cutting", "qr": "QR"}
 
     def _stage_values_merged(row: Dict[str, object]) -> Dict[str, float]:
         merged_vals: Dict[str, float] = {}
@@ -371,9 +367,23 @@ def _plot_qos_component_breakdown_12_24(
             merged_vals[stage] = merged_vals.get(stage, 0.0) + sec
         return merged_vals
 
+    def _component_values(row: Dict[str, object]) -> Dict[str, float]:
+        merged = _stage_values_merged(row)
+        return {
+            "qf": float(max(merged.get("qf", 0.0), 0.0)),
+            "cutting": float(
+                max(merged.get("cost_search", 0.0), 0.0)
+                + max(merged.get("gv", 0.0), 0.0)
+                + max(merged.get("wc", 0.0), 0.0)
+            ),
+            "qr": float(max(merged.get("qr", 0.0), 0.0)),
+        }
+
     timing_rows = fe._read_rows_csv(timing_torino_csv) + fe._read_rows_csv(timing_marrakesh_csv)
     size_set = {int(s) for s in sizes}
-    stage_vals_by_size: Dict[int, Dict[str, List[float]]] = {int(s): {} for s in sizes}
+    component_vals_by_size: Dict[int, Dict[str, List[float]]] = {
+        int(s): {k: [] for k in component_order} for s in sizes
+    }
 
     for row in timing_rows:
         if str(row.get("method", "")).strip() != "QOS":
@@ -381,33 +391,17 @@ def _plot_qos_component_breakdown_12_24(
         size = fe._safe_int(row.get("size", ""), -1)
         if size not in size_set:
             continue
-        merged = _stage_values_merged(row)
-        if not merged:
-            continue
-        for stage, sec in merged.items():
-            stage_vals_by_size[size].setdefault(stage, []).append(float(sec))
-
-    stage_set = set()
-    for s in size_set:
-        stage_set.update(stage_vals_by_size[s].keys())
-    stage_order = [s for s in stage_order_pref if s in stage_set] + sorted(stage_set - set(stage_order_pref))
-    if not stage_order:
-        stage_order = ["analysis"]
-
-    # Keep components with any signal across requested sizes.
-    keep_stages = []
-    for stage in stage_order:
-        has_signal = any(sum(stage_vals_by_size[int(sz)].get(stage, [])) > 0.0 for sz in sizes)
-        if has_signal:
-            keep_stages.append(stage)
-    stage_order = keep_stages if keep_stages else stage_order
+        comps = _component_values(row)
+        for comp_key, sec in comps.items():
+            if sec > 0.0:
+                component_vals_by_size[size][comp_key].append(sec)
 
     means: Dict[int, List[float]] = {int(s): [] for s in sizes}
     stds: Dict[int, List[float]] = {int(s): [] for s in sizes}
     for sz in sizes:
         sz = int(sz)
-        for stage in stage_order:
-            vals = stage_vals_by_size[sz].get(stage, [])
+        for comp_key in component_order:
+            vals = component_vals_by_size[sz].get(comp_key, [])
             if vals:
                 means[sz].append(float(np.mean(vals)))
                 stds[sz].append(float(np.std(vals)))
@@ -417,20 +411,20 @@ def _plot_qos_component_breakdown_12_24(
 
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 13,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 22,
+            "ytick.labelsize": 22,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
-    x = np.arange(len(stage_order))
+    x = np.arange(len(component_order))
     width = 0.34
     y_eps = 1e-4
-    fig, ax = plt.subplots(1, 1, figsize=(8.8, 4.4))
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.3))
 
     colors = {int(sizes[0]): "#4C78A8", int(sizes[1]): "#F58518"} if len(sizes) >= 2 else {int(sizes[0]): "#4C78A8"}
     hatches = {int(sizes[0]): "///", int(sizes[1]): "\\\\\\",}
@@ -471,32 +465,45 @@ def _plot_qos_component_breakdown_12_24(
         for b in bars_b:
             b.set_hatch(hatches[size_b])
 
-    # Annotate mean value on top of each bar.
+    ax.set_yscale("log")
+    # Add headroom so annotation text is fully visible on log-scale.
+    ymax_data = max(
+        [max(v + e, y_eps) for v, e in zip(vals_a, err_a)] +
+        ([max(v + e, y_eps) for v, e in zip(vals_b, err_b)] if len(sizes) >= 2 else [y_eps])
+    )
+    ax.set_ylim(y_eps, max(ax.get_ylim()[1], ymax_data * 1.90))
+
+    # Annotate mean value at top of error bar, while keeping labels inside axes bounds.
     def _annotate(bar_container, raw_vals: List[float], err_vals: List[float]) -> None:
+        _y_low, y_high = ax.get_ylim()
         for bar, raw, err in zip(bar_container, raw_vals, err_vals):
             shown = max(float(raw), y_eps)
+            y_target = max(shown + float(err), shown) * 1.05
+            y_target = min(y_target, y_high * 0.93)
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                max(shown + float(err), shown) * 1.08,
+                y_target,
                 f"{float(raw):.3f}",
                 ha="center",
                 va="bottom",
-                fontsize=10,
+                fontsize=15,
+                rotation=0,
+                clip_on=False,
             )
 
     _annotate(bars_a, means[size_a], err_a)
     if len(sizes) >= 2:
         _annotate(bars_b, means[size_b], err_b)
 
-    stage_labels = [stage_label_map.get(s, s) for s in stage_order]
-    ax.set_xticks(x, stage_labels)
-    ax.set_ylabel("Time (s)")
-    ax.set_yscale("log")
+    component_labels = [component_label_map.get(s, s) for s in component_order]
+    ax.set_xticks(x, component_labels)
+    ax.set_xlabel("Mitigation Stages")
+    ax.set_ylabel("Mitigation Time (s)", fontsize=22)
     ax.grid(axis="y", linestyle="--", alpha=0.3)
-    ax.legend(loc="upper left", frameon=True)
+    ax.legend(loc="upper right", frameon=True, bbox_to_anchor=(0.98, 0.82), borderaxespad=0.15)
 
     fig.tight_layout()
-    fig.savefig(out_pdf)
+    fig.savefig(out_pdf, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
 
 

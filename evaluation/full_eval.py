@@ -2190,6 +2190,8 @@ def _plot_panel(
     ylabel_fontsize: int = 12,
     title_fontsize: int = 14,
     ytick_fontsize: int = 11,
+    avg_label_prefix: str = "avg ",
+    method_label_map: Optional[Dict[str, str]] = None,
 ) -> None:
     x = np.arange(len(methods))
     width = 0.08
@@ -2241,7 +2243,7 @@ def _plot_panel(
             ax.text(
                 x[idx],
                 y,
-                f"avg {avg:.2f}",
+                f"{avg_label_prefix}{avg:.2f}" if avg_label_prefix else f"{avg:.2f}",
                 ha="center",
                 va="bottom",
                 fontsize=avg_label_fontsize,
@@ -2249,8 +2251,9 @@ def _plot_panel(
         # Leave enough headroom so avg labels do not touch/cross the top edge.
         ax.margins(y=0.10)
 
+    display_methods = [method_label_map.get(m, m) if method_label_map else m for m in methods]
     ax.set_xticks(x)
-    ax.set_xticklabels(methods, fontsize=xtick_fontsize)
+    ax.set_xticklabels(display_methods, fontsize=xtick_fontsize)
     ax.set_ylabel(ylabel, fontsize=ylabel_fontsize)
     ax.set_title(title, fontsize=title_fontsize)
     ax.tick_params(axis="y", labelsize=ytick_fontsize)
@@ -3217,17 +3220,21 @@ def _plot_cached_panels(
     fig, axes = plt.subplots(1, len(sizes) * 2, figsize=(6.2 * len(sizes) * 2, 4.0))
     axes = np.array(axes).reshape(1, len(sizes) * 2)
     depth_cnot_font_kwargs = {
-        "avg_label_fontsize": 14,
-        "xtick_fontsize": 16,
-        "ylabel_fontsize": 17,
-        "title_fontsize": 19,
-        "ytick_fontsize": 16,
+        "avg_label_fontsize": 20,
+        "xtick_fontsize": 20,
+        "ylabel_fontsize": 22,
+        "title_fontsize": 22,
+        "ytick_fontsize": 20,
+        "avg_label_prefix": "",
+        "method_label_map": {"QOSE": "QSA", "FrozenQubits": "Frozen"},
     }
     for idx, size in enumerate(sizes):
         rel_depth, rel_nonlocal = sim_rel_by_size[size]
+        letter_depth = chr(ord("a") + (idx * 2))
+        letter_cnot = chr(ord("a") + (idx * 2 + 1))
         _plot_panel(
             axes[0, idx * 2],
-            f"Depth - {size} qubits (lower is better)",
+            f"({letter_depth}) Depth - {size} qubits",
             rel_depth,
             benches,
             methods,
@@ -3237,7 +3244,7 @@ def _plot_cached_panels(
         )
         _plot_panel(
             axes[0, idx * 2 + 1],
-            f"# of CNOT - {size} qubits (lower is better)",
+            f"({letter_cnot}) # of CNOT - {size} qubits",
             rel_nonlocal,
             benches,
             methods,
@@ -3246,8 +3253,15 @@ def _plot_cached_panels(
             **depth_cnot_font_kwargs,
         )
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, ncol=max(1, len(labels)), fontsize=17, loc="upper center")
-    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    fig.legend(
+        handles,
+        labels,
+        ncol=max(1, len(labels)),
+        fontsize=20,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.03),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.87))
     depth_cnot_path = out_dir / f"relative_properties_panels_depth_cnot_{panel_tag}.pdf"
     fig.savefig(depth_cnot_path)
     plt.close(fig)

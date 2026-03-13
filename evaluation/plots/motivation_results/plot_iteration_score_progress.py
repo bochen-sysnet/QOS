@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_RUN_DIR = (
     ROOT
     / "openevolve_ablation"
+    / "artifact"
     / "gem3flash_pws8_22q_noseed_no_cases_no_summary_v2"
 )
 DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "figures"

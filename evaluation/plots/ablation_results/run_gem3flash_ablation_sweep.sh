@@ -14,6 +14,7 @@ NUM_INSPIRE="${NUM_INSPIRE:-3}"
 
 GEMINI_KEY_FILE="${GEMINI_KEY_FILE:-keys/gemini-ge0.key}"
 REFERENCE_FULL_PREFIX="${REFERENCE_FULL_PREFIX:-openevolve_output/gem3flash_pws8_22q_seed_low_full_v}"
+ARTIFACT_OUT_DIR="${ARTIFACT_OUT_DIR:-openevolve_ablation/artifact}"
 
 require_file() {
   local path="$1"
@@ -164,17 +165,17 @@ for round in $(seq 1 "$TARGET_TOTAL_SWEEPS"); do
     "$round" \
     "111_full_without_seed" \
     "0" "1" "1" \
-    "openevolve_ablation/gem3flash_pws8_22q_noseed_full"
+    "${ARTIFACT_OUT_DIR}/gem3flash_pws8_22q_noseed_full"
 
   run_variant_for_round \
     "$round" \
     "110_full_without_seed_no_cases" \
     "0" "0" "1" \
-    "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases"
+    "${ARTIFACT_OUT_DIR}/gem3flash_pws8_22q_noseed_no_cases"
 
   run_variant_for_round \
     "$round" \
     "100_full_without_seed_no_cases_no_summary" \
     "0" "0" "0" \
-    "openevolve_ablation/gem3flash_pws8_22q_noseed_no_cases_no_summary"
+    "${ARTIFACT_OUT_DIR}/gem3flash_pws8_22q_noseed_no_cases_no_summary"
 done

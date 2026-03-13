@@ -27,12 +27,14 @@ from qos.error_mitigator import evaluator as evaluator_module
 OUT_DIR = Path(__file__).resolve().parent
 DATA_DIR = OUT_DIR / "data" / "qubit_sampling_size_sweep"
 FIGURES_DIR = OUT_DIR / "figures"
+ABLATION_ROOT = ROOT / "openevolve_ablation"
+ABLATION_QUBITS_ROOT = ABLATION_ROOT / "qubits"
 
 VARIANT_SPECS = [
     {
         "key": "12q",
         "label": "12q",
-        "root": ROOT / "openevolve_ablation",
+        "roots": [ABLATION_QUBITS_ROOT, ABLATION_ROOT],
         "prefix": "gem3flash_pws8_12q_seed_low_full_v",
         "color": "#4C78A8",
         "hatch": "//",
@@ -40,7 +42,7 @@ VARIANT_SPECS = [
     {
         "key": "24q",
         "label": "24q",
-        "root": ROOT / "openevolve_ablation",
+        "roots": [ABLATION_QUBITS_ROOT, ABLATION_ROOT],
         "prefix": "gem3flash_pws8_24q_seed_low_full_v",
         "color": "#F58518",
         "hatch": "\\\\",
@@ -48,15 +50,15 @@ VARIANT_SPECS = [
     {
         "key": "randq",
         "label": "RandQ",
-        "root": ROOT / "openevolve_ablation",
+        "roots": [ABLATION_QUBITS_ROOT, ABLATION_ROOT],
         "prefix": "gem3flash_pws8_12to24_random_seed_low_full_v",
         "color": "#54A24B",
         "hatch": "..",
     },
     {
         "key": "22q",
-        "label": "22q (Ours)",
-        "root": ROOT / "openevolve_output",
+        "label": "Ours",
+        "roots": [ROOT / "openevolve_output"],
         "prefix": "gem3flash_pws8_22q_seed_low_full_v",
         "color": "#B279A2",
         "hatch": "xx",
@@ -126,6 +128,11 @@ def _parse_sizes(raw: str) -> list[int]:
     return sorted(set(out))
 
 
+def _parse_variant_keys(raw: str) -> set[str]:
+    keys = {token.strip() for token in raw.split(",") if token.strip()}
+    return keys
+
+
 def _list_version_dirs(root: Path, prefix: str) -> dict[int, Path]:
     out: dict[int, Path] = {}
     for d in sorted(root.glob(f"{prefix}*")):
@@ -134,6 +141,14 @@ def _list_version_dirs(root: Path, prefix: str) -> dict[int, Path]:
         suffix = d.name.rsplit("_v", 1)[-1]
         if suffix.isdigit():
             out[int(suffix)] = d
+    return out
+
+
+def _list_version_dirs_multi(roots: list[Path], prefix: str) -> dict[int, Path]:
+    out: dict[int, Path] = {}
+    for root in roots:
+        for version, path in _list_version_dirs(root, prefix).items():
+            out.setdefault(version, path)
     return out
 
 
@@ -235,7 +250,7 @@ def _load_metrics_map(path: Path) -> dict[int, dict[str, Any]]:
         norm = dict(row)
         norm["size"] = size
         for k in METRICS_FIELDS:
-            if k in ("size", "failure_reason"):
+            if k in ("size", "failure_reason", "score_mode"):
                 continue
             norm[k] = _safe_float(norm.get(k))
         out[size] = norm
@@ -484,11 +499,11 @@ def _summarize_variant_rows(run_rows: list[dict[str, Any]]) -> list[dict[str, An
 def _plot_variant_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> None:
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
-            "legend.fontsize": 12,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
+            "legend.fontsize": 24,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -527,9 +542,6 @@ def _plot_variant_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> 
         edgecolor="black",
         linewidth=0.9,
     )
-    for bar, spec in zip(bars, VARIANT_SPECS):
-        bar.set_hatch(spec["hatch"])
-
     for idx, (bar, m, s) in enumerate(zip(bars, means, stds)):
         if not math.isfinite(m):
             ax.text(
@@ -538,7 +550,7 @@ def _plot_variant_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> 
                 "N/A",
                 ha="center",
                 va="bottom",
-                fontsize=11,
+                fontsize=20,
             )
             continue
         ax.text(
@@ -547,11 +559,11 @@ def _plot_variant_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> 
             f"{m:.3f}",
             ha="center",
             va="bottom",
-            fontsize=11,
+            fontsize=20,
         )
 
     ax.set_xticks(x, [spec["label"] for spec in VARIANT_SPECS])
-    ax.set_ylabel("Avg Combined Score Across 12-24 Qubits")
+    ax.set_ylabel("Reward")
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_pdf)
@@ -678,10 +690,10 @@ def _plot_randq_reward(
 ) -> None:
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 13,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -708,17 +720,29 @@ def _plot_randq_reward(
         stds.append(max(0.0, _safe_float(rec.get("std"), 0.0)))
 
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
-    ax.errorbar(
-        x,
-        means,
-        yerr=stds,
-        color="black",
-        marker="^",
-        markersize=6.0,
-        linewidth=2.0,
-        capsize=3.5,
-        alpha=0.95,
-    )
+    if x:
+        x_arr = np.asarray(x, dtype=float)
+        means_arr = np.asarray(means, dtype=float)
+        stds_arr = np.asarray(stds, dtype=float)
+        lower = means_arr - stds_arr
+        upper = means_arr + stds_arr
+        ax.fill_between(
+            x_arr,
+            lower,
+            upper,
+            color="black",
+            alpha=0.18,
+            linewidth=0.0,
+        )
+        ax.plot(
+            x_arr,
+            means_arr,
+            color="black",
+            marker="^",
+            markersize=6.0,
+            linewidth=2.0,
+            alpha=0.95,
+        )
     ax.set_xlabel("# Qubits")
     ax.set_ylabel("Reward")
     ax.set_xticks(x)
@@ -779,9 +803,18 @@ def main() -> None:
         default="piecewise",
         help="Scoring mode passed to evaluator via QOSE_SCORE_MODE (default: piecewise).",
     )
+    parser.add_argument(
+        "--variant-keys",
+        default="",
+        help=(
+            "Optional comma-separated variant keys to run. "
+            "Available: 12q,24q,randq,22q. Empty means all."
+        ),
+    )
     args = parser.parse_args()
 
     sizes = _parse_sizes(args.sizes)
+    selected_variant_keys = _parse_variant_keys(args.variant_keys)
     benches = args.benches.strip()
     sample_seed = args.sample_seed.strip()
     score_mode = args.score_mode.strip().lower()
@@ -795,7 +828,9 @@ def main() -> None:
     size_set = set(sizes)
 
     for spec in VARIANT_SPECS:
-        version_dirs = _list_version_dirs(spec["root"], spec["prefix"])
+        if selected_variant_keys and spec["key"] not in selected_variant_keys:
+            continue
+        version_dirs = _list_version_dirs_multi(spec["roots"], spec["prefix"])
         versions = sorted(version_dirs.keys())
         if args.max_runs_per_variant > 0:
             versions = versions[: args.max_runs_per_variant]

@@ -23,6 +23,13 @@ METHOD_SPECS = [
 ]
 SIZES = [12, 24]
 BACKENDS = ["torino", "marrakesh"]
+GROUP_CENTERS = [1.0, 2.0]
+BOX_WIDTH = 0.18
+METHOD_OFFSETS = {
+    "FrozenQubits": -0.24,
+    "CutQC": 0.0,
+    "QOS": 0.24,
+}
 
 
 def _safe_float(value: object) -> float | None:
@@ -150,18 +157,16 @@ def _draw_grouped_boxplot(
     title: str,
     use_log: bool = False,
     label_mode: str = "side",
+    annotate_medians: bool = True,
 ) -> None:
-    centers = [1.0, 2.0]
-    offsets = [-0.24, 0.0, 0.24]
-    width = 0.18
-
-    for (method, label, color), offset in zip(METHOD_SPECS, offsets):
+    for method, label, color in METHOD_SPECS:
+        offset = METHOD_OFFSETS[method]
         series = [data[size][method] for size in SIZES]
-        positions = [c + offset for c in centers]
+        positions = [c + offset for c in GROUP_CENTERS]
         bp = ax.boxplot(
             series,
             positions=positions,
-            widths=width,
+            widths=BOX_WIDTH,
             patch_artist=True,
             showfliers=True,
             medianprops={"color": "black", "linewidth": 1.2},
@@ -178,36 +183,36 @@ def _draw_grouped_boxplot(
                 artist.set_color("black")
         for flier in bp["fliers"]:
             flier.set(marker="o", markersize=3.5, markerfacecolor=color, markeredgecolor="black", alpha=0.65)
-        for pos, vals in zip(positions, series):
-            if not vals:
-                continue
-            med = statistics.median(vals)
-            if label_mode == "top":
-                x_text = pos
-                y_text = _quantile(vals, 0.75) * 1.5
-                ha = "center"
-                va = "bottom"
-            else:
-                x_text = pos + width * 0.72
-                y_text = med * (1.02 if med > 0 else 1.0)
-                ha = "left"
-                va = "center"
-            ax.text(
-                x_text,
-                y_text,
-                _fmt_value(med),
-                ha=ha,
-                va=va,
-                fontsize=10,
-                color="black",
-            )
+        if annotate_medians:
+            for pos, vals in zip(positions, series):
+                if not vals:
+                    continue
+                med = statistics.median(vals)
+                if label_mode == "top":
+                    x_text = pos
+                    y_text = _quantile(vals, 0.75) * 1.5
+                    ha = "center"
+                    va = "bottom"
+                else:
+                    x_text = pos + BOX_WIDTH * 0.72
+                    y_text = med * (1.02 if med > 0 else 1.0)
+                    ha = "left"
+                    va = "center"
+                ax.text(
+                    x_text,
+                    y_text,
+                    _fmt_value(med),
+                    ha=ha,
+                    va=va,
+                    fontsize=20,
+                    color="black",
+                )
 
-    ax.set_xticks(centers)
-    ax.set_xticklabels([str(size) for size in SIZES], fontsize=12)
-    ax.set_xlabel("Qubits", fontsize=13)
-    ax.set_ylabel(ylabel, fontsize=13)
-    ax.set_title(title, fontsize=14)
-    ax.tick_params(axis="y", labelsize=11)
+    ax.set_xticks(GROUP_CENTERS)
+    ax.set_xticklabels([str(size) for size in SIZES])
+    ax.set_xlabel("Qubits")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.grid(axis="y", linestyle="--", alpha=0.28)
     if use_log:
         ax.set_yscale("log")
@@ -245,6 +250,18 @@ def main() -> None:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    plt.rcParams.update(
+        {
+            "font.size": 20,
+            "axes.labelsize": 20,
+            "xtick.labelsize": 20,
+            "ytick.labelsize": 20,
+            "legend.fontsize": 16,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
     fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
     _draw_grouped_boxplot(
         axes[0],
@@ -253,6 +270,7 @@ def main() -> None:
         title="",
         use_log=True,
         label_mode="top",
+        annotate_medians=False,
     )
     _draw_grouped_boxplot(
         axes[1],
@@ -261,19 +279,66 @@ def main() -> None:
         title="",
         use_log=True,
         label_mode="side",
+        annotate_medians=False,
     )
+
+    # Annotate only the largest QOS fidelity value at 24 qubits.
+    qos_vals_24 = fidelity.get(24, {}).get("QOS", [])
+    if qos_vals_24:
+        y_max = max(qos_vals_24)
+        x_qos_24 = GROUP_CENTERS[1] + METHOD_OFFSETS["QOS"]
+        y_min_fid, y_max_fid = axes[0].get_ylim()
+        y_text_fid = min(y_max * 1.03, y_max_fid * 0.95)
+        axes[0].annotate(
+            _fmt_value(y_max),
+            xy=(x_qos_24, y_max),
+            xytext=(x_qos_24 + 0.03, 100),
+            textcoords="data",
+            ha="left",
+            va="bottom",
+            fontsize=20,
+            arrowprops={"arrowstyle": "->", "lw": 1.4, "color": "black"},
+        )
+
+    # Annotate 24q median mitigation time for FQ/CutQC/QOS as text near each point (no arrow).
+    y_min_t, y_max_t = axes[1].get_ylim()
+    for method, _label, _color in METHOD_SPECS:
+        vals_24 = timing.get(24, {}).get(method, [])
+        if not vals_24:
+            continue
+        y_med = statistics.median(vals_24)
+        x_pos = GROUP_CENTERS[1] + METHOD_OFFSETS[method]
+        y_text_t = y_med
+        if method == "FrozenQubits":
+            # Move FQ label slightly lower to reduce overlap with nearby text.
+            y_text_t = max(y_med * 0.70, y_min_t * 1.05)
+        axes[1].text(
+            x_pos + 0.12,
+            y_text_t,
+            _fmt_value(y_med),
+            ha="left",
+            va="center",
+            fontsize=20,
+            color="black",
+        )
 
     legend_handles = [Patch(facecolor=color, edgecolor="black", alpha=0.78, label=label) for _, label, color in METHOD_SPECS]
     legend_labels = [label for _, label, _ in METHOD_SPECS]
-    for ax in axes:
-        ax.legend(
-            handles=legend_handles,
-            labels=legend_labels,
-            loc="upper left",
-            ncol=1,
-            frameon=True,
-            fontsize=12,
-        )
+    axes[0].legend(
+        handles=legend_handles,
+        labels=legend_labels,
+        loc="upper left",
+        ncol=1,
+        frameon=True,
+    )
+    axes[1].legend(
+        handles=legend_handles,
+        labels=legend_labels,
+        loc="upper left",
+        bbox_to_anchor=(-0.05, 1.0),
+        ncol=1,
+        frameon=True,
+    )
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)

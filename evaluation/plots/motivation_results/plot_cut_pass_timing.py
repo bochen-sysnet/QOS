@@ -26,12 +26,12 @@ def _import_matplotlib():
 
     plt.rcParams.update(
         {
-            "font.size": 15,
-            "axes.titlesize": 17,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 15,
+            "font.size": 24,
+            "axes.titlesize": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 22,
+            "ytick.labelsize": 22,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -109,17 +109,15 @@ def _read_records(path: Path) -> list[dict[str, str]]:
 
 def _plot(records, fixed_str, fixed_qubits, out_path: Path) -> None:
     plt = _import_matplotlib()
-    fig, axes = plt.subplots(1, 2, figsize=(14.6, 5.4), sharey=False)
+    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.3), sharey=False)
 
     colors = {"GV": "#1f77b4", "WC": "#d55e00"}
-    labels = {"GV": "Gate Virtualization", "WC": "Wire Cutting"}
+    labels = {"GV": "GV", "WC": "WC"}
 
     fixed_rows = [row for row in records if row["sweep"] == "fixed_size_to_reach"]
-    sweep_rows = [row for row in records if row["sweep"] == "fixed_qubits"]
-
     sizes = sorted({int(row["qubits"]) for row in fixed_rows})
-    sizes_to_reach = sorted({int(row["size_to_reach"]) for row in sweep_rows})
 
+    series: dict[str, list[float]] = {}
     for method in ("GV", "WC"):
         y_vals = [
             float(
@@ -131,7 +129,8 @@ def _plot(records, fixed_str, fixed_qubits, out_path: Path) -> None:
             )
             for size in sizes
         ]
-        axes[0].plot(
+        series[method] = y_vals
+        ax.plot(
             sizes,
             y_vals,
             marker="o",
@@ -141,52 +140,47 @@ def _plot(records, fixed_str, fixed_qubits, out_path: Path) -> None:
             label=labels[method],
         )
 
-    axes[0].set_title(f"Fixed target partition size = {fixed_str}")
-    axes[0].set_xlabel("Circuit Size (qubits)")
-    axes[0].set_ylabel("Mitigation Time (s)")
-    axes[0].grid(axis="y", linestyle="--", alpha=0.35)
+    # No panel title by request.
+    ax.set_xlabel("Circuit Size (# of Qubits)")
+    ax.set_ylabel("Mitigation Time (s)", fontsize=22)
+    ax.set_yscale("log")
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    ax.legend(loc="lower right", frameon=True)
 
-    for method in ("GV", "WC"):
-        y_vals = [
-            float(
-                next(
-                    row["elapsed_sec"]
-                    for row in sweep_rows
-                    if row["method"] == method and int(row["size_to_reach"]) == size_to_reach
-                )
-            )
-            for size_to_reach in sizes_to_reach
-        ]
-        axes[1].plot(
-            sizes_to_reach,
-            y_vals,
-            marker="o",
-            linewidth=2.5,
-            markersize=7,
+    # Annotate specific points requested by user:
+    # - Wire Cut: 3rd and 4th points
+    # - Virtual Gate: 5th and 6th points
+    # Use offset annotations with a white background to keep text inside the axes
+    # and prevent overlap with line segments.
+    annotation_offsets = {
+        ("WC", 2): (-14, 14),
+        ("WC", 3): (14, -20),
+        ("GV", 4): (-26, +5),
+        ("GV", 5): (14, -16),
+    }
+
+    for (method, idx), (dx, dy) in annotation_offsets.items():
+        xs = sizes
+        ys = series.get(method, [])
+        if idx < 0 or idx >= len(xs) or idx >= len(ys):
+            continue
+        x = xs[idx]
+        y = ys[idx]
+        ax.annotate(
+            f"{y:.2f}",
+            xy=(x, y),
+            xytext=(dx, dy),
+            textcoords="offset points",
             color=colors[method],
-            label=labels[method],
+            fontsize=18,
+            ha="center",
+            va="center",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8, "pad": 0.2},
+            clip_on=True,
         )
-
-    axes[1].set_title(f"Fixed circuit size = {fixed_qubits} qubits")
-    axes[1].set_xlabel("Target Partition Size")
-    axes[1].set_ylabel("Mitigation Time (s)")
-    axes[1].grid(axis="y", linestyle="--", alpha=0.35)
-
-    handles, legend_labels = axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        legend_labels,
-        loc="upper center",
-        ncol=2,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.985),
-        handlelength=2.2,
-        columnspacing=1.6,
-        borderaxespad=0.2,
-    )
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.91])
+    fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 

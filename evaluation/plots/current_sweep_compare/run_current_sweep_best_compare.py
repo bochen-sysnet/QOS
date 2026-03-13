@@ -4,6 +4,8 @@ import csv
 import json
 import math
 import os
+import re
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -27,6 +29,7 @@ OUT_DIR = Path(__file__).resolve().parent
 DATA_DIR = OUT_DIR / "data"
 FIGURES_DIR = OUT_DIR / "figures"
 SIZE_SWEEP_DIR = DATA_DIR / "size_sweep"
+SIZE_SWEEP_ALL_VERSIONS_DIR = DATA_DIR / "size_sweep_all_versions"
 
 MODEL_FAMILIES = [
     ("gem3pro", "Gemini 3 Pro", "gem3pro_pws8_22q_seed_low_full_v"),
@@ -36,6 +39,13 @@ MODEL_FAMILIES = [
     ("claude_sonnet46", "Claude Sonnet 4.6", "claude_sonnet46_pws8_22q_full_v"),
     ("claude_opus46", "Claude Opus 4.6", "claude_opus46_pws8_22q_full_v"),
 ]
+
+METRIC_GROUPS = (
+    ("time_ratio_mean", "Time (mean of ratio)"),
+    ("time_ratio_sum", "Time (ratio of mean)"),
+    ("depth_ratio", "Depth"),
+    ("cnot_ratio", "CNOT"),
+)
 
 # Official published token prices as checked on 2026-03-04.
 # Sources:
@@ -122,6 +132,42 @@ def _load_rows_csv(path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
+def _extract_version_from_name(name: str) -> int:
+    match = re.search(r"_v(\d+)$", name)
+    return int(match.group(1)) if match else -1
+
+
+def _select_all_runs(base_dir: Path, selected_families: set[str], max_versions_per_family: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for family_key, display_name, prefix in MODEL_FAMILIES:
+        if family_key not in selected_families:
+            continue
+        family_runs: list[dict[str, Any]] = []
+        for run_dir in sorted(base_dir.glob(prefix + "*")):
+            info_path = run_dir / "best" / "best_program_info.json"
+            program_path = run_dir / "best" / "best_program.py"
+            if not info_path.exists() or not program_path.exists():
+                continue
+            version = _extract_version_from_name(run_dir.name)
+            family_runs.append(
+                {
+                    "family": family_key,
+                    "display_name": display_name,
+                    "run_name": run_dir.name,
+                    "version": version,
+                    "best_program": str(program_path),
+                }
+            )
+        family_runs = sorted(
+            family_runs,
+            key=lambda row: (int(row["version"]), str(row["run_name"])),
+        )
+        if max_versions_per_family > 0:
+            family_runs = family_runs[:max_versions_per_family]
+        selected.extend(family_runs)
+    return selected
+
+
 def _select_best_runs(base_dir: Path, selected_families: set[str]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     for family_key, display_name, prefix in MODEL_FAMILIES:
@@ -172,9 +218,10 @@ def _evaluate_program_across_sizes(
     benches: list[str],
     sample_seed: str,
     force_recompute: bool,
+    output_dir: Path,
 ) -> Path:
-    SIZE_SWEEP_DIR.mkdir(parents=True, exist_ok=True)
-    metrics_csv_path = SIZE_SWEEP_DIR / f"size_sweep_{run_name}_metrics.csv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_csv_path = output_dir / f"size_sweep_{run_name}_metrics.csv"
     rows_by_size: dict[int, dict[str, Any]] = {}
     if metrics_csv_path.exists() and not force_recompute:
         for row in _load_rows_csv(metrics_csv_path):
@@ -406,6 +453,142 @@ def _plot_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> None:
     ax.set_xticklabels([row["display_name"] for row in summary_rows], rotation=20, ha="right")
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
     ax.legend(ncol=4, loc="upper center", frameon=False, bbox_to_anchor=(0.5, 1.02))
+
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+
+
+def _summarize_family_metric(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[float]] = {}
+    for row in raw_rows:
+        for metric_key, _metric_label in METRIC_GROUPS:
+            value = _safe_float(row.get(metric_key))
+            grouped.setdefault((str(row["family"]), str(row["display_name"]), metric_key), []).append(value)
+
+    summary_rows: list[dict[str, Any]] = []
+    for (family, display_name, metric_key), values in sorted(grouped.items()):
+        finite = [value for value in values if math.isfinite(value)]
+        if not finite:
+            summary_rows.append(
+                {
+                    "family": family,
+                    "display_name": display_name,
+                    "metric_key": metric_key,
+                    "n_versions": 0,
+                    "mean": "",
+                    "std": "",
+                }
+            )
+            continue
+        summary_rows.append(
+            {
+                "family": family,
+                "display_name": display_name,
+                "metric_key": metric_key,
+                "n_versions": len(finite),
+                "mean": float(statistics.mean(finite)),
+                "std": float(statistics.pstdev(finite) if len(finite) > 1 else 0.0),
+            }
+        )
+    return summary_rows
+
+
+def _plot_grouped_component_summary(summary_rows: list[dict[str, Any]], out_pdf: Path) -> None:
+    plt.rcParams.update(
+        {
+            "font.size": 22,
+            "axes.titlesize": 22,
+            "axes.labelsize": 22,
+            "xtick.labelsize": 22,
+            "ytick.labelsize": 22,
+            "legend.fontsize": 20,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+    metric_defs = list(METRIC_GROUPS)
+    family_order = [family for family, _display, _prefix in MODEL_FAMILIES]
+    display_name_map = {family: display for family, display, _prefix in MODEL_FAMILIES}
+    color_map = {
+        family: plt.get_cmap("tab10")(idx % 10) for idx, family in enumerate(family_order)
+    }
+    hatch_cycle = ["", "//", "\\\\", "xx", "..", "++", "--", "oo"]
+    hatch_map = {
+        family: hatch_cycle[idx % len(hatch_cycle)] for idx, family in enumerate(family_order)
+    }
+
+    fig, ax = plt.subplots(figsize=(14.8, 4.8), constrained_layout=True)
+    x = np.arange(len(metric_defs), dtype=float)
+    n_models = len(family_order)
+    width = 0.13
+    offsets = [(idx - (n_models - 1) / 2.0) * width for idx in range(n_models)]
+
+    for model_idx, family in enumerate(family_order):
+        means: list[float] = []
+        stds: list[float] = []
+        for metric_key, _metric_label in metric_defs:
+            row = next(
+                (
+                    rec
+                    for rec in summary_rows
+                    if rec["family"] == family and rec["metric_key"] == metric_key
+                ),
+                None,
+            )
+            means.append(_safe_float(row.get("mean")) if row is not None else float("nan"))
+            stds.append(max(0.0, _safe_float(row.get("std"), 0.0)) if row is not None else float("nan"))
+
+        bars = ax.bar(
+            x + offsets[model_idx],
+            means,
+            width=width,
+            yerr=stds,
+            capsize=3.0,
+            color=color_map[family],
+            hatch=hatch_map[family],
+            edgecolor="black",
+            linewidth=0.5,
+            label=display_name_map[family],
+            alpha=0.95,
+        )
+        for bar, value, std in zip(bars, means, stds):
+            if not math.isfinite(value):
+                continue
+            std_val = max(0.0, _safe_float(std, 0.0))
+            if value >= 0:
+                y_text = value + std_val + 0.02
+                va = "bottom"
+            else:
+                y_text = value - std_val - 0.02
+                va = "top"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                y_text,
+                f"{value:.2f}",
+                ha="center",
+                va=va,
+                fontsize=20,
+                rotation=90,
+            )
+
+    ax.grid(True, axis="y", linestyle="--", alpha=0.35)
+    ax.axhline(1.0, color="black", linewidth=1.2, linestyle=":", alpha=0.9)
+    ax.text(
+        0.6,
+        1.0,
+        "QOS",
+        va="bottom",
+        ha="center",
+        fontsize=20,
+        fontweight="bold",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels([label for _key, label in metric_defs], rotation=0, ha="center")
+    ax.set_ylabel("Ratio of Metrics")
+
+    ax.legend(loc="lower right", ncol=1, frameon=True)
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_pdf)
@@ -767,6 +950,12 @@ def main() -> None:
         action="store_true",
         help="Do not run evaluation; require cached CSVs and only rebuild summary/figure.",
     )
+    parser.add_argument(
+        "--max-versions-per-family",
+        type=int,
+        default=0,
+        help="Optional limit of versions per family for all-version comparison (0 means all).",
+    )
     args = parser.parse_args()
 
     sizes = _parse_csv_ints(args.sizes)
@@ -787,6 +976,88 @@ def main() -> None:
     selected_models_csv = DATA_DIR / "selected_models.csv"
     _write_selected_models(selected_models_csv, selected)
     print(f"[start] wrote selected models: {selected_models_csv}")
+
+    # Build current_sweep_best_compare.pdf from all available versions:
+    # per run -> size sweep average over requested sizes -> aggregate mean/std across versions.
+    all_runs = _select_all_runs(
+        ROOT / "openevolve_output",
+        selected_families=selected_families,
+        max_versions_per_family=args.max_versions_per_family,
+    )
+    grouped_raw_rows: list[dict[str, Any]] = []
+    for run_row in all_runs:
+        program = Path(str(run_row["best_program"]))
+        run_name = str(run_row["run_name"])
+        metrics_csv = SIZE_SWEEP_ALL_VERSIONS_DIR / f"size_sweep_{run_name}_metrics.csv"
+        if not args.skip_eval:
+            metrics_csv = _evaluate_program_across_sizes(
+                program=program,
+                run_name=run_name,
+                sizes=sizes,
+                benches=benches,
+                sample_seed=args.sample_seed,
+                force_recompute=args.force_recompute,
+                output_dir=SIZE_SWEEP_ALL_VERSIONS_DIR,
+            )
+        elif not metrics_csv.exists():
+            print(f"[skip] all-version cached metrics not found for {run_name}: {metrics_csv}")
+            continue
+
+        per_run_summary = _load_summary_from_metrics(metrics_csv, sizes)
+        grouped_raw_rows.append(
+            {
+                "family": run_row["family"],
+                "display_name": run_row["display_name"],
+                "run_name": run_name,
+                "version": run_row["version"],
+                "metrics_csv": str(metrics_csv),
+                **per_run_summary,
+            }
+        )
+
+    grouped_raw_csv = DATA_DIR / "current_sweep_best_compare_grouped_raw.csv"
+    with grouped_raw_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "family",
+                "display_name",
+                "run_name",
+                "version",
+                "metrics_csv",
+                "combined_score",
+                "depth_ratio",
+                "cnot_ratio",
+                "time_ratio_mean",
+                "time_ratio_sum",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(grouped_raw_rows)
+    print(f"[done] wrote grouped raw: {grouped_raw_csv}")
+
+    grouped_summary_rows = _summarize_family_metric(grouped_raw_rows)
+    grouped_summary_csv = DATA_DIR / "current_sweep_best_compare_grouped_summary.csv"
+    with grouped_summary_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "family",
+                "display_name",
+                "metric_key",
+                "n_versions",
+                "mean",
+                "std",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(grouped_summary_rows)
+    print(f"[done] wrote grouped summary: {grouped_summary_csv}")
+
+    if grouped_summary_rows:
+        grouped_fig = FIGURES_DIR / "current_sweep_best_compare.pdf"
+        _plot_grouped_component_summary(grouped_summary_rows, grouped_fig)
+        print(f"[done] wrote figure: {grouped_fig}")
 
     summary_rows: list[dict[str, Any]] = []
     runtime_rows: list[dict[str, Any]] = []
@@ -810,6 +1081,7 @@ def main() -> None:
                 benches=benches,
                 sample_seed=args.sample_seed,
                 force_recompute=args.force_recompute,
+                output_dir=SIZE_SWEEP_DIR,
             )
         elif not metrics_csv.exists():
             print(f"[skip] cached metrics not found for {run_name}: {metrics_csv}")
@@ -845,11 +1117,6 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(summary_rows)
     print(f"[done] wrote summary: {summary_csv}")
-
-    if summary_rows:
-        fig_path = FIGURES_DIR / "current_sweep_best_compare.pdf"
-        _plot_summary(summary_rows, fig_path)
-        print(f"[done] wrote figure: {fig_path}")
 
     runtime_summary_csv = DATA_DIR / "current_sweep_runtime_summary.csv"
     with runtime_summary_csv.open("w", newline="") as f:

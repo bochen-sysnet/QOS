@@ -13,6 +13,7 @@ NUM_DIVERSE="${NUM_DIVERSE:-2}"
 NUM_INSPIRE="${NUM_INSPIRE:-3}"
 
 GEMINI_KEY_FILE="${GEMINI_KEY_FILE:-keys/gemini-ge0.key}"
+QUBITS_OUT_DIR="${QUBITS_OUT_DIR:-openevolve_ablation/qubits}"
 # Random 12-24 seed behavior:
 # - per_round (default): seed = base + (round - 1)
 # - fixed: always use the same seed across rounds
@@ -136,18 +137,18 @@ for round in $(seq 1 "$TARGET_TOTAL_SWEEPS"); do
     "$round" \
     "12q-only" \
     "12" "12" \
-    "openevolve_ablation/gem3flash_pws8_12q_seed_low_full"
+    "${QUBITS_OUT_DIR}/gem3flash_pws8_12q_seed_low_full"
 
   run_variant_for_round \
     "$round" \
     "24q-only" \
     "24" "24" \
-    "openevolve_ablation/gem3flash_pws8_24q_seed_low_full"
+    "${QUBITS_OUT_DIR}/gem3flash_pws8_24q_seed_low_full"
 
   run_variant_for_round \
     "$round" \
     "random-12to24" \
     "12" "24" \
-    "openevolve_ablation/gem3flash_pws8_12to24_random_seed_low_full" \
+    "${QUBITS_OUT_DIR}/gem3flash_pws8_12to24_random_seed_low_full" \
     "$random_seed"
 done

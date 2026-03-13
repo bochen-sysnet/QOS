@@ -221,17 +221,17 @@ def main() -> None:
 
     plt.rcParams.update(
         {
-            "font.size": 16,
-            "axes.labelsize": 17,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 12,
+            "font.size": 28,
+            "axes.labelsize": 28,
+            "xtick.labelsize": 28,
+            "ytick.labelsize": 28,
+            "legend.fontsize": 28,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
-    fig, axes = plt.subplots(1, 3, figsize=(17.8, 4.3), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(18.5, 4.8), constrained_layout=True)
     ax_first, ax_last, ax_count = axes
 
     # Deterministic plotting order: known models first, then unknown.
@@ -243,7 +243,7 @@ def main() -> None:
         ax_last.step(x_last, y_last, where="post", linewidth=2.8, color="black", label="All Runs")
         ax_count.step(x2, y2, where="post", linewidth=2.8, color="black", label="All Runs")
 
-    ax_first.set_xlabel("Iteration of First Improvement")
+    ax_first.set_xlabel("First Improve Iter")
     ax_first.set_ylabel("CDF")
     if all_first:
         x_min = max(1, int(min(all_first)) - 1)
@@ -268,7 +268,7 @@ def main() -> None:
         ax_first.set_xticks([1, 20, 40, 60, 80, 100])
     ax_first.grid(axis="both", linestyle="--", alpha=0.3)
 
-    ax_last.set_xlabel("Iteration of Last Improvement")
+    ax_last.set_xlabel("Last Improve Iter")
     ax_last.set_ylabel("CDF")
     if all_last:
         lx_min = max(1, int(min(all_last)) - 1)
@@ -293,7 +293,7 @@ def main() -> None:
         ax_last.set_xticks([1, 20, 40, 60, 80, 100])
     ax_last.grid(axis="both", linestyle="--", alpha=0.3)
 
-    ax_count.set_xlabel("Number of Improvements in 100 Iterations")
+    ax_count.set_xlabel("Improve Count (100 iters)")
     ax_count.set_ylabel("CDF")
     if all_counts:
         ax_count.set_xlim(min(all_counts), max(all_counts))

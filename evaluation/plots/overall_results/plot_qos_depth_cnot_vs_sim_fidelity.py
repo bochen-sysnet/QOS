@@ -169,7 +169,7 @@ def _plot_scatter(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Scatter correlation between raw depth/CNOT and simulated fidelity for 24q, "
+            "Scatter correlation between raw depth and simulated fidelity for 24q, "
             "combining Qiskit, QOS, CutQC, and FrozenQubits."
         )
     )
@@ -203,20 +203,14 @@ def main() -> None:
         }
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.4, 4.9), constrained_layout=True, sharey=True)
+    fig, ax = plt.subplots(1, 1, figsize=(6.4, 4.2), constrained_layout=True)
     _plot_scatter(
-        axes[0],
+        ax,
         rows_by_method,
         x_key="depth",
         x_label="Depth",
     )
-    _plot_scatter(
-        axes[1],
-        rows_by_method,
-        x_key="cnot",
-        x_label="CNOT",
-    )
-    axes[0].set_ylabel("Fidelity")
+    ax.set_ylabel("Fidelity")
 
     args.out_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out_pdf, bbox_inches="tight")
