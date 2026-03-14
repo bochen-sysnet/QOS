@@ -56,7 +56,14 @@ def _plot_avg_jobs_from_strict_csv(csv_path: Path, out_pdf: Path, sizes: List[in
     np = fe.np
     rows = fe._read_rows_csv(csv_path)
 
-    method_priority = ["Qiskit", "FrozenQubits", "CutQC", "QOS", "QOSE"]
+    # Exclude Qiskit per request; keep four mitigation methods.
+    method_priority = ["FrozenQubits", "CutQC", "QOS", "QOSE"]
+    method_label = {
+        "FrozenQubits": "Frozen",
+        "CutQC": "CutQC",
+        "QOS": "QOS",
+        "QOSE": "QSA",
+    }
     hatch_patterns = ["///", "\\\\\\", "...", "xxx", "+++", "---", "|||", "ooo", "***"]
     cmap_jobs = plt.get_cmap("tab10")
     y_eps = 1e-2
@@ -64,59 +71,58 @@ def _plot_avg_jobs_from_strict_csv(csv_path: Path, out_pdf: Path, sizes: List[in
     panel_specs = [int(s) for s in sizes]
     with plt.rc_context(
         {
-            "font.size": 15,
-            "axes.labelsize": 18,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
+            "font.size": 20,
+            "axes.labelsize": 20,
+            "xtick.labelsize": 20,
+            "ytick.labelsize": 20,
+            "legend.fontsize": 18,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     ):
-        fig, axes = plt.subplots(1, len(panel_specs), figsize=(5.9 * len(panel_specs), 4.8), squeeze=False)
+        fig, ax = plt.subplots(1, 1, figsize=(6.8, 4.2))
 
-        for panel_idx, size in enumerate(panel_specs):
-            ax = axes[0, panel_idx]
-            sub = [r for r in rows if int(r.get("size", 0) or 0) == size]
-            methods = [m for m in method_priority if any(str(r.get("method", "")) == m for r in sub)]
-            x = np.arange(len(methods))
-            vals = []
-            for m in methods:
-                m_rows = [r for r in sub if str(r.get("method", "")) == m]
+        x = np.arange(len(panel_specs), dtype=float)
+        methods = [m for m in method_priority if any(str(r.get("method", "")) == m for r in rows)]
+        width = 0.18
+        colors = [cmap_jobs(i % 10) for i in range(len(methods))]
+
+        for mi, m in enumerate(methods):
+            offset = (mi - (len(methods) - 1) / 2.0) * width
+            raw_vals = []
+            plot_vals = []
+            for size in panel_specs:
+                sub = [r for r in rows if int(r.get("size", 0) or 0) == size and str(r.get("method", "")) == m]
                 jobs_vals = [
                     fe._safe_float(r.get("jobs"), 0.0)
-                    for r in m_rows
+                    for r in sub
                     if fe._safe_float(r.get("jobs"), 0.0) > 0.0
                 ]
                 avg = float(sum(jobs_vals) / len(jobs_vals)) if jobs_vals else 0.0
-                vals.append(max(avg, y_eps))
-            colors = [cmap_jobs(i % 10) for i in range(len(methods))]
-            bars = ax.bar(x, vals, color=colors, edgecolor="black", linewidth=0.7)
-            for i, bar in enumerate(bars):
-                bar.set_hatch(hatch_patterns[i % len(hatch_patterns)])
-                m_rows = [r for r in sub if str(r.get("method", "")) == methods[i]]
-                jobs_vals = [
-                    fe._safe_float(r.get("jobs"), 0.0)
-                    for r in m_rows
-                    if fe._safe_float(r.get("jobs"), 0.0) > 0.0
-                ]
-                raw = float(sum(jobs_vals) / len(jobs_vals)) if jobs_vals else 0.0
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    max(vals[i], y_eps) * 1.08,
-                    f"{raw:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=10,
-                )
-            ax.set_title(f"{size} qubits", fontsize=17)
-            ax.set_ylabel("#Jobs Per Circuit")
-            ax.set_xticks(x)
-            ax.set_xticklabels(methods, rotation=32, ha="right")
-            ax.set_yscale("log")
-            ax.grid(axis="y", linestyle="--", alpha=0.3)
+                raw_vals.append(avg)
+                plot_vals.append(max(avg, y_eps))
+
+            bars = ax.bar(
+                x + offset,
+                plot_vals,
+                width=width,
+                color=colors[mi],
+                edgecolor="black",
+                linewidth=0.7,
+                label=method_label.get(m, m),
+            )
+            for b in bars:
+                b.set_hatch(hatch_patterns[mi % len(hatch_patterns)])
+
+        ax.set_ylabel("Quantum Overhead")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{s} qubit" for s in panel_specs])
+        ax.set_yscale("log")
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.legend(loc="lower center", ncol=2, frameon=True, fontsize=18, bbox_to_anchor=(0.5, 0.06))
 
         fig.tight_layout()
-        fig.savefig(out_pdf)
+        fig.savefig(out_pdf, bbox_inches="tight")
         plt.close(fig)
 
 
@@ -242,17 +248,17 @@ def _plot_qose_time_breakdown_aggregated(
 
     plt.rcParams.update(
         {
-            "font.size": 14,
-            "axes.labelsize": 16,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 14,
-            "legend.fontsize": 14,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
-    fig, ax = plt.subplots(1, 1, figsize=(6.6, 4.2))
+    fig, ax = plt.subplots(1, 1, figsize=(6.8, 4.2))
 
     vals_m = [max(v, y_eps) for v in per_bench_mit]
     vals_w = [max(v, y_eps) for v in per_job_wait]
@@ -309,7 +315,7 @@ def _plot_qose_time_breakdown_aggregated(
                 label,
                 ha="center",
                 va="bottom",
-                fontsize=11,
+                fontsize=20,
             )
 
     _annotate(b1, per_bench_mit, err_m)
@@ -323,14 +329,14 @@ def _plot_qose_time_breakdown_aggregated(
 
     fig.legend(
         [b1[0], b2[0], b3[0]],
-        ["Mitigation", "Queue/Network", "QPU"],
+        ["Mitigation", "Network", "QPU"],
         ncol=3,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.01),
+        bbox_to_anchor=(0.5, 1.05),
         frameon=False,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out_pdf)
+    fig.tight_layout()
+    fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -503,7 +509,7 @@ def _plot_qos_component_breakdown_12_24(
     ax.legend(loc="upper right", frameon=True, bbox_to_anchor=(0.98, 0.82), borderaxespad=0.15)
 
     fig.tight_layout()
-    fig.savefig(out_pdf, bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -571,52 +577,66 @@ def _plot_mitigation_stage_breakdown_qos_qsa_24(
         for method in ("QOS", "QOSE")
     }
 
+    stds = {
+        method: [
+            float(np.std(values[method][b])) if values[method][b] else 0.0
+            for b in benches
+        ]
+        for method in ("QOS", "QOSE")
+    }
+
     y_eps = 1e-4
-    x = np.arange(len(benches))
-    cmap = plt.get_cmap("tab10")
-    colors = [cmap(i % 10) for i in range(len(benches))]
-    hatches = ["///", "\\\\\\", "xxx", "...", "++", "--", "||", "oo", "**", "///"]
+    x = np.arange(len(benches), dtype=float)
     with plt.rc_context(
         {
-            "font.size": 16,
-            "axes.labelsize": 18,
-            "xtick.labelsize": 14,
-            "ytick.labelsize": 15,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "xtick.labelsize": 22,
+            "ytick.labelsize": 22,
+            "legend.fontsize": 20,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(13.6, 4.3), sharey=True)
-        for ax, method in zip(axes, ("QOS", "QOSE")):
-            vals = [max(v, y_eps) for v in means[method]]
-            bars = ax.bar(
+        fig, ax = plt.subplots(1, 1, figsize=(6.8, 4.2))
+
+        style = {
+            "QOS": {"color": "#4C78A8", "marker": "o", "label": method_map["QOS"]},
+            "QOSE": {"color": "#F58518", "marker": "s", "label": method_map["QOSE"]},
+        }
+        for method in ("QOS", "QOSE"):
+            vals = np.array([max(v, y_eps) for v in means[method]], dtype=float)
+            errs = np.array([max(e, 0.0) for e in stds[method]], dtype=float)
+            lo = np.maximum(vals - errs, y_eps)
+            hi = np.maximum(vals + errs, y_eps * 1.01)
+            ax.plot(
                 x,
                 vals,
-                color=colors,
-                edgecolor="black",
-                linewidth=0.7,
+                color=style[method]["color"],
+                marker=style[method]["marker"],
+                linewidth=2.5,
+                markersize=7,
+                label=style[method]["label"],
+                zorder=3,
             )
-            for i, b in enumerate(bars):
-                b.set_hatch(hatches[i % len(hatches)])
-                raw = means[method][i]
-                y = max(raw, y_eps) * 1.08
-                ax.text(
-                    b.get_x() + b.get_width() / 2.0,
-                    y,
-                    f"{raw:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=11,
-                )
+            ax.fill_between(
+                x,
+                lo,
+                hi,
+                color=style[method]["color"],
+                alpha=0.20,
+                zorder=2,
+            )
 
-            ax.set_title(method_map[method], fontsize=18)
-            ax.set_xticks(x, benches, rotation=32, ha="right")
-            ax.set_yscale("log")
-            ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.set_xticks(x)
+        ax.set_xticklabels(benches, rotation=32, ha="right")
+        ax.set_ylabel("Time (s)")
+        ax.set_yscale("log")
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.legend(loc="center left", frameon=True)
 
-        axes[0].set_ylabel("Time (s)")
         fig.tight_layout()
-        fig.savefig(out_pdf)
+        fig.savefig(out_pdf, bbox_inches="tight")
         plt.close(fig)
 
 

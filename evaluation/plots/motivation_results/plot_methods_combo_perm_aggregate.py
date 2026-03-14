@@ -16,7 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -143,11 +143,11 @@ def _plot_metric_two_panels(
 ) -> None:
     plt.rcParams.update(
         {
-            "font.size": 20,
-            "axes.labelsize": 22,
-            "axes.titlesize": 22,
-            "xtick.labelsize": 20,
-            "ytick.labelsize": 20,
+            "font.size": 24,
+            "axes.labelsize": 24,
+            "axes.titlesize": 24,
+            "xtick.labelsize": 24,
+            "ytick.labelsize": 24,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
@@ -159,90 +159,76 @@ def _plot_metric_two_panels(
     perm_means = np.array([amap[("permutation", m)][metric_mean] for m in labels_perm], dtype=float)
     perm_stds = np.array([amap[("permutation", m)][metric_std] for m in labels_perm], dtype=float)
 
-    x_combo = np.arange(len(labels_combo))
-    x_perm = np.arange(len(labels_perm))
+    x_combo = np.arange(1, len(labels_combo) + 1, dtype=float)
+    x_perm = np.arange(1, len(labels_perm) + 1, dtype=float)
 
-    fig, axes = plt.subplots(1, 2, figsize=(22.5, 7.2), constrained_layout=False)
+    fig, axes = plt.subplots(1, 2, figsize=(16.0, 5.4), constrained_layout=False)
 
     ax_cmb, ax_prm = axes
     ours_combo = _combo_label(tuple(METHODS))
     ours_perm = " > ".join(METHODS)
 
-    combo_colors = ["#E45756" if lbl == ours_combo else "#6C757D" for lbl in labels_combo]
-    combo_hatches = ["////" if lbl == ours_combo else ".." for lbl in labels_combo]
-    bars_c = ax_cmb.bar(
+    # Combination panel: line + band, with a red horizontal reference line for ours.
+    ax_cmb.plot(x_combo, combo_means, color="#6C757D", linewidth=2.0, zorder=3)
+    ax_cmb.fill_between(
         x_combo,
-        combo_means,
-        yerr=combo_stds,
-        capsize=2.8,
-        color=combo_colors,
-        edgecolor="black",
-        linewidth=0.6,
-        alpha=0.9,
+        combo_means - combo_stds,
+        combo_means + combo_stds,
+        color="#6C757D",
+        alpha=0.22,
+        zorder=2,
     )
-    for b, h in zip(bars_c, combo_hatches):
-        b.set_hatch(h)
-    ax_cmb.set_title("Combinations")
     ax_cmb.set_ylabel(y_label)
-    ax_cmb.set_xticks(x_combo)
-    ax_cmb.set_xticklabels(labels_combo, rotation=75, ha="right")
-    ax_cmb.set_xlim(-0.65, len(labels_combo) - 0.35)
+    ax_cmb.set_xlabel("Combination ID")
+    if len(x_combo) <= 12:
+        ax_cmb.set_xticks(x_combo)
+    else:
+        ticks = np.unique(np.rint(np.linspace(1, len(x_combo), 6)).astype(int))
+        ax_cmb.set_xticks(ticks)
+    ax_cmb.set_xlim(1, len(x_combo))
     ax_cmb.grid(axis="y", linestyle="--", alpha=0.3)
 
-    perm_colors = ["#E45756" if lbl == ours_perm else "#6C757D" for lbl in labels_perm]
-    perm_hatches = ["////" if lbl == ours_perm else ".." for lbl in labels_perm]
-    bars_p = ax_prm.bar(
+    # Permutation panel: line + band, with a red horizontal reference line for ours.
+    ax_prm.plot(x_perm, perm_means, color="#6C757D", linewidth=2.0, zorder=3)
+    ax_prm.fill_between(
         x_perm,
-        perm_means,
-        yerr=perm_stds,
-        capsize=2.8,
-        color=perm_colors,
-        edgecolor="black",
-        linewidth=0.6,
-        alpha=0.9,
+        perm_means - perm_stds,
+        perm_means + perm_stds,
+        color="#6C757D",
+        alpha=0.22,
+        zorder=2,
     )
-    for b, h in zip(bars_p, perm_hatches):
-        b.set_hatch(h)
-    ax_prm.set_title("Permutations")
     ax_prm.set_ylabel(y_label)
-    ax_prm.set_xticks(x_perm)
-    ax_prm.set_xticklabels(labels_perm, rotation=75, ha="right")
-    ax_prm.set_xlim(-0.65, len(labels_perm) - 0.35)
+    ax_prm.set_xlabel("Permutation ID")
+    if len(x_perm) <= 12:
+        ax_prm.set_xticks(x_perm)
+    else:
+        ticks = np.unique(np.rint(np.linspace(1, len(x_perm), 6)).astype(int))
+        ax_prm.set_xticks(ticks)
+    ax_prm.set_xlim(1, len(x_perm))
     ax_prm.grid(axis="y", linestyle="--", alpha=0.3)
 
-    legend_handles = [
-        Patch(facecolor="#E45756", edgecolor="black", hatch="////", label="Ours"),
-        Patch(facecolor="#6C757D", edgecolor="black", hatch="..", label="Others"),
-    ]
-    ax_cmb.legend(
-        handles=legend_handles,
-        loc="upper left",
-        ncol=1,
-        frameon=True,
-        fontsize=20,
-    )
-    ax_prm.legend(
-        handles=legend_handles,
-        loc="upper left",
-        ncol=1,
-        frameon=True,
-        fontsize=20,
-    )
-
-    # Add a horizontal guide line for "ours" value in each panel.
     if ours_combo in labels_combo:
         i = labels_combo.index(ours_combo)
         ours_val = float(combo_means[i])
-        ax_cmb.axhline(ours_val, color="#E45756", linestyle="--", linewidth=1.2, alpha=0.9)
+        ax_cmb.axhline(ours_val, color="#E45756", linestyle="--", linewidth=2.0, alpha=0.95, label="Ours")
     if ours_perm in labels_perm:
         i = labels_perm.index(ours_perm)
         ours_val = float(perm_means[i])
-        ax_prm.axhline(ours_val, color="#E45756", linestyle="--", linewidth=1.2, alpha=0.9)
+        ax_prm.axhline(ours_val, color="#E45756", linestyle="--", linewidth=2.0, alpha=0.95, label="Ours")
 
-    fig.subplots_adjust(left=0.045, right=0.998, bottom=0.30, top=0.96, wspace=0.08)
+    legend_handles = [
+        Line2D([0], [0], color="#6C757D", linewidth=2.0, label="Others"),
+        Line2D([0], [0], color="#E45756", linestyle="--", linewidth=2.0, label="Ours"),
+    ]
+    ax_cmb.legend(handles=legend_handles, loc="upper right", frameon=True, fontsize=22)
+    ax_prm.legend(handles=legend_handles, loc="upper right", frameon=True, fontsize=22)
+
+    fig.subplots_adjust(left=0.06, right=0.995, bottom=0.15, top=0.98, wspace=0.12)
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_pdf, bbox_inches="tight", pad_inches=0.10)
+    fig.tight_layout()
+    fig.savefig(out_pdf, bbox_inches="tight")
     plt.close(fig)
 
 
